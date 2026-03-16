@@ -1,3 +1,0 @@
-/data/pytorch-source/build/confu-deps/six-download/CMakeFiles/six.dir
-/data/pytorch-source/build/confu-deps/six-download/CMakeFiles/edit_cache.dir
-/data/pytorch-source/build/confu-deps/six-download/CMakeFiles/rebuild_cache.dir
