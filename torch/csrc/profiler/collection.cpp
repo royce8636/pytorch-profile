@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <queue>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -23,6 +24,7 @@
 #include <torch/csrc/jit/runtime/interpreter.h>
 #include <torch/csrc/profiler/data_flow.h>
 #include <torch/csrc/profiler/kineto_shim.h>
+#include <torch/csrc/profiler/util.h>
 
 namespace torch::profiler::impl {
 using result_ptr_t = std::shared_ptr<Result>;
@@ -75,6 +77,10 @@ struct TagToIOType {
   InputOutputEncoder::IOType io_type;
 };
 
+constexpr const char* kUserAnnotationArgsMetadataKey = "user_annotation_args";
+constexpr const char* kUserAnnotationScopeKey = "scope";
+constexpr const char* kUserAnnotationScopeValue = "user_scope";
+
 constexpr int tagCount = ((int)InputOutputEncoder::Tag::TERMINATOR) + 1;
 constexpr std::array<TagToIOType, tagCount> tag_map = {{
     {InputOutputEncoder::Tag::Tensor, InputOutputEncoder::IOType::Shapes},
@@ -97,6 +103,143 @@ static_assert(allTagsMapped(), "tag_map is out of order");
 
 constexpr InputOutputEncoder::IOType tagToIOType(InputOutputEncoder::Tag tag) {
   return tag_map[(int)tag].io_type;
+}
+
+static std::string jsonEscapeString(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (const char c : value) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+    }
+  }
+  return out;
+}
+
+static std::optional<std::string> userAnnotationValueToJson(
+    const c10::IValue& value) {
+  if (value.isString()) {
+    return fmt::format(
+        "\"{}\"", jsonEscapeString(std::string(value.toStringRef())));
+  }
+  if (value.isInt() || value.isDouble() || value.isBool()) {
+    return ivalueToStr(value, /*isString=*/false);
+  }
+  if (value.isList()) {
+    const auto list = value.toListRef();
+    const bool is_string_list = std::all_of(
+        list.begin(), list.end(), [](const c10::IValue& item) {
+          return item.isString();
+        });
+    if (is_string_list) {
+      std::vector<c10::IValue> string_list(list.begin(), list.end());
+      return ivalueListToStr(string_list);
+    }
+  }
+  return std::nullopt;
+}
+
+static extra_meta_t buildUserAnnotationExtraMeta(
+    const at::RecordFunction& fn,
+    const bool capture_kwinputs_from_record_function) {
+  extra_meta_t extra_meta;
+  if (fn.scope() != at::RecordScope::USER_SCOPE) {
+    return extra_meta;
+  }
+
+  const auto inputs = fn.inputs();
+  if (inputs.size() == 1 && inputs[0].isString()) {
+    extra_meta.emplace(
+        kUserAnnotationArgsMetadataKey,
+        fmt::format(
+            "\"{}\"",
+            jsonEscapeString(std::string(inputs[0].toStringRef()))));
+  }
+
+  if (!capture_kwinputs_from_record_function) {
+    return extra_meta;
+  }
+
+  for (const auto& [key, value] : fn.kwinputs()) {
+    if (key == kUserAnnotationScopeKey &&
+        value.isString() &&
+        std::string(value.toStringRef()) == kUserAnnotationScopeValue) {
+      continue;
+    }
+    auto json_value = userAnnotationValueToJson(value);
+    if (json_value.has_value()) {
+      extra_meta.emplace(key, std::move(*json_value));
+    }
+  }
+
+  return extra_meta;
+}
+
+static std::string buildUserAnnotationMetadataJson(
+    const extra_meta_t& extra_meta,
+    const kwinputs_t& kwinputs) {
+  extra_meta_t metadata = extra_meta;
+
+  for (const auto& [key, value] : kwinputs) {
+    if (metadata.count(key) != 0) {
+      continue;
+    }
+    if (key == kUserAnnotationScopeKey &&
+        value.isString() &&
+        std::string(value.toStringRef()) == kUserAnnotationScopeValue) {
+      continue;
+    }
+    auto json_value = userAnnotationValueToJson(value);
+    if (json_value.has_value()) {
+      metadata.emplace(key, std::move(*json_value));
+    }
+  }
+
+  if (metadata.empty()) {
+    return "";
+  }
+
+  std::vector<std::pair<std::string, std::string>> sorted_metadata(
+      metadata.begin(), metadata.end());
+  std::sort(
+      sorted_metadata.begin(),
+      sorted_metadata.end(),
+      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+  std::string json = "{";
+  bool first = true;
+  for (const auto& [key, value] : sorted_metadata) {
+    if (!first) {
+      json += ", ";
+    }
+    first = false;
+    json += fmt::format("\"{}\": {}", jsonEscapeString(key), value);
+  }
+  json += "}";
+  return json;
 }
 } // namespace
 
@@ -326,6 +469,11 @@ uint64_t ThreadLocalSubqueue::TorchOpStorage::EventBlock<T, ChunkSize>::
 // ---------------------------------
 std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
     const at::RecordFunction& fn) {
+  const bool capture_user_annotation_kwinputs =
+      fn.scope() == at::RecordScope::USER_SCOPE &&
+      !config_.report_input_shapes;
+  extra_meta_t extra_meta =
+      buildUserAnnotationExtraMeta(fn, capture_user_annotation_kwinputs);
   auto overload_name = config_.experimental_config.capture_overload_names
       ? fn.overload_name()
       : "";
@@ -375,10 +523,13 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
     // if needed.
     torch::profiler::impl::SaveNcclMetaConfig ncclMetaConfig{
         true, true, true, false};
-    out->event_->extra_nccl_meta_ = torch_ops_.extra_meta_.emplace_back(
-        torch::profiler::impl::saveNcclMeta(fn, ncclMetaConfig));
+    auto nccl_meta = torch::profiler::impl::saveNcclMeta(fn, ncclMetaConfig);
+    extra_meta.insert(nccl_meta.begin(), nccl_meta.end());
+    out->event_->extra_nccl_meta_ =
+        torch_ops_.extra_meta_.emplace_back(std::move(extra_meta));
   } else {
-    out->event_->extra_nccl_meta_ = torch_ops_.extra_meta_.emplace_back();
+    out->event_->extra_nccl_meta_ =
+        torch_ops_.extra_meta_.emplace_back(std::move(extra_meta));
   }
 
   if (config_.state == ProfilerState::KINETO_GPU_FALLBACK) {
@@ -502,6 +653,11 @@ void ThreadLocalSubqueue::TorchOpStorage::materialize(
         gpu_fallback(),
         event->allow_tf32_cublas_,
         std::move(event->counters_)};
+
+    if (e.scope_ == at::RecordScope::USER_SCOPE) {
+      e.metadata_json_ =
+          buildUserAnnotationMetadataJson(e.extra_meta_, e.kwinputs_);
+    }
 
     if (e.name_.find(profilerStepString) != std::string::npos) {
       step_info.emplace_back(

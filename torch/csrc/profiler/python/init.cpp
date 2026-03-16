@@ -241,7 +241,7 @@ PyObject* RecordFunctionFast_enter(PyObject* selfGeneric, PyObject* unused) {
     }
 
     // parse through kwargs if they exist
-    if (self->keyword_values != nullptr && profiler_need_input) {
+    if (self->keyword_values != nullptr) {
       const auto kw_size = PyDict_Size(self->keyword_values);
       if (kw_size > 0) {
         kwargs.reserve(static_cast<size_t>(kw_size));

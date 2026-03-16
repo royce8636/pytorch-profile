@@ -1,0 +1,23 @@
+set(
+generated_headers
+    "/data/pytorch-source/build/aten/src/ATen/CPUFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/CPUFunctions_inl.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeExplicitAutogradFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeExplicitAutogradFunctions_inl.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeExplicitAutogradNonFunctionalFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeExplicitAutogradNonFunctionalFunctions_inl.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeImplicitAutogradFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeImplicitAutogradFunctions_inl.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeImplicitAutogradNestedTensorFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/CompositeImplicitAutogradNestedTensorFunctions_inl.h"
+    "/data/pytorch-source/build/aten/src/ATen/Functions.h"
+    "/data/pytorch-source/build/aten/src/ATen/MetaFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/MetaFunctions_inl.h"
+    "/data/pytorch-source/build/aten/src/ATen/MethodOperators.h"
+    "/data/pytorch-source/build/aten/src/ATen/NativeFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/NativeMetaFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/Operators.h"
+    "/data/pytorch-source/build/aten/src/ATen/RedispatchFunctions.h"
+    "/data/pytorch-source/build/aten/src/ATen/RegistrationDeclarations.h"
+    "/data/pytorch-source/build/aten/src/ATen/VmapGeneratedPlumbing.h"
+)

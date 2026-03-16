@@ -21,7 +21,7 @@ static void record_function_enter(
     const std::optional<std::string>& args,
     at::RecordFunction& rec) {
   if (rec.isActive()) {
-    if (rec.needsInputs() && args.has_value()) {
+    if (args.has_value()) {
       rec.before(
           name, c10::ArrayRef<const c10::IValue>{c10::IValue{args.value()}});
     } else {

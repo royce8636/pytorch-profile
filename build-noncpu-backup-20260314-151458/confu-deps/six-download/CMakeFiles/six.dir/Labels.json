@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/CMakeFiles/six"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/CMakeFiles/six.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/CMakeFiles/six-complete.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-build.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-configure.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-download.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-install.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-mkdir.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-patch.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-test.rule"
+		},
+		{
+			"file" : "/data/pytorch-source/build/confu-deps/six-download/six-prefix/src/six-stamp/six-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"six"
+		],
+		"name" : "six"
+	}
+}

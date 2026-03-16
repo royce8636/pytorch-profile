@@ -125,6 +125,32 @@ class TestExecutionTrace(TestCase):
         )
         return sorted(rf_id for rf_id in rf_ids_ if rf_id is not None)
 
+    def iter_execution_trace_tensor_values(self, value: Any):
+        if isinstance(value, list):
+            if (
+                len(value) == 6
+                and all(isinstance(v, int) for v in value[:5])
+                and isinstance(value[5], str)
+            ):
+                yield value
+                return
+            for child in value:
+                yield from self.iter_execution_trace_tensor_values(child)
+
+    def test_iter_execution_trace_tensor_values(self):
+        values = [
+            7,
+            [[11, 21, 0, 64, 4, "cuda:0"], "not_a_tensor"],
+            [31, 41, 2, 16, 2, "cpu"],
+        ]
+        self.assertEqual(
+            list(self.iter_execution_trace_tensor_values(values)),
+            [
+                [11, 21, 0, 64, 4, "cuda:0"],
+                [31, 41, 2, 16, 2, "cpu"],
+            ],
+        )
+
     def get_kineto_rf_ids(self, events: list[Json]) -> list[int]:
         """Returns a sorted list of Record function IDs for CPU operators and user annotations"""
         ops_and_annotations = (
@@ -446,6 +472,15 @@ class TestExecutionTrace(TestCase):
                             raise AssertionError(
                                 "Expected triton node to have input values"
                             )
+                        tensor_values = list(
+                            self.iter_execution_trace_tensor_values(
+                                n["inputs"]["values"]
+                            )
+                        )
+                        if len(tensor_values) <= 0:
+                            raise AssertionError(
+                                "Expected triton node to have tensor-valued inputs"
+                            )
                         if len(n["outputs"]["values"]) != 0:
                             raise AssertionError(
                                 "Expected triton node to have no output values"
@@ -522,6 +557,15 @@ class TestExecutionTrace(TestCase):
                         if len(n["inputs"]["values"]) <= 0:
                             raise AssertionError(
                                 "Expected triton node to have input values"
+                            )
+                        tensor_values = list(
+                            self.iter_execution_trace_tensor_values(
+                                n["inputs"]["values"]
+                            )
+                        )
+                        if len(tensor_values) <= 0:
+                            raise AssertionError(
+                                "Expected triton node to have tensor-valued inputs"
                             )
                         if len(n["outputs"]["values"]) != 0:
                             raise AssertionError(

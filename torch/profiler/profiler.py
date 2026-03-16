@@ -305,6 +305,14 @@ class _KinetoProfile:
         else:
             return self.profiler.export_chrome_trace(path)
 
+    def export_csv(self, path: str):
+        """
+        Exports the collected trace as normalized per-event CSV rows.
+        """
+        if self.profiler is None:
+            raise AssertionError("Profiler must be initialized before exporting CSV")
+        return self.profiler.export_csv(path)
+
     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
         """Save stack traces to a file
 

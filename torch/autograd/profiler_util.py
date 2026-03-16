@@ -1,6 +1,8 @@
 # mypy: allow-untyped-defs
 import bisect
+import csv
 import itertools
+import json
 import math
 from collections import defaultdict, namedtuple
 from operator import attrgetter
@@ -337,6 +339,174 @@ class EventList(list):
                 f.seek(f.tell() - 2, os.SEEK_SET)
                 f.truncate()
             f.write("]")
+
+    @staticmethod
+    def _csv_jsonify(value):
+        if isinstance(value, DeviceType):
+            return value.name
+        if isinstance(value, tuple):
+            return [EventList._csv_jsonify(v) for v in value]
+        if isinstance(value, list):
+            return [EventList._csv_jsonify(v) for v in value]
+        if isinstance(value, dict):
+            return {
+                str(key): EventList._csv_jsonify(val) for key, val in value.items()
+            }
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    @staticmethod
+    def _csv_cell(value):
+        value = EventList._csv_jsonify(value)
+        if value is None:
+            return ""
+        if isinstance(value, (list, dict)):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return value
+
+    @staticmethod
+    def _event_depth(event):
+        depth = 0
+        parent = getattr(event, "cpu_parent", None)
+        while parent is not None:
+            depth += 1
+            parent = getattr(parent, "cpu_parent", None)
+        return depth
+
+    def export_csv(self, path: str):
+        """Export an EventList as a CSV file.
+
+        The CSV preserves the current EventList ordering. For profiler results
+        returned by :meth:`torch.autograd.profiler.profile.events`, that order is
+        chronological by ``(start_us, -end_us)``.
+
+        Args:
+            path (str): Path where the CSV will be written.
+        """
+        fieldnames = [
+            "event_index",
+            "id",
+            "name",
+            "overload_name",
+            "trace_name",
+            "start_us",
+            "end_us",
+            "duration_us",
+            "self_cpu_time_total_us",
+            "cpu_time_total_us",
+            "self_device_time_total_us",
+            "device_time_total_us",
+            "thread",
+            "fwd_thread",
+            "device_type",
+            "device_index",
+            "device_resource_id",
+            "node_id",
+            "sequence_nr",
+            "scope",
+            "depth",
+            "cpu_parent_id",
+            "cpu_children",
+            "kernel_count",
+            "kernel_names",
+            "kernel_durations_us",
+            "is_async",
+            "is_remote",
+            "is_legacy",
+            "is_user_annotation",
+            "flops",
+            "cpu_memory_usage",
+            "self_cpu_memory_usage",
+            "device_memory_usage",
+            "self_device_memory_usage",
+            "input_shapes",
+            "concrete_inputs",
+            "kwinputs",
+            "stack",
+            "metadata_json",
+        ]
+
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for event_index, evt in enumerate(self):
+                if hasattr(evt, "trace_name") and getattr(evt, "trace_name") is None:
+                    continue
+
+                time_range = getattr(evt, "time_range", None)
+                start_us = getattr(time_range, "start", "")
+                end_us = getattr(time_range, "end", "")
+                duration_us = (
+                    time_range.elapsed_us() if time_range is not None else ""
+                )
+                kernels = getattr(evt, "kernels", [])
+                parent = getattr(evt, "cpu_parent", None)
+
+                writer.writerow(
+                    {
+                        "event_index": event_index,
+                        "id": getattr(evt, "id", ""),
+                        "name": getattr(evt, "name", ""),
+                        "overload_name": getattr(evt, "overload_name", ""),
+                        "trace_name": getattr(evt, "trace_name", ""),
+                        "start_us": start_us,
+                        "end_us": end_us,
+                        "duration_us": duration_us,
+                        "self_cpu_time_total_us": getattr(
+                            evt, "self_cpu_time_total", ""
+                        ),
+                        "cpu_time_total_us": getattr(evt, "cpu_time_total", ""),
+                        "self_device_time_total_us": getattr(
+                            evt, "self_device_time_total", ""
+                        ),
+                        "device_time_total_us": getattr(evt, "device_time_total", ""),
+                        "thread": getattr(evt, "thread", ""),
+                        "fwd_thread": getattr(evt, "fwd_thread", ""),
+                        "device_type": self._csv_cell(getattr(evt, "device_type", "")),
+                        "device_index": getattr(evt, "device_index", ""),
+                        "device_resource_id": getattr(evt, "device_resource_id", ""),
+                        "node_id": getattr(evt, "node_id", ""),
+                        "sequence_nr": getattr(evt, "sequence_nr", ""),
+                        "scope": getattr(evt, "scope", ""),
+                        "depth": self._event_depth(evt),
+                        "cpu_parent_id": getattr(parent, "id", "") if parent else "",
+                        "cpu_children": len(getattr(evt, "cpu_children", [])),
+                        "kernel_count": len(kernels),
+                        "kernel_names": self._csv_cell(
+                            [kernel.name for kernel in kernels]
+                        ),
+                        "kernel_durations_us": self._csv_cell(
+                            [kernel.duration for kernel in kernels]
+                        ),
+                        "is_async": getattr(evt, "is_async", ""),
+                        "is_remote": getattr(evt, "is_remote", ""),
+                        "is_legacy": getattr(evt, "is_legacy", ""),
+                        "is_user_annotation": getattr(
+                            evt, "is_user_annotation", ""
+                        ),
+                        "flops": getattr(evt, "flops", ""),
+                        "cpu_memory_usage": getattr(evt, "cpu_memory_usage", ""),
+                        "self_cpu_memory_usage": getattr(
+                            evt, "self_cpu_memory_usage", ""
+                        ),
+                        "device_memory_usage": getattr(
+                            evt, "device_memory_usage", ""
+                        ),
+                        "self_device_memory_usage": getattr(
+                            evt, "self_device_memory_usage", ""
+                        ),
+                        "input_shapes": self._csv_cell(
+                            getattr(evt, "input_shapes", "")
+                        ),
+                        "concrete_inputs": self._csv_cell(
+                            getattr(evt, "concrete_inputs", "")
+                        ),
+                        "kwinputs": self._csv_cell(getattr(evt, "kwinputs", "")),
+                        "stack": self._csv_cell(getattr(evt, "stack", "")),
+                        "metadata_json": getattr(evt, "metadata_json", ""),
+                    }
+                )
 
     def supported_export_stacks_metrics(self):
         return [

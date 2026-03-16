@@ -1,0 +1,814 @@
+diff --git a/test/profiler/test_profiler.py b/test/profiler/test_profiler.py
+index 0a574a34ba9..79377722a2c 100644
+--- a/test/profiler/test_profiler.py
++++ b/test/profiler/test_profiler.py
+@@ -3,6 +3,7 @@
+ 
+ import collections
+ import copy
++import csv
+ import gc
+ import json
+ import mmap
+@@ -1217,6 +1218,68 @@ class TestProfiler(TestCase):
+                 if not is_int:
+                     raise AssertionError("Invalid stacks record")
+ 
++    def test_export_csv(self):
++        with _profile(
++            with_stack=True,
++            record_shapes=True,
++            use_kineto=kineto_available(),
++            experimental_config=_ExperimentalConfig(verbose=True),
++        ) as p:
++            x = torch.randn(8, 8)
++            y = torch.randn(8, 8)
++            with record_function("csv_parent"):
++                z = torch.mm(x, y)
++                z = z + y
++
++        with TemporaryFileName(mode="w+") as fname:
++            p.export_csv(fname)
++            with open(fname, newline="") as f:
++                rows = list(csv.DictReader(f))
++
++        if len(rows) <= 0:
++            raise AssertionError("Empty CSV file")
++
++        expected_columns = {
++            "event_index",
++            "id",
++            "name",
++            "start_us",
++            "end_us",
++            "duration_us",
++            "device_type",
++            "thread",
++            "depth",
++            "cpu_parent_id",
++            "kernel_count",
++            "input_shapes",
++            "stack",
++            "metadata_json",
++        }
++        if not expected_columns.issubset(rows[0].keys()):
++            raise AssertionError(
++                f"Missing expected CSV columns: {expected_columns - set(rows[0].keys())}"
++            )
++
++        timestamps = [
++            (float(row["start_us"]), -float(row["end_us"]))
++            for row in rows
++            if row["start_us"] and row["end_us"]
++        ]
++        self.assertEqual(timestamps, sorted(timestamps))
++
++        csv_parent = next((row for row in rows if row["name"] == "csv_parent"), None)
++        if csv_parent is None:
++            raise AssertionError("Could not find csv_parent row")
++        self.assertEqual(csv_parent["device_type"], "CPU")
++        self.assertEqual(csv_parent["depth"], "0")
++        self.assertEqual(csv_parent["is_user_annotation"], "True")
++
++        aten_mm = next((row for row in rows if row["name"] == "aten::mm"), None)
++        if aten_mm is None:
++            raise AssertionError("Could not find aten::mm row")
++        self.assertEqual(aten_mm["cpu_parent_id"], csv_parent["id"])
++        self.assertGreaterEqual(int(aten_mm["depth"]), 1)
++
+     def test_experimental_config_pickle(self):
+         with warnings.catch_warnings():
+             warnings.simplefilter("ignore", BytesWarning)
+@@ -2238,6 +2301,107 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
+             else:
+                 self.assertFalse(evt.is_user_annotation)
+ 
++    @unittest.skipIf(not kineto_available(), "Kineto is required")
++    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
++    def test_user_annotation_args_metadata(self):
++        annotation_args = "sample_step=1 phase=diffusion_cond sigma=0.125000"
++
++        with profile(activities=[ProfilerActivity.CPU]) as prof:
++            with torch.profiler.record_function(
++                "test_user_annotation_args",
++                annotation_args,
++            ):
++                torch.add(1, 5)
++
++        user_event = None
++        for event in prof.events():
++            if event.name == "test_user_annotation_args":
++                user_event = event
++                break
++
++        if user_event is None:
++            raise AssertionError("Could not find user annotation event")
++
++        self.assertTrue(user_event.is_user_annotation)
++        self.assertEqual(
++            json.loads(user_event.metadata_json),
++            {"user_annotation_args": annotation_args},
++        )
++
++        with TemporaryFileName(mode="w+") as fname:
++            prof.export_chrome_trace(fname)
++            with open(fname) as f:
++                events = json.load(f)["traceEvents"]
++                trace_event = None
++                for event in events:
++                    if event.get("name") == "test_user_annotation_args":
++                        trace_event = event
++                        break
++
++                if trace_event is None:
++                    raise AssertionError("Could not find user annotation in trace")
++
++                self.assertEqual(trace_event["cat"], "user_annotation")
++                self.assertEqual(
++                    trace_event["args"]["user_annotation_args"], annotation_args
++                )
++
++    @unittest.skipIf(not kineto_available(), "Kineto is required")
++    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
++    def test_user_annotation_fast_kwargs_without_record_shapes(self):
++        x, y = (torch.rand((4, 4)) for _ in range(2))
++
++        with profile(activities=[ProfilerActivity.CPU]) as prof:
++            cm = torch._C._profiler._RecordFunctionFast(
++                "test_user_annotation_fast",
++                (),
++                {
++                    "scope": "user_scope",
++                    "sample_step": 3,
++                    "phase": "diffusion_uncond",
++                    "enabled": True,
++                },
++            )
++            with cm:
++                x.add(y)
++
++        user_event = None
++        for event in prof.events():
++            if event.name == "test_user_annotation_fast":
++                user_event = event
++                break
++
++        if user_event is None:
++            raise AssertionError("Could not find fast user annotation event")
++
++        self.assertTrue(user_event.is_user_annotation)
++        self.assertEqual(
++            json.loads(user_event.metadata_json),
++            {
++                "enabled": True,
++                "phase": "diffusion_uncond",
++                "sample_step": 3,
++            },
++        )
++
++        with TemporaryFileName(mode="w+") as fname:
++            prof.export_chrome_trace(fname)
++            with open(fname) as f:
++                events = json.load(f)["traceEvents"]
++                trace_event = None
++                for event in events:
++                    if event.get("name") == "test_user_annotation_fast":
++                        trace_event = event
++                        break
++
++                if trace_event is None:
++                    raise AssertionError("Could not find fast user annotation in trace")
++
++                self.assertEqual(trace_event["cat"], "user_annotation")
++                self.assertEqual(trace_event["args"]["sample_step"], 3)
++                self.assertEqual(trace_event["args"]["phase"], "diffusion_uncond")
++                self.assertTrue(trace_event["args"]["enabled"])
++
+     @unittest.skipUnless(TEST_CUDA or TEST_XPU, "requires gpu")
+     @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
+     def test_basic_profile(self):
+diff --git a/torch/autograd/profiler.py b/torch/autograd/profiler.py
+index e5b171a7489..b50c0eeffa2 100644
+--- a/torch/autograd/profiler.py
++++ b/torch/autograd/profiler.py
+@@ -526,6 +526,14 @@ class profile:
+ 
+     export_chrome_trace.__doc__ = EventList.export_chrome_trace.__doc__
+ 
++    def export_csv(self, path: str):
++        self._ensure_function_events()
++        if self._function_events is None:
++            raise AssertionError("Expected profiling results")
++        return self._function_events.export_csv(path)
++
++    export_csv.__doc__ = EventList.export_csv.__doc__
++
+     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
+         self._ensure_function_events()
+         if self._function_events is None:
+diff --git a/torch/autograd/profiler_legacy.py b/torch/autograd/profiler_legacy.py
+index 5dd26c08813..0f4e82e1fa6 100644
+--- a/torch/autograd/profiler_legacy.py
++++ b/torch/autograd/profiler_legacy.py
+@@ -159,6 +159,14 @@ class profile:
+ 
+     export_chrome_trace.__doc__ = EventList.export_chrome_trace.__doc__
+ 
++    def export_csv(self, path: str):
++        self._check_finish()
++        if self.function_events is None:
++            raise AssertionError("Expected profiling results")
++        return self.function_events.export_csv(path)
++
++    export_csv.__doc__ = EventList.export_csv.__doc__
++
+     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
+         self._check_finish()
+         if self.function_events is None:
+diff --git a/torch/autograd/profiler_util.py b/torch/autograd/profiler_util.py
+index c51ac870aa3..16c7fd600ad 100644
+--- a/torch/autograd/profiler_util.py
++++ b/torch/autograd/profiler_util.py
+@@ -1,6 +1,8 @@
+ # mypy: allow-untyped-defs
+ import bisect
++import csv
+ import itertools
++import json
+ import math
+ from collections import defaultdict, namedtuple
+ from operator import attrgetter
+@@ -338,6 +340,174 @@ class EventList(list):
+                 f.truncate()
+             f.write("]")
+ 
++    @staticmethod
++    def _csv_jsonify(value):
++        if isinstance(value, DeviceType):
++            return value.name
++        if isinstance(value, tuple):
++            return [EventList._csv_jsonify(v) for v in value]
++        if isinstance(value, list):
++            return [EventList._csv_jsonify(v) for v in value]
++        if isinstance(value, dict):
++            return {
++                str(key): EventList._csv_jsonify(val) for key, val in value.items()
++            }
++        if value is None or isinstance(value, (str, int, float, bool)):
++            return value
++        return str(value)
++
++    @staticmethod
++    def _csv_cell(value):
++        value = EventList._csv_jsonify(value)
++        if value is None:
++            return ""
++        if isinstance(value, (list, dict)):
++            return json.dumps(value, sort_keys=True, separators=(",", ":"))
++        return value
++
++    @staticmethod
++    def _event_depth(event):
++        depth = 0
++        parent = getattr(event, "cpu_parent", None)
++        while parent is not None:
++            depth += 1
++            parent = getattr(parent, "cpu_parent", None)
++        return depth
++
++    def export_csv(self, path: str):
++        """Export an EventList as a CSV file.
++
++        The CSV preserves the current EventList ordering. For profiler results
++        returned by :meth:`torch.autograd.profiler.profile.events`, that order is
++        chronological by ``(start_us, -end_us)``.
++
++        Args:
++            path (str): Path where the CSV will be written.
++        """
++        fieldnames = [
++            "event_index",
++            "id",
++            "name",
++            "overload_name",
++            "trace_name",
++            "start_us",
++            "end_us",
++            "duration_us",
++            "self_cpu_time_total_us",
++            "cpu_time_total_us",
++            "self_device_time_total_us",
++            "device_time_total_us",
++            "thread",
++            "fwd_thread",
++            "device_type",
++            "device_index",
++            "device_resource_id",
++            "node_id",
++            "sequence_nr",
++            "scope",
++            "depth",
++            "cpu_parent_id",
++            "cpu_children",
++            "kernel_count",
++            "kernel_names",
++            "kernel_durations_us",
++            "is_async",
++            "is_remote",
++            "is_legacy",
++            "is_user_annotation",
++            "flops",
++            "cpu_memory_usage",
++            "self_cpu_memory_usage",
++            "device_memory_usage",
++            "self_device_memory_usage",
++            "input_shapes",
++            "concrete_inputs",
++            "kwinputs",
++            "stack",
++            "metadata_json",
++        ]
++
++        with open(path, "w", newline="") as f:
++            writer = csv.DictWriter(f, fieldnames=fieldnames)
++            writer.writeheader()
++            for event_index, evt in enumerate(self):
++                if hasattr(evt, "trace_name") and getattr(evt, "trace_name") is None:
++                    continue
++
++                time_range = getattr(evt, "time_range", None)
++                start_us = getattr(time_range, "start", "")
++                end_us = getattr(time_range, "end", "")
++                duration_us = (
++                    time_range.elapsed_us() if time_range is not None else ""
++                )
++                kernels = getattr(evt, "kernels", [])
++                parent = getattr(evt, "cpu_parent", None)
++
++                writer.writerow(
++                    {
++                        "event_index": event_index,
++                        "id": getattr(evt, "id", ""),
++                        "name": getattr(evt, "name", ""),
++                        "overload_name": getattr(evt, "overload_name", ""),
++                        "trace_name": getattr(evt, "trace_name", ""),
++                        "start_us": start_us,
++                        "end_us": end_us,
++                        "duration_us": duration_us,
++                        "self_cpu_time_total_us": getattr(
++                            evt, "self_cpu_time_total", ""
++                        ),
++                        "cpu_time_total_us": getattr(evt, "cpu_time_total", ""),
++                        "self_device_time_total_us": getattr(
++                            evt, "self_device_time_total", ""
++                        ),
++                        "device_time_total_us": getattr(evt, "device_time_total", ""),
++                        "thread": getattr(evt, "thread", ""),
++                        "fwd_thread": getattr(evt, "fwd_thread", ""),
++                        "device_type": self._csv_cell(getattr(evt, "device_type", "")),
++                        "device_index": getattr(evt, "device_index", ""),
++                        "device_resource_id": getattr(evt, "device_resource_id", ""),
++                        "node_id": getattr(evt, "node_id", ""),
++                        "sequence_nr": getattr(evt, "sequence_nr", ""),
++                        "scope": getattr(evt, "scope", ""),
++                        "depth": self._event_depth(evt),
++                        "cpu_parent_id": getattr(parent, "id", "") if parent else "",
++                        "cpu_children": len(getattr(evt, "cpu_children", [])),
++                        "kernel_count": len(kernels),
++                        "kernel_names": self._csv_cell(
++                            [kernel.name for kernel in kernels]
++                        ),
++                        "kernel_durations_us": self._csv_cell(
++                            [kernel.duration for kernel in kernels]
++                        ),
++                        "is_async": getattr(evt, "is_async", ""),
++                        "is_remote": getattr(evt, "is_remote", ""),
++                        "is_legacy": getattr(evt, "is_legacy", ""),
++                        "is_user_annotation": getattr(
++                            evt, "is_user_annotation", ""
++                        ),
++                        "flops": getattr(evt, "flops", ""),
++                        "cpu_memory_usage": getattr(evt, "cpu_memory_usage", ""),
++                        "self_cpu_memory_usage": getattr(
++                            evt, "self_cpu_memory_usage", ""
++                        ),
++                        "device_memory_usage": getattr(
++                            evt, "device_memory_usage", ""
++                        ),
++                        "self_device_memory_usage": getattr(
++                            evt, "self_device_memory_usage", ""
++                        ),
++                        "input_shapes": self._csv_cell(
++                            getattr(evt, "input_shapes", "")
++                        ),
++                        "concrete_inputs": self._csv_cell(
++                            getattr(evt, "concrete_inputs", "")
++                        ),
++                        "kwinputs": self._csv_cell(getattr(evt, "kwinputs", "")),
++                        "stack": self._csv_cell(getattr(evt, "stack", "")),
++                        "metadata_json": getattr(evt, "metadata_json", ""),
++                    }
++                )
++
+     def supported_export_stacks_metrics(self):
+         return [
+             "self_cpu_time_total",
+diff --git a/torch/csrc/autograd/record_function_ops.cpp b/torch/csrc/autograd/record_function_ops.cpp
+index 09f7311dbef..21e55f4112e 100644
+--- a/torch/csrc/autograd/record_function_ops.cpp
++++ b/torch/csrc/autograd/record_function_ops.cpp
+@@ -21,7 +21,7 @@ static void record_function_enter(
+     const std::optional<std::string>& args,
+     at::RecordFunction& rec) {
+   if (rec.isActive()) {
+-    if (rec.needsInputs() && args.has_value()) {
++    if (args.has_value()) {
+       rec.before(
+           name, c10::ArrayRef<const c10::IValue>{c10::IValue{args.value()}});
+     } else {
+diff --git a/torch/csrc/profiler/collection.cpp b/torch/csrc/profiler/collection.cpp
+index 617316617fc..30a75b0c52e 100644
+--- a/torch/csrc/profiler/collection.cpp
++++ b/torch/csrc/profiler/collection.cpp
+@@ -6,6 +6,7 @@
+ #include <limits>
+ #include <memory>
+ #include <queue>
++#include <string_view>
+ #include <type_traits>
+ #include <utility>
+ 
+@@ -23,6 +24,7 @@
+ #include <torch/csrc/jit/runtime/interpreter.h>
+ #include <torch/csrc/profiler/data_flow.h>
+ #include <torch/csrc/profiler/kineto_shim.h>
++#include <torch/csrc/profiler/util.h>
+ 
+ namespace torch::profiler::impl {
+ using result_ptr_t = std::shared_ptr<Result>;
+@@ -75,6 +77,10 @@ struct TagToIOType {
+   InputOutputEncoder::IOType io_type;
+ };
+ 
++constexpr const char* kUserAnnotationArgsMetadataKey = "user_annotation_args";
++constexpr const char* kUserAnnotationScopeKey = "scope";
++constexpr const char* kUserAnnotationScopeValue = "user_scope";
++
+ constexpr int tagCount = ((int)InputOutputEncoder::Tag::TERMINATOR) + 1;
+ constexpr std::array<TagToIOType, tagCount> tag_map = {{
+     {InputOutputEncoder::Tag::Tensor, InputOutputEncoder::IOType::Shapes},
+@@ -98,6 +104,143 @@ static_assert(allTagsMapped(), "tag_map is out of order");
+ constexpr InputOutputEncoder::IOType tagToIOType(InputOutputEncoder::Tag tag) {
+   return tag_map[(int)tag].io_type;
+ }
++
++static std::string jsonEscapeString(std::string_view value) {
++  std::string out;
++  out.reserve(value.size());
++  for (const char c : value) {
++    switch (c) {
++      case '\\':
++        out += "\\\\";
++        break;
++      case '"':
++        out += "\\\"";
++        break;
++      case '\b':
++        out += "\\b";
++        break;
++      case '\f':
++        out += "\\f";
++        break;
++      case '\n':
++        out += "\\n";
++        break;
++      case '\r':
++        out += "\\r";
++        break;
++      case '\t':
++        out += "\\t";
++        break;
++      default:
++        out += c;
++        break;
++    }
++  }
++  return out;
++}
++
++static std::optional<std::string> userAnnotationValueToJson(
++    const c10::IValue& value) {
++  if (value.isString()) {
++    return fmt::format(
++        "\"{}\"", jsonEscapeString(std::string(value.toStringRef())));
++  }
++  if (value.isInt() || value.isDouble() || value.isBool()) {
++    return ivalueToStr(value, /*isString=*/false);
++  }
++  if (value.isList()) {
++    const auto list = value.toListRef();
++    const bool is_string_list = std::all_of(
++        list.begin(), list.end(), [](const c10::IValue& item) {
++          return item.isString();
++        });
++    if (is_string_list) {
++      std::vector<c10::IValue> string_list(list.begin(), list.end());
++      return ivalueListToStr(string_list);
++    }
++  }
++  return std::nullopt;
++}
++
++static extra_meta_t buildUserAnnotationExtraMeta(
++    const at::RecordFunction& fn,
++    const bool capture_kwinputs_from_record_function) {
++  extra_meta_t extra_meta;
++  if (fn.scope() != at::RecordScope::USER_SCOPE) {
++    return extra_meta;
++  }
++
++  const auto inputs = fn.inputs();
++  if (inputs.size() == 1 && inputs[0].isString()) {
++    extra_meta.emplace(
++        kUserAnnotationArgsMetadataKey,
++        fmt::format(
++            "\"{}\"",
++            jsonEscapeString(std::string(inputs[0].toStringRef()))));
++  }
++
++  if (!capture_kwinputs_from_record_function) {
++    return extra_meta;
++  }
++
++  for (const auto& [key, value] : fn.kwinputs()) {
++    if (key == kUserAnnotationScopeKey &&
++        value.isString() &&
++        std::string(value.toStringRef()) == kUserAnnotationScopeValue) {
++      continue;
++    }
++    auto json_value = userAnnotationValueToJson(value);
++    if (json_value.has_value()) {
++      extra_meta.emplace(key, std::move(*json_value));
++    }
++  }
++
++  return extra_meta;
++}
++
++static std::string buildUserAnnotationMetadataJson(
++    const extra_meta_t& extra_meta,
++    const kwinputs_t& kwinputs) {
++  extra_meta_t metadata = extra_meta;
++
++  for (const auto& [key, value] : kwinputs) {
++    if (metadata.count(key) != 0) {
++      continue;
++    }
++    if (key == kUserAnnotationScopeKey &&
++        value.isString() &&
++        std::string(value.toStringRef()) == kUserAnnotationScopeValue) {
++      continue;
++    }
++    auto json_value = userAnnotationValueToJson(value);
++    if (json_value.has_value()) {
++      metadata.emplace(key, std::move(*json_value));
++    }
++  }
++
++  if (metadata.empty()) {
++    return "";
++  }
++
++  std::vector<std::pair<std::string, std::string>> sorted_metadata(
++      metadata.begin(), metadata.end());
++  std::sort(
++      sorted_metadata.begin(),
++      sorted_metadata.end(),
++      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
++
++  std::string json = "{";
++  bool first = true;
++  for (const auto& [key, value] : sorted_metadata) {
++    if (!first) {
++      json += ", ";
++    }
++    first = false;
++    json += fmt::format("\"{}\": {}", jsonEscapeString(key), value);
++  }
++  json += "}";
++  return json;
++}
+ } // namespace
+ 
+ // ----------------------------
+@@ -326,6 +469,11 @@ uint64_t ThreadLocalSubqueue::TorchOpStorage::EventBlock<T, ChunkSize>::
+ // ---------------------------------
+ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
+     const at::RecordFunction& fn) {
++  const bool capture_user_annotation_kwinputs =
++      fn.scope() == at::RecordScope::USER_SCOPE &&
++      !config_.report_input_shapes;
++  extra_meta_t extra_meta =
++      buildUserAnnotationExtraMeta(fn, capture_user_annotation_kwinputs);
+   auto overload_name = config_.experimental_config.capture_overload_names
+       ? fn.overload_name()
+       : "";
+@@ -375,10 +523,13 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
+     // if needed.
+     torch::profiler::impl::SaveNcclMetaConfig ncclMetaConfig{
+         true, true, true, false};
+-    out->event_->extra_nccl_meta_ = torch_ops_.extra_meta_.emplace_back(
+-        torch::profiler::impl::saveNcclMeta(fn, ncclMetaConfig));
++    auto nccl_meta = torch::profiler::impl::saveNcclMeta(fn, ncclMetaConfig);
++    extra_meta.insert(nccl_meta.begin(), nccl_meta.end());
++    out->event_->extra_nccl_meta_ =
++        torch_ops_.extra_meta_.emplace_back(std::move(extra_meta));
+   } else {
+-    out->event_->extra_nccl_meta_ = torch_ops_.extra_meta_.emplace_back();
++    out->event_->extra_nccl_meta_ =
++        torch_ops_.extra_meta_.emplace_back(std::move(extra_meta));
+   }
+ 
+   if (config_.state == ProfilerState::KINETO_GPU_FALLBACK) {
+@@ -503,6 +654,11 @@ void ThreadLocalSubqueue::TorchOpStorage::materialize(
+         event->allow_tf32_cublas_,
+         std::move(event->counters_)};
+ 
++    if (e.scope_ == at::RecordScope::USER_SCOPE) {
++      e.metadata_json_ =
++          buildUserAnnotationMetadataJson(e.extra_meta_, e.kwinputs_);
++    }
++
+     if (e.name_.find(profilerStepString) != std::string::npos) {
+       step_info.emplace_back(
+           time_converter(event->start_time_),
+diff --git a/torch/csrc/profiler/python/init.cpp b/torch/csrc/profiler/python/init.cpp
+index 68e033449bb..244bc3c5c94 100644
+--- a/torch/csrc/profiler/python/init.cpp
++++ b/torch/csrc/profiler/python/init.cpp
+@@ -241,7 +241,7 @@ PyObject* RecordFunctionFast_enter(PyObject* selfGeneric, PyObject* unused) {
+     }
+ 
+     // parse through kwargs if they exist
+-    if (self->keyword_values != nullptr && profiler_need_input) {
++    if (self->keyword_values != nullptr) {
+       const auto kw_size = PyDict_Size(self->keyword_values);
+       if (kw_size > 0) {
+         kwargs.reserve(static_cast<size_t>(kw_size));
+diff --git a/torch/profiler/profiler.py b/torch/profiler/profiler.py
+index e573ce570c6..2068b56fa51 100644
+--- a/torch/profiler/profiler.py
++++ b/torch/profiler/profiler.py
+@@ -305,6 +305,14 @@ class _KinetoProfile:
+         else:
+             return self.profiler.export_chrome_trace(path)
+ 
++    def export_csv(self, path: str):
++        """
++        Exports the collected trace as normalized per-event CSV rows.
++        """
++        if self.profiler is None:
++            raise AssertionError("Profiler must be initialized before exporting CSV")
++        return self.profiler.export_csv(path)
++
+     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
+         """Save stack traces to a file
+ 
+diff --git a/scripts/build-pytorch-profiler-cpu.sh b/scripts/build-pytorch-profiler-cpu.sh
+new file mode 100755
+index 00000000000..6018dd62c1c
+--- /dev/null
++++ b/scripts/build-pytorch-profiler-cpu.sh
+@@ -0,0 +1,132 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++show_help() {
++    cat <<'EOF'
++Usage:
++  script/build-pytorch-profiler-cpu.sh [--skip-deps] [--tests]
++
++Build the patched /data/pytorch-source as a CPU-only editable install.
++
++Environment overrides:
++  PT_SOURCE      PyTorch source tree (default: /data/pytorch-source)
++  PT_VENV        Virtualenv path (default: /tmp/ptvenv)
++  PT_PYTHON      Python executable used to create the venv (default: python3)
++  PT_JOBS        Parallel build jobs for ninja (default: nproc)
++  PT_SKIP_DEPS   Skip pip dependency installation when set to 1
++  PT_RUN_TESTS   Run profiler regression tests when set to 1
++EOF
++}
++
++PT_SOURCE="${PT_SOURCE:-/data/pytorch-source}"
++PT_VENV="${PT_VENV:-/tmp/ptvenv}"
++PT_PYTHON="${PT_PYTHON:-python3}"
++PT_JOBS="${PT_JOBS:-$(nproc)}"
++PT_SKIP_DEPS="${PT_SKIP_DEPS:-0}"
++PT_RUN_TESTS="${PT_RUN_TESTS:-0}"
++
++while [[ "$#" -gt 0 ]]; do
++    case "$1" in
++        --skip-deps)
++            PT_SKIP_DEPS=1
++            shift
++            ;;
++        --tests)
++            PT_RUN_TESTS=1
++            shift
++            ;;
++        -h|--help)
++            show_help
++            exit 0
++            ;;
++        *)
++            echo "error: unknown argument: $1" >&2
++            show_help >&2
++            exit 1
++            ;;
++    esac
++done
++
++if [[ ! -d "$PT_SOURCE" ]]; then
++    echo "error: PT_SOURCE does not exist: $PT_SOURCE" >&2
++    exit 1
++fi
++
++BUILD_DIR="$PT_SOURCE/build"
++if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
++    if grep -Eq '^USE_(CUDA|ROCM|XPU):BOOL=1$' "$BUILD_DIR/CMakeCache.txt"; then
++        BACKUP_DIR="${BUILD_DIR}-noncpu-backup-$(date +%Y%m%d-%H%M%S)"
++        echo "Moving existing non-CPU build cache to $BACKUP_DIR"
++        mv "$BUILD_DIR" "$BACKUP_DIR"
++    fi
++fi
++
++echo "Creating virtualenv at $PT_VENV"
++"$PT_PYTHON" -m venv "$PT_VENV"
++
++PYTHON_BIN="$PT_VENV/bin/python"
++PIP_BIN="$PT_VENV/bin/pip"
++PATH_PREFIX="$PT_VENV/bin:/usr/bin:/bin"
++
++if [[ "$PT_SKIP_DEPS" != "1" ]]; then
++    echo "Installing build and runtime dependencies"
++    "$PIP_BIN" install -r "$PT_SOURCE/requirements-build.txt"
++    "$PIP_BIN" install expecttest diffusers jinja2 networkx sympy filelock fsspec psutil
++    "$PIP_BIN" install --no-deps \
++        transformers==4.48.3 \
++        tokenizers==0.21.4 \
++        huggingface-hub==0.36.0
++fi
++
++echo "Configuring CPU-only PyTorch build"
++env \
++    PATH="$PATH_PREFIX" \
++    PYTHONNOUSERSITE=1 \
++    CMAKE_FRESH=1 \
++    CMAKE_ONLY=1 \
++    USE_CUDA=0 \
++    USE_ROCM=0 \
++    USE_XPU=0 \
++    BUILD_TEST=0 \
++    USE_DISTRIBUTED=0 \
++    CMAKE_GENERATOR=Ninja \
++    CMAKE_PREFIX_PATH="$PT_VENV" \
++    "$PYTHON_BIN" "$PT_SOURCE/setup.py" build
++
++echo "Building torch_python"
++env PATH="$PATH_PREFIX" ninja -C "$BUILD_DIR" -j "$PT_JOBS" torch_python
++
++echo "Installing editable PyTorch package"
++env \
++    PATH="$PATH_PREFIX" \
++    PYTHONNOUSERSITE=1 \
++    USE_CUDA=0 \
++    USE_ROCM=0 \
++    USE_XPU=0 \
++    BUILD_TEST=0 \
++    USE_DISTRIBUTED=0 \
++    CMAKE_GENERATOR=Ninja \
++    CMAKE_PREFIX_PATH="$PT_VENV" \
++    "$PIP_BIN" install --no-build-isolation -v -e "$PT_SOURCE"
++
++echo "Verifying import"
++env PYTHONNOUSERSITE=1 "$PYTHON_BIN" -c \
++    "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
++
++if [[ "$PT_RUN_TESTS" == "1" ]]; then
++    echo "Running profiler regression tests"
++    env PYTHONNOUSERSITE=1 "$PYTHON_BIN" \
++        "$PT_SOURCE/test/profiler/test_profiler.py" \
++        TestProfiler.test_user_annotation_args_metadata \
++        TestProfiler.test_user_annotation_fast_kwargs_without_record_shapes \
++        -v
++fi
++
++cat <<EOF
++Build completed.
++Venv: $PT_VENV
++PyTorch source: $PT_SOURCE
++
++Example:
++  PYTHONNOUSERSITE=1 $PYTHON_BIN -c "import torch; print(torch.__version__)"
++EOF

@@ -3,6 +3,7 @@
 
 import collections
 import copy
+import csv
 import gc
 import json
 import mmap
@@ -1217,6 +1218,68 @@ class TestProfiler(TestCase):
                 if not is_int:
                     raise AssertionError("Invalid stacks record")
 
+    def test_export_csv(self):
+        with _profile(
+            with_stack=True,
+            record_shapes=True,
+            use_kineto=kineto_available(),
+            experimental_config=_ExperimentalConfig(verbose=True),
+        ) as p:
+            x = torch.randn(8, 8)
+            y = torch.randn(8, 8)
+            with record_function("csv_parent"):
+                z = torch.mm(x, y)
+                z = z + y
+
+        with TemporaryFileName(mode="w+") as fname:
+            p.export_csv(fname)
+            with open(fname, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        if len(rows) <= 0:
+            raise AssertionError("Empty CSV file")
+
+        expected_columns = {
+            "event_index",
+            "id",
+            "name",
+            "start_us",
+            "end_us",
+            "duration_us",
+            "device_type",
+            "thread",
+            "depth",
+            "cpu_parent_id",
+            "kernel_count",
+            "input_shapes",
+            "stack",
+            "metadata_json",
+        }
+        if not expected_columns.issubset(rows[0].keys()):
+            raise AssertionError(
+                f"Missing expected CSV columns: {expected_columns - set(rows[0].keys())}"
+            )
+
+        timestamps = [
+            (float(row["start_us"]), -float(row["end_us"]))
+            for row in rows
+            if row["start_us"] and row["end_us"]
+        ]
+        self.assertEqual(timestamps, sorted(timestamps))
+
+        csv_parent = next((row for row in rows if row["name"] == "csv_parent"), None)
+        if csv_parent is None:
+            raise AssertionError("Could not find csv_parent row")
+        self.assertEqual(csv_parent["device_type"], "CPU")
+        self.assertEqual(csv_parent["depth"], "0")
+        self.assertEqual(csv_parent["is_user_annotation"], "True")
+
+        aten_mm = next((row for row in rows if row["name"] == "aten::mm"), None)
+        if aten_mm is None:
+            raise AssertionError("Could not find aten::mm row")
+        self.assertEqual(aten_mm["cpu_parent_id"], csv_parent["id"])
+        self.assertGreaterEqual(int(aten_mm["depth"]), 1)
+
     def test_experimental_config_pickle(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", BytesWarning)
@@ -2237,6 +2300,107 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
                 self.assertTrue(evt.is_user_annotation)
             else:
                 self.assertFalse(evt.is_user_annotation)
+
+    @unittest.skipIf(not kineto_available(), "Kineto is required")
+    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
+    def test_user_annotation_args_metadata(self):
+        annotation_args = "sample_step=1 phase=diffusion_cond sigma=0.125000"
+
+        with profile(activities=[ProfilerActivity.CPU]) as prof:
+            with torch.profiler.record_function(
+                "test_user_annotation_args",
+                annotation_args,
+            ):
+                torch.add(1, 5)
+
+        user_event = None
+        for event in prof.events():
+            if event.name == "test_user_annotation_args":
+                user_event = event
+                break
+
+        if user_event is None:
+            raise AssertionError("Could not find user annotation event")
+
+        self.assertTrue(user_event.is_user_annotation)
+        self.assertEqual(
+            json.loads(user_event.metadata_json),
+            {"user_annotation_args": annotation_args},
+        )
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                events = json.load(f)["traceEvents"]
+                trace_event = None
+                for event in events:
+                    if event.get("name") == "test_user_annotation_args":
+                        trace_event = event
+                        break
+
+                if trace_event is None:
+                    raise AssertionError("Could not find user annotation in trace")
+
+                self.assertEqual(trace_event["cat"], "user_annotation")
+                self.assertEqual(
+                    trace_event["args"]["user_annotation_args"], annotation_args
+                )
+
+    @unittest.skipIf(not kineto_available(), "Kineto is required")
+    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
+    def test_user_annotation_fast_kwargs_without_record_shapes(self):
+        x, y = (torch.rand((4, 4)) for _ in range(2))
+
+        with profile(activities=[ProfilerActivity.CPU]) as prof:
+            cm = torch._C._profiler._RecordFunctionFast(
+                "test_user_annotation_fast",
+                (),
+                {
+                    "scope": "user_scope",
+                    "sample_step": 3,
+                    "phase": "diffusion_uncond",
+                    "enabled": True,
+                },
+            )
+            with cm:
+                x.add(y)
+
+        user_event = None
+        for event in prof.events():
+            if event.name == "test_user_annotation_fast":
+                user_event = event
+                break
+
+        if user_event is None:
+            raise AssertionError("Could not find fast user annotation event")
+
+        self.assertTrue(user_event.is_user_annotation)
+        self.assertEqual(
+            json.loads(user_event.metadata_json),
+            {
+                "enabled": True,
+                "phase": "diffusion_uncond",
+                "sample_step": 3,
+            },
+        )
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                events = json.load(f)["traceEvents"]
+                trace_event = None
+                for event in events:
+                    if event.get("name") == "test_user_annotation_fast":
+                        trace_event = event
+                        break
+
+                if trace_event is None:
+                    raise AssertionError("Could not find fast user annotation in trace")
+
+                self.assertEqual(trace_event["cat"], "user_annotation")
+                self.assertEqual(trace_event["args"]["sample_step"], 3)
+                self.assertEqual(trace_event["args"]["phase"], "diffusion_uncond")
+                self.assertTrue(trace_event["args"]["enabled"])
 
     @unittest.skipUnless(TEST_CUDA or TEST_XPU, "requires gpu")
     @skipIfTorchDynamo("profiler gets ignored if dynamo activated")

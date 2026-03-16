@@ -159,6 +159,14 @@ class profile:
 
     export_chrome_trace.__doc__ = EventList.export_chrome_trace.__doc__
 
+    def export_csv(self, path: str):
+        self._check_finish()
+        if self.function_events is None:
+            raise AssertionError("Expected profiling results")
+        return self.function_events.export_csv(path)
+
+    export_csv.__doc__ = EventList.export_csv.__doc__
+
     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
         self._check_finish()
         if self.function_events is None:

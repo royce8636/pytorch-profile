@@ -1,0 +1,354 @@
+diff --git a/test/profiler/test_profiler.py b/test/profiler/test_profiler.py
+index 0a574a34ba9..ace47107b85 100644
+--- a/test/profiler/test_profiler.py
++++ b/test/profiler/test_profiler.py
+@@ -2238,6 +2238,107 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
+             else:
+                 self.assertFalse(evt.is_user_annotation)
+ 
++    @unittest.skipIf(not kineto_available(), "Kineto is required")
++    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
++    def test_user_annotation_args_metadata(self):
++        annotation_args = "sample_step=1 phase=diffusion_cond sigma=0.125000"
++
++        with profile(activities=[ProfilerActivity.CPU]) as prof:
++            with torch.profiler.record_function(
++                "test_user_annotation_args",
++                annotation_args,
++            ):
++                torch.add(1, 5)
++
++        user_event = None
++        for event in prof.events():
++            if event.name == "test_user_annotation_args":
++                user_event = event
++                break
++
++        if user_event is None:
++            raise AssertionError("Could not find user annotation event")
++
++        self.assertTrue(user_event.is_user_annotation)
++        self.assertEqual(
++            json.loads(user_event.metadata_json),
++            {"user_annotation_args": annotation_args},
++        )
++
++        with TemporaryFileName(mode="w+") as fname:
++            prof.export_chrome_trace(fname)
++            with open(fname) as f:
++                events = json.load(f)["traceEvents"]
++                trace_event = None
++                for event in events:
++                    if event.get("name") == "test_user_annotation_args":
++                        trace_event = event
++                        break
++
++                if trace_event is None:
++                    raise AssertionError("Could not find user annotation in trace")
++
++                self.assertEqual(trace_event["cat"], "user_annotation")
++                self.assertEqual(
++                    trace_event["args"]["user_annotation_args"], annotation_args
++                )
++
++    @unittest.skipIf(not kineto_available(), "Kineto is required")
++    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
++    def test_user_annotation_fast_kwargs_without_record_shapes(self):
++        x, y = (torch.rand((4, 4)) for _ in range(2))
++
++        with profile(activities=[ProfilerActivity.CPU]) as prof:
++            cm = torch._C._profiler._RecordFunctionFast(
++                "test_user_annotation_fast",
++                (),
++                {
++                    "scope": "user_scope",
++                    "sample_step": 3,
++                    "phase": "diffusion_uncond",
++                    "enabled": True,
++                },
++            )
++            with cm:
++                x.add(y)
++
++        user_event = None
++        for event in prof.events():
++            if event.name == "test_user_annotation_fast":
++                user_event = event
++                break
++
++        if user_event is None:
++            raise AssertionError("Could not find fast user annotation event")
++
++        self.assertTrue(user_event.is_user_annotation)
++        self.assertEqual(
++            json.loads(user_event.metadata_json),
++            {
++                "enabled": True,
++                "phase": "diffusion_uncond",
++                "sample_step": 3,
++            },
++        )
++
++        with TemporaryFileName(mode="w+") as fname:
++            prof.export_chrome_trace(fname)
++            with open(fname) as f:
++                events = json.load(f)["traceEvents"]
++                trace_event = None
++                for event in events:
++                    if event.get("name") == "test_user_annotation_fast":
++                        trace_event = event
++                        break
++
++                if trace_event is None:
++                    raise AssertionError("Could not find fast user annotation in trace")
++
++                self.assertEqual(trace_event["cat"], "user_annotation")
++                self.assertEqual(trace_event["args"]["sample_step"], 3)
++                self.assertEqual(trace_event["args"]["phase"], "diffusion_uncond")
++                self.assertTrue(trace_event["args"]["enabled"])
++
+     @unittest.skipUnless(TEST_CUDA or TEST_XPU, "requires gpu")
+     @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
+     def test_basic_profile(self):
+diff --git a/torch/csrc/autograd/record_function_ops.cpp b/torch/csrc/autograd/record_function_ops.cpp
+index 09f7311dbef..21e55f4112e 100644
+--- a/torch/csrc/autograd/record_function_ops.cpp
++++ b/torch/csrc/autograd/record_function_ops.cpp
+@@ -21,7 +21,7 @@ static void record_function_enter(
+     const std::optional<std::string>& args,
+     at::RecordFunction& rec) {
+   if (rec.isActive()) {
+-    if (rec.needsInputs() && args.has_value()) {
++    if (args.has_value()) {
+       rec.before(
+           name, c10::ArrayRef<const c10::IValue>{c10::IValue{args.value()}});
+     } else {
+diff --git a/torch/csrc/profiler/collection.cpp b/torch/csrc/profiler/collection.cpp
+index 617316617fc..30a75b0c52e 100644
+--- a/torch/csrc/profiler/collection.cpp
++++ b/torch/csrc/profiler/collection.cpp
+@@ -6,6 +6,7 @@
+ #include <limits>
+ #include <memory>
+ #include <queue>
++#include <string_view>
+ #include <type_traits>
+ #include <utility>
+ 
+@@ -23,6 +24,7 @@
+ #include <torch/csrc/jit/runtime/interpreter.h>
+ #include <torch/csrc/profiler/data_flow.h>
+ #include <torch/csrc/profiler/kineto_shim.h>
++#include <torch/csrc/profiler/util.h>
+ 
+ namespace torch::profiler::impl {
+ using result_ptr_t = std::shared_ptr<Result>;
+@@ -75,6 +77,10 @@ struct TagToIOType {
+   InputOutputEncoder::IOType io_type;
+ };
+ 
++constexpr const char* kUserAnnotationArgsMetadataKey = "user_annotation_args";
++constexpr const char* kUserAnnotationScopeKey = "scope";
++constexpr const char* kUserAnnotationScopeValue = "user_scope";
++
+ constexpr int tagCount = ((int)InputOutputEncoder::Tag::TERMINATOR) + 1;
+ constexpr std::array<TagToIOType, tagCount> tag_map = {{
+     {InputOutputEncoder::Tag::Tensor, InputOutputEncoder::IOType::Shapes},
+@@ -98,6 +104,143 @@ static_assert(allTagsMapped(), "tag_map is out of order");
+ constexpr InputOutputEncoder::IOType tagToIOType(InputOutputEncoder::Tag tag) {
+   return tag_map[(int)tag].io_type;
+ }
++
++static std::string jsonEscapeString(std::string_view value) {
++  std::string out;
++  out.reserve(value.size());
++  for (const char c : value) {
++    switch (c) {
++      case '\\':
++        out += "\\\\";
++        break;
++      case '"':
++        out += "\\\"";
++        break;
++      case '\b':
++        out += "\\b";
++        break;
++      case '\f':
++        out += "\\f";
++        break;
++      case '\n':
++        out += "\\n";
++        break;
++      case '\r':
++        out += "\\r";
++        break;
++      case '\t':
++        out += "\\t";
++        break;
++      default:
++        out += c;
++        break;
++    }
++  }
++  return out;
++}
++
++static std::optional<std::string> userAnnotationValueToJson(
++    const c10::IValue& value) {
++  if (value.isString()) {
++    return fmt::format(
++        "\"{}\"", jsonEscapeString(std::string(value.toStringRef())));
++  }
++  if (value.isInt() || value.isDouble() || value.isBool()) {
++    return ivalueToStr(value, /*isString=*/false);
++  }
++  if (value.isList()) {
++    const auto list = value.toListRef();
++    const bool is_string_list = std::all_of(
++        list.begin(), list.end(), [](const c10::IValue& item) {
++          return item.isString();
++        });
++    if (is_string_list) {
++      std::vector<c10::IValue> string_list(list.begin(), list.end());
++      return ivalueListToStr(string_list);
++    }
++  }
++  return std::nullopt;
++}
++
++static extra_meta_t buildUserAnnotationExtraMeta(
++    const at::RecordFunction& fn,
++    const bool capture_kwinputs_from_record_function) {
++  extra_meta_t extra_meta;
++  if (fn.scope() != at::RecordScope::USER_SCOPE) {
++    return extra_meta;
++  }
++
++  const auto inputs = fn.inputs();
++  if (inputs.size() == 1 && inputs[0].isString()) {
++    extra_meta.emplace(
++        kUserAnnotationArgsMetadataKey,
++        fmt::format(
++            "\"{}\"",
++            jsonEscapeString(std::string(inputs[0].toStringRef()))));
++  }
++
++  if (!capture_kwinputs_from_record_function) {
++    return extra_meta;
++  }
++
++  for (const auto& [key, value] : fn.kwinputs()) {
++    if (key == kUserAnnotationScopeKey &&
++        value.isString() &&
++        std::string(value.toStringRef()) == kUserAnnotationScopeValue) {
++      continue;
++    }
++    auto json_value = userAnnotationValueToJson(value);
++    if (json_value.has_value()) {
++      extra_meta.emplace(key, std::move(*json_value));
++    }
++  }
++
++  return extra_meta;
++}
++
++static std::string buildUserAnnotationMetadataJson(
++    const extra_meta_t& extra_meta,
++    const kwinputs_t& kwinputs) {
++  extra_meta_t metadata = extra_meta;
++
++  for (const auto& [key, value] : kwinputs) {
++    if (metadata.count(key) != 0) {
++      continue;
++    }
++    if (key == kUserAnnotationScopeKey &&
++        value.isString() &&
++        std::string(value.toStringRef()) == kUserAnnotationScopeValue) {
++      continue;
++    }
++    auto json_value = userAnnotationValueToJson(value);
++    if (json_value.has_value()) {
++      metadata.emplace(key, std::move(*json_value));
++    }
++  }
++
++  if (metadata.empty()) {
++    return "";
++  }
++
++  std::vector<std::pair<std::string, std::string>> sorted_metadata(
++      metadata.begin(), metadata.end());
++  std::sort(
++      sorted_metadata.begin(),
++      sorted_metadata.end(),
++      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
++
++  std::string json = "{";
++  bool first = true;
++  for (const auto& [key, value] : sorted_metadata) {
++    if (!first) {
++      json += ", ";
++    }
++    first = false;
++    json += fmt::format("\"{}\": {}", jsonEscapeString(key), value);
++  }
++  json += "}";
++  return json;
++}
+ } // namespace
+ 
+ // ----------------------------
+@@ -326,6 +469,11 @@ uint64_t ThreadLocalSubqueue::TorchOpStorage::EventBlock<T, ChunkSize>::
+ // ---------------------------------
+ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
+     const at::RecordFunction& fn) {
++  const bool capture_user_annotation_kwinputs =
++      fn.scope() == at::RecordScope::USER_SCOPE &&
++      !config_.report_input_shapes;
++  extra_meta_t extra_meta =
++      buildUserAnnotationExtraMeta(fn, capture_user_annotation_kwinputs);
+   auto overload_name = config_.experimental_config.capture_overload_names
+       ? fn.overload_name()
+       : "";
+@@ -375,10 +523,13 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
+     // if needed.
+     torch::profiler::impl::SaveNcclMetaConfig ncclMetaConfig{
+         true, true, true, false};
+-    out->event_->extra_nccl_meta_ = torch_ops_.extra_meta_.emplace_back(
+-        torch::profiler::impl::saveNcclMeta(fn, ncclMetaConfig));
++    auto nccl_meta = torch::profiler::impl::saveNcclMeta(fn, ncclMetaConfig);
++    extra_meta.insert(nccl_meta.begin(), nccl_meta.end());
++    out->event_->extra_nccl_meta_ =
++        torch_ops_.extra_meta_.emplace_back(std::move(extra_meta));
+   } else {
+-    out->event_->extra_nccl_meta_ = torch_ops_.extra_meta_.emplace_back();
++    out->event_->extra_nccl_meta_ =
++        torch_ops_.extra_meta_.emplace_back(std::move(extra_meta));
+   }
+ 
+   if (config_.state == ProfilerState::KINETO_GPU_FALLBACK) {
+@@ -503,6 +654,11 @@ void ThreadLocalSubqueue::TorchOpStorage::materialize(
+         event->allow_tf32_cublas_,
+         std::move(event->counters_)};
+ 
++    if (e.scope_ == at::RecordScope::USER_SCOPE) {
++      e.metadata_json_ =
++          buildUserAnnotationMetadataJson(e.extra_meta_, e.kwinputs_);
++    }
++
+     if (e.name_.find(profilerStepString) != std::string::npos) {
+       step_info.emplace_back(
+           time_converter(event->start_time_),
+diff --git a/torch/csrc/profiler/python/init.cpp b/torch/csrc/profiler/python/init.cpp
+index 68e033449bb..244bc3c5c94 100644
+--- a/torch/csrc/profiler/python/init.cpp
++++ b/torch/csrc/profiler/python/init.cpp
+@@ -241,7 +241,7 @@ PyObject* RecordFunctionFast_enter(PyObject* selfGeneric, PyObject* unused) {
+     }
+ 
+     // parse through kwargs if they exist
+-    if (self->keyword_values != nullptr && profiler_need_input) {
++    if (self->keyword_values != nullptr) {
+       const auto kw_size = PyDict_Size(self->keyword_values);
+       if (kw_size > 0) {
+         kwargs.reserve(static_cast<size_t>(kw_size));

@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+THIS_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = THIS_DIR.parent / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from profile_sdxl_turbo_common import main
+
+
+if __name__ == "__main__":
+    main(
+        default_device="cpu",
+        default_dtype="float32",
+        default_output_prefix="sdxl_turbo_cpu",
+    )

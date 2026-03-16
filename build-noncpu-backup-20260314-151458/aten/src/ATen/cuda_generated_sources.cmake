@@ -1,0 +1,9 @@
+set(
+cuda_generated_sources
+    "/data/pytorch-source/build/aten/src/ATen/RegisterCUDA_0.cpp"
+    "/data/pytorch-source/build/aten/src/ATen/RegisterNestedTensorCUDA_0.cpp"
+    "/data/pytorch-source/build/aten/src/ATen/RegisterQuantizedCUDA_0.cpp"
+    "/data/pytorch-source/build/aten/src/ATen/RegisterSparseCUDA_0.cpp"
+    "/data/pytorch-source/build/aten/src/ATen/RegisterSparseCsrCUDA_0.cpp"
+    "/data/pytorch-source/build/aten/src/ATen/UfuncCUDA_add.cu"
+)
