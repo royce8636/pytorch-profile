@@ -8,6 +8,7 @@ import gzip
 import inspect
 import json
 from pathlib import Path
+import shlex
 import sys
 from typing import Any
 
@@ -19,6 +20,38 @@ DTYPE_BY_NAME = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
+
+
+def format_missing_diffusers_runtime_error(
+    *,
+    component: str,
+    exc: ModuleNotFoundError,
+) -> str:
+    lines = [
+        f"Failed to import `diffusers` required by {component}.",
+        f"sys.executable = {sys.executable!r}",
+        f"torch.__file__ = {Path(torch.__file__).resolve()}",
+        f"Original error: {exc}",
+    ]
+    venv_python = Path("/tmp/ptvenv/bin/python")
+    if venv_python.exists():
+        rerun_command = shlex.join([str(venv_python), *sys.argv])
+        lines.extend(
+            [
+                "This interpreter does not have `diffusers` installed.",
+                "Re-run with the profiler/runtime environment:",
+                f"PYTHONNOUSERSITE=1 {rerun_command}",
+            ]
+        )
+    else:
+        lines.append(
+            "Use a Python environment that has `diffusers` installed."
+        )
+    return "\n".join(lines)
+
+
+def is_missing_diffusers_error(exc: ModuleNotFoundError) -> bool:
+    return exc.name == "diffusers" or str(exc) == "No module named 'diffusers'"
 
 
 @dataclass(frozen=True)
@@ -34,6 +67,7 @@ class OutputPaths:
     kineto_map_path: Path | None
     hybrid_dot_path: Path | None
     runtime_io_dot_path: Path | None
+    llamasim_output_dir: Path | None
 
 
 def parse_args(
@@ -154,6 +188,7 @@ def parse_args(
             "kineto",
             "hybrid",
             "runtime-io",
+            "llamasim-runtime",
             "both",
             "all",
         ),
@@ -165,8 +200,10 @@ def parse_args(
             "'kineto' exports the post-fusion runtime event graph from Kineto, "
             "'hybrid' overlays matched tensor-flow onto Kineto runtime nodes, "
             "'runtime-io' overlays exact ExecutionTraceObserver I/O onto Kineto "
-            "runtime nodes, 'both' writes fx+execution, and 'all' writes "
-            "fx+execution+memory+kineto+hybrid+runtime-io."
+            "runtime nodes, 'llamasim-runtime' emits a step_0_compute_graph.dot "
+            "bundle for /data/llamasim with CPU leaf nodes plus GPU runtime nodes, "
+            "'both' writes fx+execution, and 'all' "
+            "writes fx+execution+memory+kineto+hybrid+runtime-io+llamasim-runtime."
         ),
     )
     parser.add_argument(
@@ -188,7 +225,7 @@ def parse_args(
         default=None,
         help=(
             "Path for the raw execution trace JSON used to build --execution-dot. "
-            "Requires --dot-level execution, runtime-io, both, or all."
+            "Requires --dot-level execution, runtime-io, llamasim-runtime, both, or all."
         ),
     )
     parser.add_argument(
@@ -224,6 +261,16 @@ def parse_args(
         default=None,
         help=(
             "Path for the exact runtime+I/O DOT graph. Requires --dot-level runtime-io or all."
+        ),
+    )
+    parser.add_argument(
+        "--llamasim-output-dir",
+        default=None,
+        help=(
+            "Directory for a llamasim runtime bundle containing step_0_compute_graph.dot, "
+            "ggml_profile_node_records.csv, runtime node/edge metadata, tensor metadata, "
+            "and a manifest. "
+            "Requires --dot-level llamasim-runtime or all."
         ),
     )
     parser.add_argument(
@@ -304,6 +351,7 @@ def validate_dot_args(args: argparse.Namespace) -> None:
     kineto_enabled = dot_level_enabled(args.dot_level, "kineto")
     hybrid_enabled = dot_level_enabled(args.dot_level, "hybrid")
     runtime_io_enabled = dot_level_enabled(args.dot_level, "runtime-io")
+    llamasim_enabled = dot_level_enabled(args.dot_level, "llamasim-runtime")
     if args.fx_dot is not None and not fx_enabled:
         raise RuntimeError("--fx-dot requires --dot-level fx, both, or all")
     if args.execution_dot is not None and not execution_enabled:
@@ -311,10 +359,10 @@ def validate_dot_args(args: argparse.Namespace) -> None:
             "--execution-dot requires --dot-level execution, both, or all"
         )
     if args.execution_trace is not None and not (
-        execution_enabled or runtime_io_enabled
+        execution_enabled or runtime_io_enabled or llamasim_enabled
     ):
         raise RuntimeError(
-            "--execution-trace requires --dot-level execution, runtime-io, both, or all"
+            "--execution-trace requires --dot-level execution, runtime-io, llamasim-runtime, both, or all"
         )
     if args.memory_dot is not None and not memory_enabled:
         raise RuntimeError("--memory-dot requires --dot-level memory or all")
@@ -327,6 +375,14 @@ def validate_dot_args(args: argparse.Namespace) -> None:
     if args.runtime_io_dot is not None and not runtime_io_enabled:
         raise RuntimeError(
             "--runtime-io-dot requires --dot-level runtime-io or all"
+        )
+    if args.llamasim_output_dir is not None and not llamasim_enabled:
+        raise RuntimeError(
+            "--llamasim-output-dir requires --dot-level llamasim-runtime or all"
+        )
+    if llamasim_enabled and args.device.startswith("cpu"):
+        raise RuntimeError(
+            "llamasim-runtime export is intended for post-fusion GPU kernel traces"
         )
     if memory_enabled:
         missing = []
@@ -407,6 +463,11 @@ def resolve_output_paths(
             if args.runtime_io_dot is not None
             else output_dir / f"{stem}_runtime_io.dot"
         )
+        llamasim_output_dir = (
+            Path(args.llamasim_output_dir)
+            if args.llamasim_output_dir is not None
+            else output_dir / f"{stem}_llamasim_runtime"
+        )
     else:
         trace_path = Path(args.trace)
         csv_path = (
@@ -459,17 +520,24 @@ def resolve_output_paths(
             if args.runtime_io_dot is not None
             else trace_path.with_name(f"{stem}_runtime_io.dot")
         )
+        llamasim_output_dir = (
+            Path(args.llamasim_output_dir)
+            if args.llamasim_output_dir is not None
+            else trace_path.with_name(f"{stem}_llamasim_runtime")
+        )
 
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     image_path.parent.mkdir(parents=True, exist_ok=True)
     if not dot_level_enabled(args.dot_level, "fx"):
         fx_dot_path = None
+    if not dot_level_enabled(args.dot_level, "execution"):
+        execution_dot_path = None
     if not (
         dot_level_enabled(args.dot_level, "execution")
         or dot_level_enabled(args.dot_level, "runtime-io")
+        or dot_level_enabled(args.dot_level, "llamasim-runtime")
     ):
-        execution_dot_path = None
         execution_trace_path = None
     if not dot_level_enabled(args.dot_level, "memory"):
         memory_dot_path = None
@@ -480,6 +548,8 @@ def resolve_output_paths(
         hybrid_dot_path = None
     if not dot_level_enabled(args.dot_level, "runtime-io"):
         runtime_io_dot_path = None
+    if not dot_level_enabled(args.dot_level, "llamasim-runtime"):
+        llamasim_output_dir = None
     if fx_dot_path is not None:
         fx_dot_path.parent.mkdir(parents=True, exist_ok=True)
     if execution_dot_path is not None:
@@ -496,6 +566,8 @@ def resolve_output_paths(
         hybrid_dot_path.parent.mkdir(parents=True, exist_ok=True)
     if runtime_io_dot_path is not None:
         runtime_io_dot_path.parent.mkdir(parents=True, exist_ok=True)
+    if llamasim_output_dir is not None:
+        llamasim_output_dir.mkdir(parents=True, exist_ok=True)
     return OutputPaths(
         trace_path=trace_path,
         csv_path=csv_path,
@@ -508,6 +580,7 @@ def resolve_output_paths(
         kineto_map_path=kineto_map_path,
         hybrid_dot_path=hybrid_dot_path,
         runtime_io_dot_path=runtime_io_dot_path,
+        llamasim_output_dir=llamasim_output_dir,
     )
 
 
@@ -524,7 +597,17 @@ def profile_activities(device: torch.device) -> list[torch.profiler.ProfilerActi
 
 
 def load_pipeline(model: str, torch_dtype: torch.dtype, device: torch.device) -> Any:
-    from diffusers import StableDiffusionXLPipeline
+    try:
+        from diffusers import StableDiffusionXLPipeline
+    except ModuleNotFoundError as exc:
+        if is_missing_diffusers_error(exc):
+            raise RuntimeError(
+                format_missing_diffusers_runtime_error(
+                    component="the SDXL Turbo scripts",
+                    exc=exc,
+                )
+            ) from exc
+        raise
 
     pipe = StableDiffusionXLPipeline.from_pretrained(
         model,
@@ -1784,6 +1867,1062 @@ def write_runtime_io_profile_dot(
         f.write("}\n")
 
 
+def execution_node_stream_hint(node: dict[str, Any]) -> int | None:
+    # The execution trace observer (execution_trace_observer.cpp) appends
+    # the CUDA stream as the last Int input for Triton kernels only.
+    if execution_trace_attr(node, "kernel_backend") != "triton":
+        return None
+    inputs = node.get("inputs", {})
+    input_values = inputs.get("values", [])
+    input_types = inputs.get("types", [])
+    if not isinstance(input_values, list) or not isinstance(input_types, list):
+        return None
+    if not input_values or not input_types:
+        return None
+    if len(input_values) != len(input_types):
+        return None
+    value = input_values[-1]
+    type_name = input_types[-1]
+    if isinstance(value, int) and type_name == "Int":
+        return value
+    return None
+
+
+def execution_is_llamasim_runtime_node(node: dict[str, Any]) -> bool:
+    kernel_backend = execution_trace_attr(node, "kernel_backend")
+    if isinstance(kernel_backend, str) and kernel_backend:
+        return True
+    name = str(node.get("name", ""))
+    return name.startswith("triton_")
+
+
+def match_execution_nodes_to_gpu_kernels(
+    raw_events: list[Any],
+    execution_nodes: dict[int, dict[str, Any]],
+) -> tuple[dict[int, dict[str, Any]], list[str], list[str]]:
+    from torch.autograd import DeviceType
+
+    gpu_events_by_linked_rf_id: dict[int, list[Any]] = {}
+    for event in raw_events:
+        if event.device_type() == DeviceType.CPU:
+            continue
+        linked_correlation_id = event.linked_correlation_id()
+        if linked_correlation_id <= 0:
+            continue
+        gpu_events_by_linked_rf_id.setdefault(linked_correlation_id, []).append(event)
+
+    matched_execution_node_by_event: dict[int, dict[str, Any]] = {}
+    errors: list[str] = []
+    warnings: list[str] = []
+    matched_event_ids: set[int] = set()
+
+    for node in execution_nodes.values():
+        if not execution_is_llamasim_runtime_node(node):
+            continue
+
+        rf_id = execution_rf_id(node)
+        if rf_id is None:
+            warnings.append(
+                f"Execution node {node.get('name', '<unknown>')} is missing rf_id"
+            )
+            continue
+
+        candidates = list(gpu_events_by_linked_rf_id.get(rf_id, ()))
+        if not candidates:
+            warnings.append(
+                f"No linked GPU kernel found for execution node {node.get('name', '<unknown>')} rf_id={rf_id}"
+            )
+            continue
+
+        same_name = [event for event in candidates if event.name() == node["name"]]
+        if same_name:
+            candidates = same_name
+
+        stream_hint = execution_node_stream_hint(node)
+        if stream_hint is not None:
+            same_stream = [
+                event
+                for event in candidates
+                if event.device_resource_id() == stream_hint
+            ]
+            if same_stream:
+                candidates = same_stream
+
+        if len(candidates) != 1:
+            candidate_summary = ", ".join(
+                f"{event.name()}@stream{event.device_resource_id()} linked={event.linked_correlation_id()}"
+                for event in candidates
+            )
+            errors.append(
+                "Ambiguous GPU kernel match for execution node "
+                f"{node.get('name', '<unknown>')} rf_id={rf_id}: {candidate_summary}"
+            )
+            continue
+
+        matched_event = candidates[0]
+        event_id = id(matched_event)
+        if event_id in matched_event_ids:
+            errors.append(
+                "GPU kernel matched more than once: "
+                f"{matched_event.name()} cid={matched_event.correlation_id()}"
+            )
+            continue
+
+        matched_event_ids.add(event_id)
+        matched_execution_node_by_event[event_id] = node
+
+    return matched_execution_node_by_event, errors, warnings
+
+
+def execution_type_to_llamasim_dtype(type_name: Any) -> str | None:
+    if not isinstance(type_name, str):
+        return None
+    prefix = "Tensor("
+    suffix = ")"
+    if type_name.startswith(prefix) and type_name.endswith(suffix):
+        inner = type_name[len(prefix) : -len(suffix)]
+    else:
+        inner = type_name
+    return {
+        "float16": "f16",
+        "float32": "f32",
+        "float64": "f64",
+        "bfloat16": "bf16",
+        "int8": "i8",
+        "uint8": "u8",
+        "int16": "i16",
+        "uint16": "u16",
+        "int32": "i32",
+        "uint32": "u32",
+        "int64": "i64",
+        "uint64": "u64",
+        "bool": "bool",
+    }.get(inner)
+
+
+def execution_shape_to_tuple(shape: Any) -> tuple[int, ...]:
+    if isinstance(shape, list) and all(isinstance(dim, int) for dim in shape):
+        return tuple(shape)
+    return ()
+
+
+def llamasim_tensor_name(
+    tensor_tuple: tuple[int, int, int, int, int, str],
+    *,
+    kind: str,
+) -> str:
+    tensor_id, storage_id, offset, _numel, _itemsize, _device = tensor_tuple
+    prefix = "cache" if kind == "CONTEXT" else "param"
+    if offset:
+        return f"{prefix}_{tensor_id}_{storage_id}_off{offset}"
+    return f"{prefix}_{tensor_id}_{storage_id}"
+
+
+def raw_event_sort_key(event: Any) -> tuple[Any, ...]:
+    return (
+        event.start_ns(),
+        event.end_ns(),
+        getattr(event.device_type(), "name", str(event.device_type())),
+        event.device_index(),
+        event.device_resource_id(),
+        event.start_thread_id(),
+        event.correlation_id(),
+        event.name(),
+    )
+
+
+def is_llamasim_gpu_runtime_event(event: Any) -> bool:
+    from torch.autograd import DeviceType
+
+    return event.device_type() != DeviceType.CPU and not event.is_user_annotation()
+
+
+def select_llamasim_runtime_events(
+    raw_events: list[Any],
+) -> tuple[list[Any], list[Any], list[Any]]:
+    from torch.autograd import DeviceType
+
+    node_ids, cpu_parent_edges, _linked_edges, _stream_edges = build_kineto_runtime_graph(
+        raw_events
+    )
+    cpu_parent_node_ids = {src for src, _dst in cpu_parent_edges}
+
+    selected_cpu_events = [
+        event
+        for event in raw_events
+        if event.device_type() == DeviceType.CPU
+        and node_ids[id(event)] not in cpu_parent_node_ids
+    ]
+    selected_gpu_events = [
+        event for event in raw_events if is_llamasim_gpu_runtime_event(event)
+    ]
+    selected_events = sorted(
+        [*selected_cpu_events, *selected_gpu_events],
+        key=raw_event_sort_key,
+    )
+    return selected_events, selected_cpu_events, selected_gpu_events
+
+
+def build_llamasim_thread_order_edges(
+    node_ids: dict[int, str], cpu_events: list[Any]
+) -> list[tuple[str, str, str]]:
+    edges: list[tuple[str, str, str]] = []
+    cpu_events_by_thread: dict[int, list[Any]] = {}
+    for event in cpu_events:
+        cpu_events_by_thread.setdefault(event.start_thread_id(), []).append(event)
+
+    for thread_events in cpu_events_by_thread.values():
+        thread_events.sort(key=raw_event_sort_key)
+        for current, nxt in zip(thread_events, thread_events[1:]):
+            edges.append((node_ids[id(current)], node_ids[id(nxt)], "thread_order"))
+    return edges
+
+
+def build_llamasim_stream_order_edges(
+    node_ids: dict[int, str], gpu_events: list[Any]
+) -> list[tuple[str, str, str]]:
+    edges: list[tuple[str, str, str]] = []
+    gpu_events_by_resource: dict[tuple[Any, int, int], list[Any]] = {}
+    for event in gpu_events:
+        key = (
+            event.device_type(),
+            event.device_index(),
+            event.device_resource_id(),
+        )
+        gpu_events_by_resource.setdefault(key, []).append(event)
+
+    for device_events in gpu_events_by_resource.values():
+        device_events.sort(key=raw_event_sort_key)
+        for current, nxt in zip(device_events, device_events[1:]):
+            edges.append((node_ids[id(current)], node_ids[id(nxt)], "stream_order"))
+    return edges
+
+
+def build_llamasim_submit_edges(
+    node_ids: dict[int, str],
+    cpu_events: list[Any],
+    gpu_events: list[Any],
+    all_raw_events: list[Any],
+) -> tuple[list[tuple[str, str, str]], dict[int, str]]:
+    from torch.autograd import DeviceType
+
+    # Index ALL CPU events by correlation_id so we can find launch calls
+    # even if they were classified as parent (non-leaf) events.
+    cpu_events_by_corr_id: dict[int, list[Any]] = {}
+    for event in all_raw_events:
+        if event.device_type() != DeviceType.CPU:
+            continue
+        corr_id = event.correlation_id()
+        if corr_id > 0:
+            cpu_events_by_corr_id.setdefault(corr_id, []).append(event)
+
+    submit_edges: list[tuple[str, str, str]] = []
+    runtime_role_by_event_id: dict[int, str] = {}
+    seen_pairs: set[tuple[str, str, str]] = set()
+
+    for gpu_event in gpu_events:
+        corr_id = gpu_event.correlation_id()
+        if corr_id <= 0:
+            continue
+        candidates = list(cpu_events_by_corr_id.get(corr_id, ()))
+        if not candidates:
+            continue
+        # Prefer candidates that are in the selected node set.
+        in_graph = [e for e in candidates if id(e) in node_ids]
+        if in_graph:
+            candidates = in_graph
+        else:
+            # The launch CPU event is a parent (not selected); skip since
+            # we can't create an edge to a node that isn't in the graph.
+            continue
+        before_start = [
+            event for event in candidates if event.start_ns() <= gpu_event.start_ns()
+        ]
+        if before_start:
+            candidates = before_start
+        submit_event = max(
+            candidates,
+            key=lambda event: (
+                event.end_ns(),
+                event.start_ns(),
+                event.name(),
+            ),
+        )
+        edge = (node_ids[id(submit_event)], node_ids[id(gpu_event)], "submit")
+        if edge in seen_pairs:
+            continue
+        seen_pairs.add(edge)
+        submit_edges.append(edge)
+        runtime_role_by_event_id[id(submit_event)] = "submit"
+
+    return submit_edges, runtime_role_by_event_id
+
+
+def build_llamasim_wait_edges(
+    node_ids: dict[int, str],
+    cpu_events: list[Any],
+    gpu_events: list[Any],
+    runtime_role_by_event_id: dict[int, str],
+) -> tuple[list[tuple[str, str, str]], dict[int, str]]:
+    gpu_events_by_family: dict[int, list[Any]] = {}
+    for event in gpu_events:
+        linked_corr_id = event.linked_correlation_id()
+        if linked_corr_id > 0:
+            gpu_events_by_family.setdefault(linked_corr_id, []).append(event)
+
+    cpu_events_by_family: dict[int, list[Any]] = {}
+    for event in cpu_events:
+        linked_corr_id = event.linked_correlation_id()
+        if linked_corr_id > 0:
+            cpu_events_by_family.setdefault(linked_corr_id, []).append(event)
+
+    wait_edges: list[tuple[str, str, str]] = []
+    wait_role_by_event_id = dict(runtime_role_by_event_id)
+    seen_pairs: set[tuple[str, str, str]] = set()
+
+    for linked_corr_id, family_gpu_events in gpu_events_by_family.items():
+        family_cpu_events = cpu_events_by_family.get(linked_corr_id, [])
+        if not family_cpu_events:
+            continue
+
+        family_gpu_events = sorted(family_gpu_events, key=raw_event_sort_key)
+        family_end_ns = max(event.end_ns() for event in family_gpu_events)
+        submit_corr_ids = {event.correlation_id() for event in family_gpu_events}
+
+        for cpu_event in family_cpu_events:
+            if id(cpu_event) in wait_role_by_event_id:
+                continue
+            if cpu_event.correlation_id() in submit_corr_ids:
+                continue
+            if cpu_event.end_ns() < family_end_ns:
+                continue
+            if cpu_event.start_ns() > family_end_ns:
+                continue
+
+            added_wait_edge = False
+            for gpu_event in family_gpu_events:
+                edge = (node_ids[id(gpu_event)], node_ids[id(cpu_event)], "wait")
+                if edge in seen_pairs:
+                    continue
+                seen_pairs.add(edge)
+                wait_edges.append(edge)
+                added_wait_edge = True
+            if added_wait_edge:
+                wait_role_by_event_id[id(cpu_event)] = "wait"
+
+    return wait_edges, wait_role_by_event_id
+
+
+_CUDA_SYNC_EVENT_NAMES = frozenset({
+    "cudaStreamSynchronize",
+    "cudaDeviceSynchronize",
+    "cudaEventSynchronize",
+})
+
+
+def build_llamasim_sync_wait_edges(
+    node_ids: dict[int, str],
+    cpu_events: list[Any],
+    gpu_events: list[Any],
+    runtime_role_by_event_id: dict[int, str],
+) -> tuple[list[tuple[str, str, str]], dict[int, str]]:
+    from torch.autograd import DeviceType
+
+    gpu_last_by_stream: dict[tuple[Any, int, int], Any] = {}
+    for event in sorted(gpu_events, key=raw_event_sort_key):
+        key = (
+            event.device_type(),
+            event.device_index(),
+            event.device_resource_id(),
+        )
+        gpu_last_by_stream[key] = event
+
+    sync_wait_edges: list[tuple[str, str, str]] = []
+    updated_roles = dict(runtime_role_by_event_id)
+    seen_pairs: set[tuple[str, str, str]] = set()
+
+    for cpu_event in cpu_events:
+        if cpu_event.name() not in _CUDA_SYNC_EVENT_NAMES:
+            continue
+        if id(cpu_event) in updated_roles:
+            continue
+        if id(cpu_event) not in node_ids:
+            continue
+
+        added = False
+        for stream_key, last_gpu in gpu_last_by_stream.items():
+            if last_gpu.end_ns() > cpu_event.end_ns():
+                continue
+            if cpu_event.name() == "cudaStreamSynchronize":
+                # Only wait on the specific stream matching this sync's resource.
+                # The CPU-side cudaStreamSynchronize correlation_id matches the
+                # stream it synchronizes; use device_resource_id as a heuristic.
+                if last_gpu.device_resource_id() != cpu_event.device_resource_id():
+                    continue
+            edge = (node_ids[id(last_gpu)], node_ids[id(cpu_event)], "wait")
+            if edge in seen_pairs:
+                continue
+            seen_pairs.add(edge)
+            sync_wait_edges.append(edge)
+            added = True
+        if added:
+            updated_roles[id(cpu_event)] = "wait"
+
+    return sync_wait_edges, updated_roles
+
+
+def _propagate_parent_tensor_io(
+    raw_events: list[Any],
+    matched_execution_node_by_event: dict[int, dict[str, Any]],
+    execution_nodes_by_rf_id: dict[int, list[dict[str, Any]]],
+) -> dict[str, int]:
+    """Inherit tensor I/O for GPU events without a direct execution trace match.
+
+    cuBLAS/cutlass kernels lack kernel_backend in the execution trace, so
+    match_execution_nodes_to_gpu_kernels skips them.  Their Kineto
+    linked_correlation_id still points to the parent ATen op's rf_id
+    (e.g. aten::mm), which carries the tensor I/O we need.
+
+    Returns a stats dict with counts for each outcome category.
+    """
+    from torch.autograd import DeviceType
+
+    propagated = 0
+    no_linked_rf_id = 0
+    no_execution_node = 0
+    ambiguous_rf_id = 0
+
+    for event in raw_events:
+        if event.device_type() == DeviceType.CPU:
+            continue
+        if id(event) in matched_execution_node_by_event:
+            continue
+        linked_rf_id = event.linked_correlation_id()
+        if linked_rf_id <= 0:
+            no_linked_rf_id += 1
+            continue
+        candidates = execution_nodes_by_rf_id.get(linked_rf_id, [])
+        if not candidates:
+            no_execution_node += 1
+            continue
+        if len(candidates) > 1:
+            ambiguous_rf_id += 1
+            continue
+        matched_execution_node_by_event[id(event)] = candidates[0]
+        propagated += 1
+
+    return {
+        "propagated": propagated,
+        "no_linked_rf_id": no_linked_rf_id,
+        "no_execution_node": no_execution_node,
+        "ambiguous_rf_id": ambiguous_rf_id,
+    }
+
+
+def write_llamasim_runtime_bundle(
+    prof: Any,
+    execution_trace_path: Path,
+    output_dir: Path,
+) -> None:
+    from torch.autograd import DeviceType
+    from torch.autograd.profiler_util import _rewrite_name
+
+    trace_start_ns, raw_events = get_raw_kineto_events(prof)
+    execution_nodes = load_execution_trace_nodes(execution_trace_path)
+    matched_execution_node_by_event, match_errors, match_warnings = (
+        match_execution_nodes_to_gpu_kernels(raw_events, execution_nodes)
+    )
+    if match_errors:
+        raise RuntimeError(
+            "llamasim runtime export has ambiguous GPU kernel matches.\n"
+            + "\n".join(match_errors)
+        )
+
+    execution_nodes_by_rf_id = index_execution_trace_nodes_by_rf_id(execution_nodes)
+    cpu_matched, _ambiguous = match_execution_nodes_to_kineto_runtime(
+        raw_events, execution_nodes_by_rf_id,
+    )
+    matched_execution_node_by_event.update(cpu_matched)
+
+    # Propagate tensor I/O from parent CPU events to GPU kernels that lack
+    # a direct execution trace match (e.g. cuBLAS/cutlass kernels whose
+    # tensor data lives on the parent aten::mm).
+    propagation_stats = _propagate_parent_tensor_io(
+        raw_events, matched_execution_node_by_event, execution_nodes_by_rf_id,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_events, selected_cpu_events, selected_gpu_events = (
+        select_llamasim_runtime_events(raw_events)
+    )
+
+    node_ids = {id(event): f"k{index}" for index, event in enumerate(selected_events)}
+    node_indexes = {id(event): index for index, event in enumerate(selected_events)}
+    selected_event_ids = set(node_ids.values())
+
+    thread_order_edges = build_llamasim_thread_order_edges(
+        node_ids, selected_cpu_events
+    )
+    stream_order_edges = build_llamasim_stream_order_edges(
+        node_ids, selected_gpu_events
+    )
+    submit_edges, runtime_role_by_event_id = build_llamasim_submit_edges(
+        node_ids,
+        selected_cpu_events,
+        selected_gpu_events,
+        raw_events,
+    )
+    wait_edges, runtime_role_by_event_id = build_llamasim_wait_edges(
+        node_ids,
+        selected_cpu_events,
+        selected_gpu_events,
+        runtime_role_by_event_id,
+    )
+    sync_wait_edges, runtime_role_by_event_id = build_llamasim_sync_wait_edges(
+        node_ids,
+        selected_cpu_events,
+        selected_gpu_events,
+        runtime_role_by_event_id,
+    )
+    wait_edges.extend(sync_wait_edges)
+
+    tensor_records: dict[str, dict[str, Any]] = {}
+    input_edges: list[tuple[str, str]] = []
+    output_edges: list[tuple[str, str]] = []
+    produced_tensor_keys: set[str] = set()
+
+    def ensure_tensor_record(
+        tensor_tuple: tuple[int, int, int, int, int, str],
+        *,
+        type_name: str | None,
+        shape: Any,
+    ) -> str:
+        tensor_key = execution_tensor_key(list(tensor_tuple))
+        if tensor_key is None:
+            raise RuntimeError("Failed to serialize execution-trace tensor tuple")
+        record = tensor_records.get(tensor_key)
+        if record is None:
+            tensor_id, storage_id, offset, numel, itemsize, device = tensor_tuple
+            shape_tuple = execution_shape_to_tuple(shape)
+            tensor_records[tensor_key] = {
+                "tensor_tuple": tensor_tuple,
+                "type_name": type_name,
+                "shape": shape_tuple,
+                "num_bytes": numel * itemsize,
+                "producers": set(),
+                "consumers": set(),
+                "kind": "WEIGHT",
+                "dtype": execution_type_to_llamasim_dtype(type_name),
+                "device": device,
+                "tensor_name": llamasim_tensor_name(
+                    tensor_tuple,
+                    kind="WEIGHT",
+                ),
+                "tensor_id": tensor_id,
+                "storage_id": storage_id,
+                "offset": offset,
+                "numel": numel,
+                "itemsize": itemsize,
+            }
+            record = tensor_records[tensor_key]
+        return tensor_key
+
+    for event in selected_events:
+        execution_node = matched_execution_node_by_event.get(id(event))
+        if execution_node is None:
+            continue
+        inputs = execution_node.get("inputs", {})
+        for input_index, (type_name, shape, value) in enumerate(
+            zip(
+                inputs.get("types", []),
+                inputs.get("shapes", []),
+                inputs.get("values", []),
+            )
+        ):
+            for entry in flatten_execution_tensor_entries(
+                value,
+                path=str(input_index),
+                shape=shape,
+                type_name=type_name,
+            ):
+                tensor_key = ensure_tensor_record(
+                    entry["tensor_tuple"],
+                    type_name=entry["type_name"],
+                    shape=entry["shape"],
+                )
+                tensor_records[tensor_key]["consumers"].add(node_ids[id(event)])
+                input_edges.append((tensor_key, node_ids[id(event)]))
+
+        outputs = execution_node.get("outputs", {})
+        for output_index, (type_name, shape, value) in enumerate(
+            zip(
+                outputs.get("types", []),
+                outputs.get("shapes", []),
+                outputs.get("values", []),
+            )
+        ):
+            for entry in flatten_execution_tensor_entries(
+                value,
+                path=str(output_index),
+                shape=shape,
+                type_name=type_name,
+            ):
+                tensor_key = ensure_tensor_record(
+                    entry["tensor_tuple"],
+                    type_name=entry["type_name"],
+                    shape=entry["shape"],
+                )
+                produced_tensor_keys.add(tensor_key)
+                tensor_records[tensor_key]["producers"].add(node_ids[id(event)])
+                output_edges.append((node_ids[id(event)], tensor_key))
+
+    tensor_keys_in_order = sorted(
+        tensor_records.keys(),
+        key=lambda key: (
+            tensor_records[key]["tensor_id"],
+            tensor_records[key]["storage_id"],
+            tensor_records[key]["offset"],
+            tensor_records[key]["device"],
+        ),
+    )
+    tensor_dot_ids = {tensor_key: f"t{index}" for index, tensor_key in enumerate(tensor_keys_in_order)}
+
+    for tensor_key in tensor_keys_in_order:
+        record = tensor_records[tensor_key]
+        if tensor_key in produced_tensor_keys:
+            record["kind"] = "CONTEXT"
+            record["tensor_name"] = llamasim_tensor_name(
+                record["tensor_tuple"],
+                kind="CONTEXT",
+            )
+
+    dot_path = output_dir / "step_0_compute_graph.dot"
+    timing_csv_path = output_dir / "ggml_profile_node_records.csv"
+    tensor_csv_path = output_dir / "pytorch_runtime_tensors.csv"
+    runtime_nodes_csv_path = output_dir / "runtime_nodes.csv"
+    runtime_edges_csv_path = output_dir / "runtime_edges.csv"
+    manifest_path = output_dir / "manifest.json"
+
+    with dot_path.open("w", encoding="utf-8") as f:
+        f.write("digraph G {\n")
+        f.write("  newrank = true;\n")
+        f.write("  rankdir = TB;\n")
+
+        for event in selected_events:
+            node_id = node_ids[id(event)]
+            node_index = node_indexes[id(event)]
+            name = _rewrite_name(name=event.name(), with_wildcard=False)
+            start_ns = event.start_ns() - trace_start_ns
+            end_ns = start_ns + event.duration_ns()
+            label = dot_escape(
+                f"{name} | {node_index} [{start_ns}-{end_ns}] | <x>{event.name()}"
+            )
+            execution_node = matched_execution_node_by_event.get(id(event))
+            kernel_file = (
+                execution_trace_attr(execution_node, "kernel_file")
+                if execution_node is not None
+                else None
+            )
+            resource_kind = (
+                "cpu_thread"
+                if event.device_type() == DeviceType.CPU
+                else "gpu_stream"
+            )
+            resource_id = (
+                event.start_thread_id()
+                if event.device_type() == DeviceType.CPU
+                else event.device_resource_id()
+            )
+            runtime_role = runtime_role_by_event_id.get(
+                id(event),
+                "cpu_leaf" if event.device_type() == DeviceType.CPU else "gpu_runtime",
+            )
+            attrs = [
+                'style = filled',
+                'fillcolor = white',
+                'shape = box',
+                f'label="{label}"',
+                f'device="{getattr(event.device_type(), "name", str(event.device_type()))}:{event.device_index()}"',
+                f'resource_kind="{resource_kind}"',
+                f'resource_id="{resource_id}"',
+                f'runtime_role="{runtime_role}"',
+                f'thread="{event.start_thread_id()}"',
+                f'stream="{event.device_resource_id()}"',
+                f'correlation_id="{event.correlation_id()}"',
+                f'linked_correlation_id="{event.linked_correlation_id()}"',
+            ]
+            rf_id = execution_rf_id(execution_node) if execution_node is not None else None
+            if rf_id is not None:
+                attrs.append(f'rf_id="{rf_id}"')
+            if isinstance(kernel_file, str) and kernel_file:
+                attrs.append(f'kernel_file="{dot_escape(Path(kernel_file).name)}"')
+            f.write(f'  "{node_id}" [ ' + "; ".join(attrs) + "; ]\n")
+
+        for tensor_index, tensor_key in enumerate(tensor_keys_in_order):
+            record = tensor_records[tensor_key]
+            dtype = record["dtype"] or "f32"
+            shape = record["shape"]
+            shape_text = ", ".join(str(dim) for dim in shape) if shape else "1"
+            label = dot_escape(
+                f'{record["tensor_name"]} ({dtype})|{tensor_index} [{shape_text}] | <x>tensor'
+            )
+            f.write(
+                '  "{node_id}" [ style = filled; fillcolor = pink; shape = record; '
+                'label="{label}"; size="{size}"; tensor_kind="{kind}"; tensor_id="{tensor_id}"; '
+                'storage_id="{storage_id}"; offset="{offset}"; numel="{numel}"; '
+                'itemsize="{itemsize}"; device="{device}"; ];\n'.format(
+                    node_id=tensor_dot_ids[tensor_key],
+                    label=label,
+                    size=record["num_bytes"],
+                    kind=record["kind"],
+                    tensor_id=record["tensor_id"],
+                    storage_id=record["storage_id"],
+                    offset=record["offset"],
+                    numel=record["numel"],
+                    itemsize=record["itemsize"],
+                    device=record["device"],
+                )
+            )
+
+        for tensor_key, node_id in input_edges:
+            f.write(f'  "{tensor_dot_ids[tensor_key]}" -> "{node_id}";\n')
+        for node_id, tensor_key in output_edges:
+            f.write(f'  "{node_id}" -> "{tensor_dot_ids[tensor_key]}";\n')
+        for edge_group, color in (
+            (thread_order_edges, "gray45"),
+            (stream_order_edges, "steelblue4"),
+            (submit_edges, "orangered3"),
+            (wait_edges, "firebrick3"),
+        ):
+            for src, dst, edge_kind in edge_group:
+                if src in selected_event_ids and dst in selected_event_ids:
+                    style = "dotted" if edge_kind.endswith("_order") else "solid"
+                    f.write(
+                        f'  "{src}" -> "{dst}" [ style = {style}; color = {color}; label = "{edge_kind}"; ];\n'
+                    )
+        f.write("}\n")
+
+    with timing_csv_path.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "step",
+            "node_n",
+            "node_name",
+            "tensor_addr",
+            "node_compute_time_ns",
+            "node_tensor_size_bytes",
+            "start_ns",
+            "end_ns",
+            "node_id",
+            "device_type",
+            "device_index",
+            "thread_id",
+            "stream_id",
+            "correlation_id",
+            "linked_correlation_id",
+            "rf_id",
+            "kernel_file",
+            "node_kind",
+            "resource_kind",
+            "resource_id",
+            "runtime_role",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for event in selected_events:
+            execution_node = matched_execution_node_by_event.get(id(event))
+            rf_id = execution_rf_id(execution_node) if execution_node is not None else None
+            node_kind = (
+                "cpu_leaf" if event.device_type() == DeviceType.CPU else "gpu_runtime"
+            )
+            resource_kind = (
+                "cpu_thread"
+                if event.device_type() == DeviceType.CPU
+                else "gpu_stream"
+            )
+            resource_id = (
+                event.start_thread_id()
+                if event.device_type() == DeviceType.CPU
+                else event.device_resource_id()
+            )
+            writer.writerow(
+                {
+                    "step": 0,
+                    "node_n": node_indexes[id(event)],
+                    "node_name": _rewrite_name(
+                        name=event.name(), with_wildcard=False
+                    ),
+                    "tensor_addr": "",
+                    "node_compute_time_ns": event.duration_ns(),
+                    "node_tensor_size_bytes": 0,
+                    "start_ns": event.start_ns() - trace_start_ns,
+                    "end_ns": event.end_ns() - trace_start_ns,
+                    "node_id": node_ids[id(event)],
+                    "device_type": getattr(
+                        event.device_type(), "name", str(event.device_type())
+                    ),
+                    "device_index": event.device_index(),
+                    "thread_id": event.start_thread_id(),
+                    "stream_id": event.device_resource_id(),
+                    "correlation_id": event.correlation_id(),
+                    "linked_correlation_id": event.linked_correlation_id(),
+                    "rf_id": "" if rf_id is None else rf_id,
+                    "kernel_file": (
+                        execution_trace_attr(execution_node, "kernel_file") or ""
+                        if execution_node is not None
+                        else ""
+                    ),
+                    "node_kind": node_kind,
+                    "resource_kind": resource_kind,
+                    "resource_id": resource_id,
+                    "runtime_role": runtime_role_by_event_id.get(
+                        id(event),
+                        "cpu_leaf"
+                        if event.device_type() == DeviceType.CPU
+                        else "gpu_runtime",
+                    ),
+                }
+            )
+
+    with runtime_nodes_csv_path.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "step",
+            "node_id",
+            "node_n",
+            "node_name",
+            "op_name",
+            "node_kind",
+            "resource_kind",
+            "resource_id",
+            "runtime_role",
+            "device_type",
+            "device_index",
+            "thread_id",
+            "stream_id",
+            "start_ns",
+            "end_ns",
+            "duration_ns",
+            "correlation_id",
+            "linked_correlation_id",
+            "rf_id",
+            "kernel_file",
+            "has_tensor_io",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for event in selected_events:
+            execution_node = matched_execution_node_by_event.get(id(event))
+            rf_id = execution_rf_id(execution_node) if execution_node is not None else None
+            writer.writerow(
+                {
+                    "step": 0,
+                    "node_id": node_ids[id(event)],
+                    "node_n": node_indexes[id(event)],
+                    "node_name": _rewrite_name(
+                        name=event.name(), with_wildcard=False
+                    ),
+                    "op_name": event.name(),
+                    "node_kind": (
+                        "cpu_leaf"
+                        if event.device_type() == DeviceType.CPU
+                        else "gpu_runtime"
+                    ),
+                    "resource_kind": (
+                        "cpu_thread"
+                        if event.device_type() == DeviceType.CPU
+                        else "gpu_stream"
+                    ),
+                    "resource_id": (
+                        event.start_thread_id()
+                        if event.device_type() == DeviceType.CPU
+                        else event.device_resource_id()
+                    ),
+                    "runtime_role": runtime_role_by_event_id.get(
+                        id(event),
+                        "cpu_leaf"
+                        if event.device_type() == DeviceType.CPU
+                        else "gpu_runtime",
+                    ),
+                    "device_type": getattr(
+                        event.device_type(), "name", str(event.device_type())
+                    ),
+                    "device_index": event.device_index(),
+                    "thread_id": event.start_thread_id(),
+                    "stream_id": event.device_resource_id(),
+                    "start_ns": event.start_ns() - trace_start_ns,
+                    "end_ns": event.end_ns() - trace_start_ns,
+                    "duration_ns": event.duration_ns(),
+                    "correlation_id": event.correlation_id(),
+                    "linked_correlation_id": event.linked_correlation_id(),
+                    "rf_id": "" if rf_id is None else rf_id,
+                    "kernel_file": (
+                        execution_trace_attr(execution_node, "kernel_file") or ""
+                        if execution_node is not None
+                        else ""
+                    ),
+                    "has_tensor_io": int(execution_node is not None),
+                }
+            )
+
+    with runtime_edges_csv_path.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "step",
+            "src_node_id",
+            "dst_node_id",
+            "edge_kind",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for src, dst, edge_kind in [
+            *thread_order_edges,
+            *stream_order_edges,
+            *submit_edges,
+            *wait_edges,
+        ]:
+            writer.writerow(
+                {
+                    "step": 0,
+                    "src_node_id": src,
+                    "dst_node_id": dst,
+                    "edge_kind": edge_kind,
+                }
+            )
+        for tensor_key, node_id in input_edges:
+            writer.writerow(
+                {
+                    "step": 0,
+                    "src_node_id": tensor_dot_ids[tensor_key],
+                    "dst_node_id": node_id,
+                    "edge_kind": "data_input",
+                }
+            )
+        for node_id, tensor_key in output_edges:
+            writer.writerow(
+                {
+                    "step": 0,
+                    "src_node_id": node_id,
+                    "dst_node_id": tensor_dot_ids[tensor_key],
+                    "edge_kind": "data_output",
+                }
+            )
+
+    with tensor_csv_path.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "step",
+            "tensor_n",
+            "tensor_name",
+            "tensor_node_id",
+            "tensor_kind",
+            "tensor_id",
+            "storage_id",
+            "offset",
+            "numel",
+            "itemsize",
+            "tensor_size_bytes",
+            "device",
+            "dtype",
+            "shape",
+            "producer_count",
+            "consumer_count",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for tensor_index, tensor_key in enumerate(tensor_keys_in_order):
+            record = tensor_records[tensor_key]
+            writer.writerow(
+                {
+                    "step": 0,
+                    "tensor_n": tensor_index,
+                    "tensor_name": record["tensor_name"],
+                    "tensor_node_id": tensor_dot_ids[tensor_key],
+                    "tensor_kind": record["kind"],
+                    "tensor_id": record["tensor_id"],
+                    "storage_id": record["storage_id"],
+                    "offset": record["offset"],
+                    "numel": record["numel"],
+                    "itemsize": record["itemsize"],
+                    "tensor_size_bytes": record["num_bytes"],
+                    "device": record["device"],
+                    "dtype": record["dtype"] or "",
+                    "shape": json.dumps(record["shape"], separators=(",", ":")),
+                    "producer_count": len(record["producers"]),
+                    "consumer_count": len(record["consumers"]),
+                }
+            )
+
+    gpu_tensor_io_count = sum(
+        1
+        for event in selected_gpu_events
+        if id(event) in matched_execution_node_by_event
+    )
+    cpu_tensor_io_count = sum(
+        1
+        for event in selected_cpu_events
+        if id(event) in matched_execution_node_by_event
+    )
+    gpu_node_id_set = {node_ids[id(e)] for e in selected_gpu_events}
+    gpu_data_input_edge_count = sum(1 for _, dst in input_edges if dst in gpu_node_id_set)
+    gpu_data_output_edge_count = sum(1 for src, _ in output_edges if src in gpu_node_id_set)
+    weight_count = sum(
+        1 for r in tensor_records.values() if r["kind"] == "WEIGHT"
+    )
+    context_count = sum(
+        1 for r in tensor_records.values() if r["kind"] == "CONTEXT"
+    )
+    memory_stats: dict[str, int] = {}
+    if torch.cuda.is_available():
+        memory_stats["vram_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
+        memory_stats["vram_peak_reserved_bytes"] = torch.cuda.max_memory_reserved()
+        memory_stats["vram_allocated_bytes"] = torch.cuda.memory_allocated()
+        memory_stats["vram_reserved_bytes"] = torch.cuda.memory_reserved()
+    try:
+        import resource
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        # ru_maxrss is in KB on Linux, bytes on macOS.
+        memory_stats["dram_peak_rss_bytes"] = rusage.ru_maxrss * 1024
+    except (ImportError, AttributeError):
+        pass
+
+    manifest = {
+        "schema": "pytorch_runtime_v3",
+        "compute_node_scope": "cpu_leaf_plus_all_gpu_runtime",
+        "tensor_io_scope": "cpu_and_gpu",
+        "step_dot_files": ["step_0_compute_graph.dot"],
+        "timing_csv": timing_csv_path.name,
+        "node_csv": runtime_nodes_csv_path.name,
+        "edge_csv": runtime_edges_csv_path.name,
+        "tensor_csv": tensor_csv_path.name,
+        "trace_start_ns": trace_start_ns,
+        "node_count": len(selected_events),
+        "gpu_node_count": len(selected_gpu_events),
+        "cpu_node_count": len(selected_cpu_events),
+        "gpu_tensor_io_count": gpu_tensor_io_count,
+        "cpu_tensor_io_count": cpu_tensor_io_count,
+        "gpu_no_tensor_io_count": len(selected_gpu_events) - gpu_tensor_io_count,
+        "cpu_no_tensor_io_count": len(selected_cpu_events) - cpu_tensor_io_count,
+        "tensor_count": len(tensor_keys_in_order),
+        "tensor_weight_count": weight_count,
+        "tensor_context_count": context_count,
+        "data_input_edge_count": len(input_edges),
+        "data_output_edge_count": len(output_edges),
+        "gpu_data_input_edge_count": gpu_data_input_edge_count,
+        "gpu_data_output_edge_count": gpu_data_output_edge_count,
+        "cpu_data_input_edge_count": len(input_edges) - gpu_data_input_edge_count,
+        "cpu_data_output_edge_count": len(output_edges) - gpu_data_output_edge_count,
+        "submit_edge_count": len(submit_edges),
+        "wait_edge_count": len(wait_edges),
+        "thread_order_edge_count": len(thread_order_edges),
+        "stream_order_edge_count": len(stream_order_edges),
+        "match_warning_count": len(match_warnings),
+        "propagation_matched": propagation_stats["propagated"],
+        "propagation_no_linked_rf_id": propagation_stats["no_linked_rf_id"],
+        "propagation_no_execution_node": propagation_stats["no_execution_node"],
+        "propagation_ambiguous_rf_id": propagation_stats["ambiguous_rf_id"],
+        **memory_stats,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
 def write_hybrid_profile_dot(prof: Any, dot_path: Path, graph_name: str) -> None:
     from torch.autograd import DeviceType
     from torch.autograd.profiler_util import _rewrite_name
@@ -2205,6 +3344,16 @@ def main(
             output_paths.runtime_io_dot_path,
             output_paths.runtime_io_dot_path.stem,
         )
+    if output_paths.llamasim_output_dir is not None:
+        if output_paths.execution_trace_path is None:
+            raise RuntimeError(
+                "llamasim-runtime export requested without an execution trace path"
+            )
+        write_llamasim_runtime_bundle(
+            prof,
+            output_paths.execution_trace_path,
+            output_paths.llamasim_output_dir,
+        )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
     print("device:", device)
@@ -2235,6 +3384,8 @@ def main(
         print("hybrid_dot_path:", output_paths.hybrid_dot_path)
     if output_paths.runtime_io_dot_path is not None:
         print("runtime_io_dot_path:", output_paths.runtime_io_dot_path)
+    if output_paths.llamasim_output_dir is not None:
+        print("llamasim_output_dir:", output_paths.llamasim_output_dir)
     print("latent_shape:", tuple(output.images.shape))
     print("metadata_json:", metadata_json)
     if metadata_json:

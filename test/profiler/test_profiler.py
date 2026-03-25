@@ -5,6 +5,9 @@ import collections
 import copy
 import csv
 import gc
+import io
+import importlib.util
+import builtins
 import json
 import mmap
 import os
@@ -2928,6 +2931,82 @@ class MockNode:
         self.children = [MockNode(name, i) for name, i in children.items()]
 
 
+def _load_profile_sdxl_turbo_common():
+    module_name = "_test_profile_sdxl_turbo_common"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "profile_sdxl_turbo_common.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_profile_qwen_image_common():
+    module_name = "_test_profile_qwen_image_common"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "profile_qwen_image_common.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_run_qwen_image():
+    module_name = "_test_run_qwen_image"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "run_qwen_image.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_split_trace_csv_leaf_events():
+    module_name = "_test_split_trace_csv_leaf_events"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "split_trace_csv_leaf_events.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class TestExperimentalUtils(TestCase):
     def make_tree(self) -> list[MockNode]:
         tree = {
@@ -2958,6 +3037,503 @@ class TestExperimentalUtils(TestCase):
         self.assertEqual(
             " ".join(i.name for i in _utils.traverse_bfs(self.make_tree())),
             "root_0 root_1 1 3 6 7 8 2 4 5 9 10",
+        )
+
+    def test_llamasim_runtime_selector_ignores_gpu_user_annotations(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockRuntimeExportEvent:
+            def __init__(
+                self,
+                name: str,
+                *,
+                device_type: DeviceType,
+                start_ns: int,
+                end_ns: int,
+                correlation_id: int = 0,
+                linked_correlation_id: int = 0,
+                device_resource_id: int = 7,
+                thread_id: int = 1,
+                is_user_annotation: bool = False,
+            ) -> None:
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+                self._is_user_annotation = is_user_annotation
+
+            def name(self) -> str:
+                return self._name
+
+            def device_type(self) -> DeviceType:
+                return self._device_type
+
+            def start_ns(self) -> int:
+                return self._start_ns
+
+            def end_ns(self) -> int:
+                return self._end_ns
+
+            def duration_ns(self) -> int:
+                return self._end_ns - self._start_ns
+
+            def correlation_id(self) -> int:
+                return self._correlation_id
+
+            def linked_correlation_id(self) -> int:
+                return self._linked_correlation_id
+
+            def device_index(self) -> int:
+                return 0
+
+            def device_resource_id(self) -> int:
+                return self._device_resource_id
+
+            def start_thread_id(self) -> int:
+                return self._thread_id
+
+            def end_thread_id(self) -> int:
+                return self._thread_id
+
+            def is_async(self) -> bool:
+                return False
+
+            def is_user_annotation(self) -> bool:
+                return self._is_user_annotation
+
+        raw_events = [
+            MockRuntimeExportEvent(
+                "cpu_submit",
+                device_type=DeviceType.CPU,
+                start_ns=0,
+                end_ns=10,
+                correlation_id=1,
+            ),
+            MockRuntimeExportEvent(
+                "sdxl_turbo_run",
+                device_type=DeviceType.CUDA,
+                start_ns=0,
+                end_ns=100,
+                correlation_id=1,
+                is_user_annotation=True,
+            ),
+            MockRuntimeExportEvent(
+                "## Call CompiledFxGraph ##",
+                device_type=DeviceType.CUDA,
+                start_ns=20,
+                end_ns=90,
+                correlation_id=2,
+                is_user_annotation=True,
+            ),
+            MockRuntimeExportEvent(
+                "triton_kernel_0",
+                device_type=DeviceType.CUDA,
+                start_ns=30,
+                end_ns=40,
+                correlation_id=3,
+            ),
+        ]
+
+        selected_events, selected_cpu_events, selected_gpu_events = (
+            sdxl_profiler.select_llamasim_runtime_events(raw_events)
+        )
+
+        self.assertEqual([event.name() for event in selected_cpu_events], ["cpu_submit"])
+        self.assertEqual(
+            [event.name() for event in selected_gpu_events], ["triton_kernel_0"]
+        )
+        self.assertEqual(
+            [event.name() for event in selected_events],
+            ["cpu_submit", "triton_kernel_0"],
+        )
+
+    def test_qwen_parse_args_defaults(self):
+        qwen_profiler = _load_profile_qwen_image_common()
+
+        with patch.object(sys, "argv", ["profile_qwen_image_gpu.py"]):
+            args = qwen_profiler.parse_args(
+                default_device="cuda:0",
+                default_dtype="bfloat16",
+                default_output_prefix="qwen_image_gpu",
+                default_profile_memory=True,
+                default_record_shapes=True,
+                default_with_stack=True,
+            )
+
+        self.assertEqual(args.model, "/data/llamasim/models/qwen-image-2512")
+        self.assertEqual(args.dtype, "bfloat16")
+        self.assertEqual(args.negative_prompt, " ")
+        self.assertEqual(args.true_cfg_scale, 4.0)
+        self.assertEqual(args.component, "qwen_image_pipeline")
+
+    def test_run_qwen_parse_args_defaults(self):
+        qwen_runner = _load_run_qwen_image()
+
+        with patch.object(sys, "argv", ["run_qwen_image.py"]):
+            args = qwen_runner.parse_args()
+
+        self.assertEqual(args.model, "/data/llamasim/models/qwen-image-2512")
+        self.assertEqual(args.device, "cpu")
+        self.assertEqual(args.dtype, "float32")
+        self.assertEqual(args.negative_prompt, " ")
+        self.assertEqual(args.true_cfg_scale, 4.0)
+
+    def test_qwen_runtime_error_mentions_qwen25_support(self):
+        qwen_profiler = _load_profile_qwen_image_common()
+
+        error = qwen_profiler.format_qwen_runtime_error(
+            model="/data/llamasim/models/qwen-image-2512",
+            exc=ImportError(
+                "cannot import name 'Qwen2_5_VLForConditionalGeneration' from 'transformers'"
+            ),
+            diffusers_version="0.37.0",
+            transformers_version="4.48.3",
+            architecture="Qwen2_5_VLForConditionalGeneration",
+            model_type="qwen2_5_vl",
+        )
+
+        self.assertIn("0.37.0", error)
+        self.assertIn("4.48.3", error)
+        self.assertIn("Qwen2_5_VLForConditionalGeneration", error)
+        self.assertIn("qwen2_5_vl", error)
+
+    def test_qwen_cuda_oom_error_mentions_accelerate_guidance(self):
+        qwen_profiler = _load_profile_qwen_image_common()
+
+        error = qwen_profiler.format_qwen_cuda_oom_error(
+            model="/data/llamasim/models/qwen-image-2512",
+            device=torch.device("cuda:0"),
+            torch_dtype=torch.bfloat16,
+            exc=torch.OutOfMemoryError("CUDA out of memory"),
+            accelerate_version=None,
+        )
+
+        self.assertIn("cuda:0", error)
+        self.assertIn("torch.bfloat16", error)
+        self.assertIn("accelerate", error)
+        self.assertIn("--device cpu", error)
+
+    def test_sdxl_load_pipeline_missing_diffusers_mentions_runtime_python(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        original_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "diffusers":
+                raise ModuleNotFoundError("No module named 'diffusers'")
+            return original_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            with self.assertRaisesRegex(
+                RuntimeError, "Failed to import `diffusers`"
+            ) as cm:
+                sdxl_profiler.load_pipeline(
+                    "/data/llamasim/models/sdxl-turbo",
+                    torch.float16,
+                    torch.device("cpu"),
+                )
+
+        error = str(cm.exception)
+        self.assertIn("sys.executable", error)
+        self.assertIn("PYTHONNOUSERSITE=1", error)
+        self.assertIn("/tmp/ptvenv/bin/python", error)
+
+    def test_split_trace_csv_leaf_events_filters_leaf_cpu_and_true_gpu(self):
+        splitter = _load_split_trace_csv_leaf_events()
+
+        fieldnames = [
+            "event_index",
+            "id",
+            "name",
+            "start_us",
+            "end_us",
+            "duration_us",
+            "device_type",
+            "device_resource_id",
+            "thread",
+            "depth",
+            "cpu_parent_id",
+            "cpu_children",
+            "kernel_count",
+            "is_user_annotation",
+        ]
+        rows = [
+            {
+                "event_index": "0",
+                "id": "10",
+                "name": "aten::parent",
+                "start_us": "0",
+                "end_us": "100",
+                "duration_us": "100",
+                "device_type": "CPU",
+                "device_resource_id": "",
+                "thread": "1",
+                "depth": "0",
+                "cpu_parent_id": "",
+                "cpu_children": "2",
+                "kernel_count": "0",
+                "is_user_annotation": "false",
+            },
+            {
+                "event_index": "1",
+                "id": "11",
+                "name": "aten::leaf",
+                "start_us": "10",
+                "end_us": "20",
+                "duration_us": "10",
+                "device_type": "CPU",
+                "device_resource_id": "",
+                "thread": "1",
+                "depth": "1",
+                "cpu_parent_id": "10",
+                "cpu_children": "0",
+                "kernel_count": "0",
+                "is_user_annotation": "false",
+            },
+            {
+                "event_index": "2",
+                "id": "15",
+                "name": "aten::leaf",
+                "start_us": "20",
+                "end_us": "35",
+                "duration_us": "15",
+                "device_type": "CPU",
+                "device_resource_id": "",
+                "thread": "1",
+                "depth": "1",
+                "cpu_parent_id": "10",
+                "cpu_children": "0",
+                "kernel_count": "0",
+                "is_user_annotation": "false",
+            },
+            {
+                "event_index": "3",
+                "id": "12",
+                "name": "sdxl_turbo_run",
+                "start_us": "0",
+                "end_us": "100",
+                "duration_us": "100",
+                "device_type": "CUDA",
+                "device_resource_id": "7",
+                "thread": "1",
+                "depth": "0",
+                "cpu_parent_id": "",
+                "cpu_children": "0",
+                "kernel_count": "0",
+                "is_user_annotation": "true",
+            },
+            {
+                "event_index": "4",
+                "id": "13",
+                "name": "Memcpy HtoD",
+                "start_us": "30",
+                "end_us": "40",
+                "duration_us": "10",
+                "device_type": "CUDA",
+                "device_resource_id": "7",
+                "thread": "1",
+                "depth": "0",
+                "cpu_parent_id": "",
+                "cpu_children": "0",
+                "kernel_count": "0",
+                "is_user_annotation": "false",
+            },
+            {
+                "event_index": "5",
+                "id": "14",
+                "name": "triton_poi_fused_0",
+                "start_us": "18",
+                "end_us": "30",
+                "duration_us": "12",
+                "device_type": "CUDA",
+                "device_resource_id": "7",
+                "thread": "1",
+                "depth": "0",
+                "cpu_parent_id": "",
+                "cpu_children": "0",
+                "kernel_count": "0",
+                "is_user_annotation": "false",
+            },
+            {
+                "event_index": "6",
+                "id": "16",
+                "name": "triton_poi_fused_0",
+                "start_us": "55",
+                "end_us": "70",
+                "duration_us": "15",
+                "device_type": "CUDA",
+                "device_resource_id": "7",
+                "thread": "1",
+                "depth": "0",
+                "cpu_parent_id": "",
+                "cpu_children": "0",
+                "kernel_count": "0",
+                "is_user_annotation": "false",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_csv = os.path.join(tmpdir, "trace.csv")
+            cpu_out = os.path.join(tmpdir, "leaf_cpu.csv")
+            gpu_out = os.path.join(tmpdir, "leaf_gpu.csv")
+            graph_out = os.path.join(tmpdir, "leaf_summary.svg")
+            with open(trace_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            stdout = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "split_trace_csv_leaf_events.py",
+                    trace_csv,
+                    "--cpu-out",
+                    cpu_out,
+                    "--gpu-out",
+                    gpu_out,
+                    "--graph-out",
+                    graph_out,
+                ],
+            ), patch.object(sys, "stdout", stdout):
+                splitter.main()
+
+            with open(cpu_out, newline="") as f:
+                cpu_rows = list(csv.DictReader(f))
+            with open(gpu_out, newline="") as f:
+                gpu_rows = list(csv.DictReader(f))
+            with open(graph_out) as f:
+                graph_svg = f.read()
+            output = stdout.getvalue()
+
+        self.assertEqual(
+            [row["name"] for row in cpu_rows], ["aten::leaf", "aten::leaf"]
+        )
+        self.assertEqual(
+            [row["name"] for row in gpu_rows],
+            ["triton_poi_fused_0", "triton_poi_fused_0"],
+        )
+        self.assertIn(f"summary_graph_out={graph_out}", output)
+        self.assertIn("total_leaf_cpu_time_us=25.000", output)
+        self.assertIn("total_leaf_gpu_time_us=27.000", output)
+        self.assertIn("leaf_cpu_active_wall_time_us=25.000", output)
+        self.assertIn("leaf_gpu_active_wall_time_us=27.000", output)
+        self.assertIn("cpu_gpu_overlap_wall_time_us=12.000", output)
+        self.assertIn("e2e_compute_wall_time_us=60.000", output)
+        self.assertIn("Top 10 Most Frequent Leaf CPU Activities", output)
+        self.assertIn("name=aten::leaf count=2 total_us=25.000 avg_us=12.500", output)
+        self.assertIn("Top 10 Longest Accumulated True GPU Activities", output)
+        self.assertIn("name=triton_poi_fused_0 count=2 total_us=27.000 avg_us=13.500", output)
+        self.assertIn("Leaf Event Activity Summary (top 10)", graph_svg)
+        self.assertIn("Leaf CPU Top 10 by Count", graph_svg)
+        self.assertIn("True GPU Top 10 by Total Time (us)", graph_svg)
+        self.assertIn("aten::leaf", graph_svg)
+        self.assertIn("triton_poi_fused_0", graph_svg)
+
+    def test_qwen_install_compat_shim_exposes_qwen25_symbol(self):
+        qwen_profiler = _load_profile_qwen_image_common()
+
+        try:
+            import transformers
+        except Exception:
+            self.skipTest("transformers is not available")
+
+        if hasattr(transformers, "Qwen2_5_VLForConditionalGeneration"):
+            self.skipTest("runtime already provides Qwen2_5_VLForConditionalGeneration")
+
+        qwen_profiler.install_qwen25_transformers_compat()
+
+        self.assertTrue(
+            hasattr(transformers, "Qwen2_5_VLForConditionalGeneration")
+        )
+        self.assertEqual(
+            transformers.Qwen2_5_VLForConditionalGeneration.config_class.model_type,
+            "qwen2_5_vl",
+        )
+
+    def test_qwen_load_pipeline_assembles_components_directly(self):
+        qwen_profiler = _load_profile_qwen_image_common()
+        loaded_components = []
+
+        def build_component(name):
+            class Component:
+                @classmethod
+                def from_pretrained(cls, path, **kwargs):
+                    loaded_components.append((name, os.fspath(path), kwargs))
+                    return cls()
+
+            return Component
+
+        FakeScheduler = build_component("scheduler")
+        FakeTextEncoder = build_component("text_encoder")
+        FakeTokenizer = build_component("tokenizer")
+        FakeTransformer = build_component("transformer")
+        FakeVAE = build_component("vae")
+
+        class FakePipeline:
+            def __init__(self, scheduler, vae, text_encoder, tokenizer, transformer):
+                self.scheduler = scheduler
+                self.vae = vae
+                self.text_encoder = text_encoder
+                self.tokenizer = tokenizer
+                self.transformer = transformer
+                self.image_processor = object()
+                self._unpack_latents = object()
+                self.vae_scale_factor = 8
+
+            def to(self, device):
+                self.device = device
+                return self
+
+        fake_diffusers = type(sys)("diffusers")
+        fake_diffusers.AutoencoderKLQwenImage = FakeVAE
+        fake_diffusers.FlowMatchEulerDiscreteScheduler = FakeScheduler
+        fake_diffusers.QwenImagePipeline = FakePipeline
+        fake_diffusers.QwenImageTransformer2DModel = FakeTransformer
+
+        fake_transformers = type(sys)("transformers")
+        fake_transformers.Qwen2_5_VLForConditionalGeneration = FakeTextEncoder
+        fake_transformers.Qwen2Tokenizer = FakeTokenizer
+
+        device = torch.device("cpu")
+        with patch.object(qwen_profiler, "install_qwen25_transformers_compat"):
+            with patch.dict(
+                sys.modules,
+                {"diffusers": fake_diffusers, "transformers": fake_transformers},
+            ):
+                pipe = qwen_profiler.load_pipeline(
+                    "/tmp/fake-qwen-model",
+                    torch.float16,
+                    device,
+                )
+
+        self.assertIsInstance(pipe, FakePipeline)
+        self.assertEqual(pipe.device, device)
+        self.assertEqual(
+            loaded_components,
+            [
+                ("scheduler", "/tmp/fake-qwen-model/scheduler", {}),
+                (
+                    "text_encoder",
+                    "/tmp/fake-qwen-model/text_encoder",
+                    {"torch_dtype": torch.float16, "low_cpu_mem_usage": False},
+                ),
+                ("tokenizer", "/tmp/fake-qwen-model/tokenizer", {}),
+                (
+                    "transformer",
+                    "/tmp/fake-qwen-model/transformer",
+                    {"torch_dtype": torch.float16, "low_cpu_mem_usage": False},
+                ),
+                (
+                    "vae",
+                    "/tmp/fake-qwen-model/vae",
+                    {"torch_dtype": torch.float16, "low_cpu_mem_usage": False},
+                ),
+            ],
         )
 
     @staticmethod
