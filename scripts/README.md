@@ -48,6 +48,57 @@ profiler instrumentation.
 - the CPU output keeps only leaf CPU rows; the GPU output keeps true kernel
   rows and drops user annotations, memcpys, and memsets
 
+## How the llamasim bundle is created
+
+This is the `llamasim-runtime` bundle, sometimes referred to here as the
+`llama_bundle`. It is emitted only when `--dot-level llamasim-runtime` or
+`--dot-level all` is enabled. The exporter requires a GPU trace and an
+Execution Trace Observer JSON file; if `--output-dir` is set, the default
+bundle directory is `<output-dir>/<stem>_llamasim_runtime`, otherwise it is
+created next to the trace path.
+
+1. Collect the two source views of the run:
+- raw Kineto events and `trace_start_ns` from the profiler result
+- Execution Trace Observer nodes from `--execution-trace`
+
+2. Match runtime events to execution-trace nodes:
+- GPU execution nodes are matched to Kineto GPU kernels by linked `rf_id`, then
+  narrowed by kernel name and stream hint when available
+- CPU runtime events are matched by `rf_id`
+- ambiguous GPU matches are a hard error for the export
+- if a GPU kernel has no direct execution-trace node, the exporter tries to
+  propagate tensor I/O from the linked parent CPU event
+
+3. Select which runtime nodes go into the bundle:
+- CPU nodes are reduced to leaf CPU events only
+- GPU nodes keep non-CPU runtime events but drop GPU user annotations
+- selected runtime nodes get stable IDs `k0`, `k1`, ... and are connected with
+  `thread_order`, `stream_order`, `submit`, `wait`, and `sync_wait` edges
+- runtime roles such as `cpu_leaf`, `gpu_runtime`, `submit`, and `wait` are
+  recorded in the emitted metadata
+
+4. Materialize tensor records from execution-trace inputs and outputs:
+- tensor entries are flattened into canonical tuples
+  `(tensor_id, storage_id, offset, numel, itemsize, device)`
+- tuples are deduplicated into bundle tensor records and assigned stable IDs
+  `t0`, `t1`, ...
+- tensors with producers in the selected graph are marked as `CONTEXT`; tensors
+  that are only consumed are marked as `WEIGHT`
+- data edges are added from tensor nodes to runtime nodes for inputs and from
+  runtime nodes to tensor nodes for outputs
+
+5. Write the bundle artifacts:
+- `step_0_compute_graph.dot`: the combined runtime+tensors graph
+- `ggml_profile_node_records.csv`: per-node timing table used by the downstream
+  llamasim tooling
+- `runtime_nodes.csv`: node metadata, timings, device/thread/stream IDs,
+  `rf_id`, `kernel_file`, and whether tensor I/O was attached
+- `runtime_edges.csv`: ordering, submit/wait, and tensor data-flow edges
+- `pytorch_runtime_tensors.csv`: tensor metadata, shape/dtype, size, and
+  producer/consumer counts
+- `manifest.json`: schema, file names, node/tensor/edge counts, tensor-I/O
+  coverage, propagation statistics, match-warning count, and peak memory stats
+
 ## Example commands
 
 ```bash
