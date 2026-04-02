@@ -1,142 +1,131 @@
 # Weight Streaming Slides Outline
 
-## Slide 1: What Exists Today
+## Slide 1: Problem And Goal
 
-- Weight streaming is implemented in current code, not just planned
-- It is integrated into Inductor wrapper codegen
-- It is not an FX graph rewrite
-- It is not based on custom ops
-- The compile path injects Python runtime calls into generated wrapper code
-- The runtime handles SSD -> DRAM, DRAM -> VRAM, and eviction behavior
-- The exported wrapper shows the actual injected calls
+- Large models cannot keep all useful weights in VRAM at once
+- The goal is to move weights through a memory hierarchy as needed
+- The hierarchy is:
+  - SSD
+  - DRAM
+  - VRAM
+- The system tries to fetch earlier and evict later to reduce stalls
+- The key question is where to hook this into compiled execution
 
-## Slide 2: Main Code Locations
+## Slide 2: High-Level Design
 
-- `torch/_inductor/weight_streaming/plan.py`
-  - schedule dataclasses and JSON / CSV loader
-- `torch/_inductor/weight_streaming/codegen.py`
-  - trace-index mapping and wrapper call emission helpers
-- `torch/_inductor/weight_streaming/runtime.py`
-  - runtime singleton and IO / memory movement logic
-- `torch/_inductor/codegen/wrapper.py`
-  - injection into generated Inductor wrapper
-- `scripts/run_weight_streaming.py`
-  - end-to-end driver used to compile and run
+- The design hooks into the compiled wrapper, not the model graph itself
+- A scheduler produces a plan using trace-level node indices
+- The compiler turns the model into a smaller set of fused compute launches
+- The wrapper is the place where these worlds meet
+- Weight-streaming calls are inserted around wrapper compute launches
+- Runtime then executes SSD / DRAM / VRAM movement at those points
 
-## Slide 3: Schedule Inputs
+## Slide 3: Main Inputs
 
-- The loader reads scheduler-style JSON
-- Main JSON sections are:
-  - `nodes`
-  - `io_operations`
-  - `spill_decisions`
-  - `cold_start_prefetches`
-- Optional CSVs add:
-  - `runtime_nodes.csv` for `resource_kind`
-  - `pytorch_runtime_tensors.csv` for tensor metadata
+- One input is the scheduler plan
+- That plan describes:
+  - which tensor to move
+  - what kind of movement it is
+  - which traced node it should be attached to
+- Another input is runtime metadata about nodes and tensors
+- Node metadata helps decide which traced nodes are GPU-facing
+- Tensor metadata helps decide what can be streamed and how
 
-## Slide 4: Parsed Operation Types
+## Slide 4: Core Hook Point
 
-- `prefetch`
-  - becomes `PrefetchOp`
-  - represents SSD -> DRAM prefetch
-- `vram_prefetch_h2d`
-  - becomes `H2DPrefetchOp`
-  - represents DRAM -> VRAM prefetch intent
-- `vram_evict_d2h`
-  - becomes `EvictVramOp`
-- `spill_decisions`
-  - become `EvictDramOp`
+- The hook point is after wrapper structure is built
+- It is before final generated code is emitted
+- At that point, the compiler already knows its actual compute launches
+- The injector can walk those launches and insert runtime calls around them
+- This avoids rewriting the model graph itself
+- It also means the exported wrapper shows the real final behavior
 
-## Slide 5: How Compile-Time Injection Works
+## Slide 5: Why Node Matching Is Needed
 
-- `run_weight_streaming.py` initializes the runtime first
-- It sets Inductor config knobs for plan and CSV paths
-- Then it compiles `pipe.unet` with `torch.compile(..., backend="inductor")`
-- In `wrapper.py`, `_generate()` calls `_inject_weight_streaming_io()`
-- Injection happens after normal wrapper IR passes
-- The wrapper is modified before final code emission
-- If export is enabled, final wrapper code is written to disk
+- The scheduler works on a detailed execution trace
+- That trace contains both CPU and GPU nodes
+- The compiled wrapper does not preserve that exact structure
+- Fusion reduces many traced GPU nodes into fewer wrapper launches
+- So a direct one-to-one mapping does not exist
+- The system needs an adapter to translate trace positions into wrapper positions
 
-## Slide 6: What The Wrapper Emits
+## Slide 6: How Nodes Are Matched
 
-- Header lines:
-  - import `WeightStreamRuntime`
-  - `_ws_rt = WeightStreamRuntime.instance()`
-- Startup call:
-  - `_ws_rt.cold_start_prefetch(...)`
-- Scheduled pre-kernel call:
-  - `_ws_rt.ssd_prefetch(...)`
-- Graph-input first-use / last-use calls:
-  - `_ws_rt.h2d_prefetch(tensor)`
-  - `_ws_rt.evict_vram(tensor)`
-- Scheduled post-kernel call:
-  - `_ws_rt.evict_dram(...)`
+- First, traced nodes are split into CPU-like and GPU-like nodes
+- GPU identity comes mainly from resource kind
+- If that is missing, GPU-like names are used as a fallback heuristic
+- Prefetch-style ops attach to the next GPU node
+- Eviction-style ops attach to the previous GPU node
+- This is conservative:
+  - fetch a little earlier
+  - evict a little later
 
-## Slide 7: Trace Mapping And Fusion
+## Slide 7: How Fusion Is Handled
 
-- Scheduler trace contains mixed CPU and GPU nodes
-- Wrapper has fewer insertion points than the original trace
-- `ScheduleAdapter` classifies GPU nodes by:
-  - `resource_kind`
-  - or GPU-like name prefixes
-- CPU-targeted prefetch ops snap forward to the next GPU node
-- CPU-targeted eviction ops snap backward to the previous GPU node
-- Fused wrapper indices are produced by rescaling to wrapper kernel count
+- Even after GPU-node matching, wrapper launch count is still smaller
+- The adapter rescales trace GPU indices into wrapper kernel indices
+- So the schedule is not copied literally
+- It is compressed onto the fused wrapper timeline
+- This is how a detailed scheduler trace can still drive a fused compiled model
+- The result is approximate but structured, not arbitrary
 
-## Slide 8: Runtime Behavior
+## Slide 8: Two Placement Strategies Used Today
 
-- Runtime owns:
-  - async SSD read thread pool
-  - pinned DRAM buffers
-  - dedicated CUDA H2D stream
-  - H2D events
-  - VRAM tensor tracking
-- `ssd_prefetch(...)` starts async SSD -> DRAM reads
-- `cold_start_prefetch(...)` blocks until startup weights reach DRAM
-- `h2d_prefetch(...)` restores weights to VRAM
+- Strategy 1: schedule-driven placement
+  - used for SSD -> DRAM prefetch
+  - used for DRAM eviction
+- Strategy 2: graph-input use analysis
+  - used for DRAM -> VRAM restore
+  - used for VRAM eviction
+- So not every movement comes directly from the schedule
+- Some are attached using first-use / last-use of compiled inputs
 
-## Slide 9: Weight Registration And VRAM Restore
+## Slide 9: Runtime Execution Model
 
-- `run_weight_streaming.py` registers model weights before compile
-- `register_weight(...)` stores a pinned CPU backup of each GPU weight
-- The current wrapper passes actual tensor objects to:
-  - `_ws_rt.h2d_prefetch(tensor)`
-  - `_ws_rt.evict_vram(tensor)`
-- On restore, the runtime:
-  - resizes GPU storage back to original size
-  - copies CPU backup to GPU on H2D stream
-  - records an event and waits immediately on current stream
-- No explicit emitted `wait_h2d(...)` is needed for this path
+- At runtime, tensors can be thought of as living in one of three places:
+  - SSD
+  - DRAM
+  - VRAM
+- SSD reads are launched asynchronously into pinned DRAM buffers
+- VRAM restore uses a dedicated H2D stream
+- VRAM eviction frees GPU storage after last use
+- DRAM eviction drops the pinned CPU copy when it is no longer needed
 
-## Slide 10: Exported Generated Code
+## Slide 10: How Restores Work In Practice
 
-- `weight_streaming_generated.py` is the final generated wrapper
-- It is written from the final Inductor wrapper buffer
-- It is not manually edited after generation
-- It is not a simplified pseudocode export
-- The visible `_ws_rt.*` calls are the real injected calls
-- This makes the file useful for inspection and debugging
-- It reflects what the compiled wrapper actually runs
+- The current wrapper restores registered weight tensors by object identity
+- Each registered weight has a CPU backup
+- Before first use, the wrapper asks the runtime to restore that weight
+- The runtime recreates GPU storage if it was evicted
+- Then it copies the CPU backup onto the GPU
+- The current stream is synchronized with that restore before compute continues
 
-## Slide 11: Current Limitations
+## Slide 11: What Is Actually Guaranteed Today
 
-- No FX-level weight replacement pass
-- No custom-op based implementation
-- Runtime initialization is still external to generated code
-- Scheduled `H2DPrefetchOp` / `EvictVramOp` are parsed but not directly emitted
-- Instead, VRAM restore / evict is driven by graph-input first-use / last-use
-- Some parsed fields are not yet used for placement
-  - `PrefetchOp.after_node`
-  - `PrefetchOp.eager_start`
-  - `ColdStartOp.attach_before_node`
+- There is real schedule loading
+- There is real wrapper injection
+- There is real runtime IO and memory movement
+- There is real exported generated code showing inserted calls
+- SSD -> DRAM behavior is schedule-driven
+- DRAM -> VRAM and VRAM eviction are currently use-driven
+- So the system is real, but the control sources are mixed
 
-## Slide 12: Short Takeaway
+## Slide 12: Main Limitations
 
-- The implementation is real and compile-path integrated
-- Schedule loading, wrapper injection, runtime IO, and export all exist
-- SSD -> DRAM prefetch is schedule-driven today
-- DRAM -> VRAM restore and VRAM eviction are graph-input driven today
-- The exported wrapper is trustworthy for understanding actual behavior
-- The main remaining gaps are around fuller schedule use and polish
-- The system is beyond a prototype, but not yet fully generalized
+- The full schedule is not used uniformly for all movement types
+- CPU trace nodes are not first-class wrapper insertion points
+- Some schedule fields are parsed but not yet used for placement
+- Matching across fusion is approximate by design
+- Runtime setup still has to happen outside generated code
+- The design is functional today, but not yet the fully generalized end state
+
+## Slide 13: Suggested Closing Summary
+
+- The key idea is to hook weight streaming into the compiled wrapper
+- The wrapper is where traced schedule intent meets fused compiled execution
+- Node matching is done by:
+  - GPU-node identification
+  - conservative snapping
+  - fusion-aware rescaling
+- Runtime then performs the actual SSD / DRAM / VRAM movement
+- This is the right mental model for understanding the current implementation
