@@ -13,6 +13,39 @@ local end-to-end profiling workflow for SDXL Turbo and Qwen-Image.
 Use `run_qwen_image.py` when you want the same Qwen runtime path without
 profiler instrumentation.
 
+Use `run_accelerate_cpu_offload.py` when you want the same local SDXL Turbo or
+Qwen-Image models to run with Diffusers Accelerate CPU offload, so the pipeline
+can exceed available GPU VRAM at the cost of extra transfer overhead. Both
+offload entrypoints also accept `--fusion inductor` to compile the hot model
+path with `torch.compile` before offload hooks are installed.
+
+Use `profile_accelerate_cpu_offload.py` when you want a steady-state profiler
+trace for the offloaded run. It starts profiling only after model load and
+unprofiled warmup, so checkpoint reads and first-touch storage costs are kept
+out of the captured region. It also emits a llama bundle next to the trace by
+default.
+Pass `--offload-mode none` when you want the same harness and steady-state
+profiling flow without installing Accelerate CPU offload hooks. In that mode,
+the full pipeline is moved onto the requested accelerator and stays there.
+When `--output-dir` is set, the offload profiler writes the bundle under
+`<output-dir>/llama_bundle` by default.
+
+Use `demo_profile_time_split.py` when you want to inspect an emitted
+`llamasim-runtime` llama bundle directory or its `manifest.json` and compare
+several heuristics for splitting the
+imported node durations into pure compute time versus offload/stall time.
+Its summary output can also break raw, compute, and stall totals into CPU and
+GPU components. The newer `v5` and `v6` modes propagate transfer/offload stall
+lineage through downstream CPU nodes. `v5` fixes later sync/wait nodes, while
+`v6` also strips CPU staging and wrapper work such as `aten::to`,
+`aten::empty_strided`, `TorchDynamo Cache Lookup`, and AOT dispatcher prologue
+nodes when they are on the offload read path. The CLI now defaults to `v6`.
+It only writes annotated CSV / JSON reports when `--write-reports` or
+`--out-dir` is passed. Use `--compare-bundle <other_bundle>` to diff two llama
+bundles and print the largest raw CPU-side deltas. Add
+`--compare-include-retained-compute` when you also want the slower section that
+prints the largest CPU nodes still retained as compute under the chosen version.
+
 2. Choose the execution mode and capture options:
 - `--fusion none|inductor` compares eager execution with
   `torch.compile(..., backend="inductor")`
@@ -118,8 +151,37 @@ PYTHONNOUSERSITE=1 /tmp/ptvenv/bin/python scripts/profile_qwen_image_gpu.py \
 ```
 
 ```bash
+PYTHONNOUSERSITE=1 /tmp/ptvenv/bin/python scripts/run_accelerate_cpu_offload.py \
+  sdxl-turbo \
+  --offload-mode model \
+  --disable-progress-bar
+```
+
+```bash
+PYTHONNOUSERSITE=1 /tmp/ptvenv/bin/python scripts/run_accelerate_cpu_offload.py \
+  qwen-image \
+  --offload-mode sequential \
+  --disable-progress-bar
+```
+
+```bash
+PYTHONNOUSERSITE=1 /tmp/ptvenv/bin/python scripts/profile_accelerate_cpu_offload.py \
+  qwen-image \
+  --offload-mode sequential \
+  --output-dir /tmp/qwen_image_offload_profile \
+  --disable-progress-bar
+```
+
+```bash
 python3 scripts/split_trace_csv_leaf_events.py \
   /tmp/sdxl_gpu_inductor/sdxl_turbo_gpu_inductor_trace.csv
+```
+
+```bash
+python3 scripts/demo_profile_time_split.py \
+  /data/pytorch-source/llamasim_bundle \
+  --version all \
+  --out-dir /tmp/llamasim_bundle_time_split
 ```
 
 ## Compared with upstream PyTorch (`origin/main`)
