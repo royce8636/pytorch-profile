@@ -45,6 +45,8 @@ It only writes annotated CSV / JSON reports when `--write-reports` or
 bundles and print the largest raw CPU-side deltas. Add
 `--compare-include-retained-compute` when you also want the slower section that
 prints the largest CPU nodes still retained as compute under the chosen version.
+See `demo_profile_time_split_detection.md` for the exact detection rules and
+their limitations.
 
 2. Choose the execution mode and capture options:
 - `--fusion none|inductor` compares eager execution with
