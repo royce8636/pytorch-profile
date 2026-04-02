@@ -1,105 +1,89 @@
-# Weight Streaming: What Has Actually Been Implemented for Prefetch/Eviction
+# Weight Streaming: What The Current Code Actually Does
 
-This file documents the code that currently exists in this worktree to support
-weight-streaming-style prefetch and eviction. It replaces the earlier
-speculative design that described an FX pass and custom ops. The implementation
-that landed is different:
+This file documents the implementation that exists in this worktree today.
+It is intentionally descriptive, not aspirational.
 
-- It is wired into Inductor wrapper codegen, not an FX graph rewrite.
-- It injects Python runtime calls around generated kernel launches.
-- It can schedule SSD prefetches and evictions from the wrapper.
-- It contains runtime primitives for DRAM->VRAM H2D prefetch and wait, but
-  those primitives are not yet emitted by Inductor codegen.
+The current implementation is:
 
-The rest of this document is intentionally concrete and describes only what the
-current code does.
+- integrated into Inductor Python wrapper codegen, not an FX rewrite
+- driven by a scheduler JSON plus optional CSV side inputs
+- executed by injected Python runtime calls around generated compute lines
+- able to emit SSD/DRAM and VRAM-level weight-streaming calls in the generated
+  wrapper
 
----
+It is not a separate post-processing pass over exported code, and it is not a
+custom-op based system.
 
-## 1. Files Changed
+## 1. Main Files
 
-### New package: `torch/_inductor/weight_streaming/`
+### `torch/_inductor/weight_streaming/plan.py`
 
-This package contains the schedule loader, wrapper/codegen helpers, and the
-runtime singleton.
-
-#### `torch/_inductor/weight_streaming/plan.py`
-
-Defines the schedule dataclasses and the JSON loader:
+Defines the schedule dataclasses and loader:
 
 - `TensorEntry`
 - `PrefetchOp`
-- `EvictOp`
+- `H2DPrefetchOp`
+- `EvictVramOp`
+- `EvictDramOp`
 - `ColdStartOp`
 - `IOSchedule`
-- `load_io_schedule(path, nodes_csv="")`
+- `load_io_schedule(path, nodes_csv="", tensor_csv="")`
 
-#### `torch/_inductor/weight_streaming/codegen.py`
+### `torch/_inductor/weight_streaming/codegen.py`
 
-Defines the codegen-side adapter and line emitter:
+Defines the wrapper-side helpers:
 
 - `_is_gpu_node(node)`
 - `ScheduleAdapter`
+- `_op_to_call(op)`
 - `WeightStreamingLine`
 
-#### `torch/_inductor/weight_streaming/runtime.py`
+### `torch/_inductor/weight_streaming/runtime.py`
 
-Defines `WeightStreamRuntime`, a singleton that owns:
+Defines `WeightStreamRuntime`, the singleton used by generated wrapper code.
 
-- async SSD-read worker threads
-- pinned CPU buffers
-- a dedicated CUDA H2D stream
-- H2D completion events
-- loaded GPU tensors
-- per-tensor location tracking
+### `torch/_inductor/codegen/wrapper.py`
 
-#### `torch/_inductor/weight_streaming/__init__.py`
+Adds weight-streaming injection and code export:
 
-Exports:
+- `PythonWrapperCodegen._inject_weight_streaming_io()`
+- `PythonWrapperCodegen._export_weight_streaming_code(...)`
 
-- `IOSchedule`
-- `load_io_schedule`
-- `WeightStreamRuntime`
+### `torch/_inductor/config.py`
 
-### Modified existing Inductor files
+Adds the config knobs used by the compile path:
 
-#### `torch/_inductor/config.py`
+- `weight_streaming_plan`
+- `weight_streaming_nodes_csv`
+- `weight_streaming_tensor_csv`
+- `weight_streaming_output_code`
 
-Adds two config knobs:
+### `scripts/run_weight_streaming.py`
 
-- `weight_streaming_plan: str = ""`
-- `weight_streaming_nodes_csv: str = ""`
+Provides the end-to-end driver that:
 
-If `weight_streaming_plan` is set, wrapper codegen will inject weight
-streaming runtime calls.
+- resolves the schedule and CSV inputs
+- initializes `WeightStreamRuntime`
+- sets Inductor config knobs
+- loads the model
+- registers GPU weight tensors with the runtime
+- compiles `pipe.unet` with `torch.compile(..., backend="inductor")`
+- optionally exports the generated wrapper to `weight_streaming_generated.py`
 
-#### `torch/_inductor/codegen/wrapper.py`
+## 2. Schedule Format That Is Actually Loaded
 
-Adds `_inject_weight_streaming_io()` and calls it from
-`PythonWrapperCodegen._generate()` after wrapper IR passes have run and before
-the final wrapper body is emitted.
+`load_io_schedule(...)` consumes the scheduler-style JSON, not the older
+speculative `pre_ops` / `post_ops` shape.
 
-### New tests
+The keys it reads are:
 
-#### `test/inductor/test_weight_streaming.py`
+- `nodes`
+- `io_operations`
+- `spill_decisions`
+- `cold_start_prefetches`
+- `tensor_metadata` as JSON fallback when `tensor_csv` is not provided
 
-Adds tests for:
-
-- schedule JSON loading
-- optional CSV-based node enrichment
-- GPU/CPU node classification
-- trace-index to wrapper-kernel-index remapping
-- runtime lifecycle
-- runtime eviction behavior
-- runtime H2D behavior
-- a real SSD->DRAM->VRAM file-backed path
-
----
-
-## 2. The Schedule Format That Is Actually Consumed
-
-The current loader does not consume the earlier `pre_ops` / `post_ops` plan
-shape. It consumes a JSON object with these top-level keys:
+A representative shape is:
 
 ```json
 {
@@ -107,23 +91,34 @@ shape. It consumes a JSON object with these top-level keys:
     {"idx": 0, "name": "aten::empty", "resource_kind": "cpu_thread"},
     {"idx": 1, "name": "triton_fused_mm_0", "resource_kind": "gpu_stream"}
   ],
-  "prefetches": [
+  "io_operations": [
     {
+      "type": "prefetch",
       "tensor_name": "param_0_1",
       "before_node": 1,
       "after_node": -1,
-      "eager_start": false
+      "eager_start": true
+    },
+    {
+      "type": "vram_prefetch_h2d",
+      "tensor_name": "param_0_1",
+      "before_node": 1
+    },
+    {
+      "type": "vram_evict_d2h",
+      "tensor_name": "param_0_1",
+      "after_node": 1
     }
   ],
-  "evictions": [
+  "spill_decisions": [
     {
       "tensor_name": "param_0_1",
       "evict_after_node": 1
     }
   ],
-  "cold_starts": [
+  "cold_start_prefetches": [
     {
-      "tensor_name": "param_0_1",
+      "tensor_name": "param_cold",
       "attach_before_node": 0
     }
   ],
@@ -140,173 +135,194 @@ shape. It consumes a JSON object with these top-level keys:
 }
 ```
 
-### Meaning of each section
+### Parsed operation types
 
-#### `nodes`
+`io_operations` is split into:
 
-The full scheduler trace. The adapter uses this to decide which trace nodes
-map to wrapper kernel indices.
+- `type == "prefetch"` -> `PrefetchOp`
+- `type == "vram_prefetch_h2d"` -> `H2DPrefetchOp`
+- `type == "vram_evict_d2h"` -> `EvictVramOp`
 
-Each node is expected to have:
+`spill_decisions` becomes:
 
-- `idx`
-- `name`
-- optionally `resource_kind`
+- `EvictDramOp`
 
-#### `prefetches`
+`cold_start_prefetches` becomes:
 
-Each entry becomes a `PrefetchOp`:
-
-- `tensor_name`
-- `before_node`
-- optional `after_node`
-- optional `eager_start`
-
-Important: the current code only uses `tensor_name` and `before_node` for
-wrapper injection. `after_node` and `eager_start` are parsed and stored, but
-they are not used by the current adapter or wrapper codegen.
-
-#### `evictions`
-
-Each entry becomes an `EvictOp`:
-
-- `tensor_name`
-- `evict_after_node`
-
-#### `cold_starts`
-
-Each entry becomes a `ColdStartOp`:
-
-- `tensor_name`
-- `attach_before_node`
-
-Important: `attach_before_node` is parsed and stored, but the current wrapper
-injection does not use it to place the operation near a specific node. All cold
-start ops are emitted before the first kernel.
-
-#### `tensor_metadata`
-
-Each tensor becomes a `TensorEntry` with:
-
-- `name`
-- `kind`
-- `size_bytes`
-- `dtype`
-- `shape`
-- `file` from `safetensors_file`
-- `file_offset` from `safetensors_offset`
-
-Important: `size_bytes` is stored in the dataclass, but the runtime currently
-computes the number of bytes to map from `shape` and `dtype`. It does not use
-`size_bytes` during file reads.
+- `ColdStartOp`
 
 ### Optional CSV enrichment
 
-`load_io_schedule(path, nodes_csv=...)` can enrich `nodes[*]["resource_kind"]`
-from a `runtime_nodes.csv` file if the JSON nodes do not already carry
-`resource_kind`.
+If `nodes_csv` is provided and JSON nodes do not already carry
+`resource_kind`, `load_io_schedule(...)` enriches the nodes from
+`runtime_nodes.csv`.
 
-This is done by:
+If `tensor_csv` is provided, the loader uses `pytorch_runtime_tensors.csv` for
+tensor metadata and filters scheduled VRAM ops to `WEIGHT` tensors only.
 
-1. Reading `runtime_nodes.csv` with `csv.DictReader`.
-2. Building `{idx: resource_kind}`.
-3. Copying `resource_kind` onto matching JSON nodes.
+Important current behavior:
 
-This is the purpose of `config.weight_streaming_nodes_csv`.
+- `tensor_csv` replaces the JSON tensor metadata instead of merging with it
+- `_load_tensors_csv(...)` does not populate `file` or `file_offset`
+- therefore, string-name SSD reads depend on JSON-backed tensor metadata or on
+  tensors already registered in DRAM
 
----
+### Fields parsed but not used for wrapper placement
 
-## 3. How Inductor Uses the Schedule
+These fields are loaded and preserved, but current wrapper placement does not
+use them directly:
 
-The integration point is wrapper codegen, not graph rewriting.
+- `PrefetchOp.after_node`
+- `PrefetchOp.eager_start`
+- `ColdStartOp.attach_before_node`
 
-### Config gating
+## 3. How `run_weight_streaming.py` Drives The Flow
 
-`torch._inductor.config.weight_streaming_plan` is the top-level switch.
+The current compile path is anchored in
+[`scripts/run_weight_streaming.py`](/data/pytorch-source/scripts/run_weight_streaming.py).
 
-If it is a non-empty string, `PythonWrapperCodegen._generate()` calls
-`self._inject_weight_streaming_io()`.
+The script:
 
-### When injection happens
+1. resolves `jit_sim_prune_schedule.json`, optional `runtime_nodes.csv`, and
+   optional `pytorch_runtime_tensors.csv`
+2. loads the schedule with `load_io_schedule(...)`
+3. initializes `WeightStreamRuntime.initialize(schedule, device)`
+4. sets:
+   - `inductor_config.weight_streaming_plan`
+   - `inductor_config.weight_streaming_nodes_csv`
+   - `inductor_config.weight_streaming_tensor_csv`
+   - `inductor_config.weight_streaming_output_code`
+5. loads the model
+6. registers model weights with `register_model_weights(...)`
+7. compiles `pipe.unet` with `torch.compile(..., backend="inductor")`
 
-Injection happens after `self.run_wrapper_ir_passes(is_inference)` has already
-built the wrapper line list and before the final wrapper body is emitted.
+Two details matter:
 
-That matters because the implementation works by rewriting `self.lines`, not by
-rewriting the FX graph or scheduler IR.
+- the generated wrapper expects the runtime singleton to already exist
+- GPU weights are registered up front so the wrapper can later call
+  `_ws_rt.h2d_prefetch(tensor)` and `_ws_rt.evict_vram(tensor)` on actual
+  tensor objects
 
-### `_inject_weight_streaming_io()`
+## 4. Where Inductor Injects Weight-Streaming Calls
 
-The wrapper injection flow is:
+Weight streaming is injected from
+[`torch/_inductor/codegen/wrapper.py`](/data/pytorch-source/torch/_inductor/codegen/wrapper.py).
 
-1. Load the schedule with `load_io_schedule(...)`.
-2. Build a `ScheduleAdapter(schedule)`.
-3. Emit two header lines:
-   - `from torch._inductor.weight_streaming.runtime import WeightStreamRuntime`
-   - `_ws_rt = WeightStreamRuntime.instance()`
-4. Walk `self.lines`.
-5. Count only `KernelCallLine` instances as kernel indices.
-6. Insert `WeightStreamingLine` objects before or after those kernel lines.
-7. Replace `self.lines` with the augmented list.
+`PythonWrapperCodegen._generate()` does this in order:
 
-### What code is emitted
+1. build the normal wrapper lines
+2. run wrapper IR passes
+3. if `config.weight_streaming_plan` is set, call
+   `_inject_weight_streaming_io()`
+4. emit the final wrapper body
+5. if `config.weight_streaming_output_code` is set, write the final generated
+   Python wrapper to `weight_streaming_generated.py`
 
-Cold-start ops become:
+This means the exported file is:
+
+- real generated Inductor wrapper code
+- after normal wrapper passes
+- after weight-streaming injection
+- without any later readability-only editing pass
+
+## 5. What `_inject_weight_streaming_io()` Emits Today
+
+The wrapper injector first loads the schedule and constructs a
+`ScheduleAdapter`.
+
+It then emits these header lines:
+
+```python
+from torch._inductor.weight_streaming.runtime import WeightStreamRuntime
+_ws_rt = WeightStreamRuntime.instance()
+```
+
+### Compute lines used by the injector
+
+The injector scans two kinds of wrapper lines as compute:
+
+- `KernelCallLine`
+- `ExternKernelOutLine`
+
+This is important because VRAM restore/evict placement is computed across all
+compute lines, not just Triton kernel lines.
+
+### Schedule-driven SSD and DRAM calls
+
+For schedule-driven insertion around rescaled kernel indices, the wrapper uses
+only `KernelCallLine` instances.
+
+The currently emitted schedule-driven calls are:
+
+- before kernels:
+  - `_ws_rt.ssd_prefetch("tensor_name")` from `PrefetchOp`
+- after kernels:
+  - `_ws_rt.evict_dram("tensor_name")` from `EvictDramOp`
+
+### Cold-start calls
+
+All `ColdStartOp`s are emitted before any compute line as:
 
 ```python
 _ws_rt.cold_start_prefetch("tensor_name")
 ```
 
-Prefetches become:
+`attach_before_node` is currently ignored for placement. All cold starts are
+attached at wrapper startup.
+
+### Graph-input-based VRAM restore and eviction
+
+Separately from the schedule adapter, the wrapper computes first-use and
+last-use of graph inputs across all compute lines.
+
+For each graph input:
+
+- before first use, it emits:
 
 ```python
-_ws_rt.ssd_prefetch("tensor_name")
+_ws_rt.h2d_prefetch(graph_input_tensor)
 ```
 
-Evictions become:
+- after last use, it emits:
 
 ```python
-_ws_rt.evict("tensor_name")
+_ws_rt.evict_vram(graph_input_tensor)
 ```
 
-Important: the wrapper does not currently emit:
+These calls use the actual graph-input tensor object, not a tensor-name string.
 
-- `_ws_rt.h2d_prefetch(...)`
-- `_ws_rt.wait_h2d(...)`
-- `_ws_rt.evict_vram(...)`
-- `_ws_rt.evict_dram(...)`
+Important current behavior:
 
-So the wrapper currently supports:
+- this path is driven by graph-input first-use / last-use analysis
+- it is not driven directly by `H2DPrefetchOp` or `EvictVramOp` from the
+  schedule
+- the runtime no-ops for tensors that were not registered as weights
 
-- cold-start population into DRAM
-- background SSD->DRAM prefetch
-- post-kernel eviction from both DRAM and VRAM
+### What the wrapper does not emit
 
-It does not yet swap actual kernel operands from normal model weights to
-runtime-fetched GPU tensors.
+The wrapper does not currently emit:
 
-### `WeightStreamingLine`
+- `wait_h2d(...)`
+- schedule-driven `H2DPrefetchOp` calls from `adapter.before_kernel`
+- schedule-driven `EvictVramOp` calls from `adapter.after_kernel`
+- runtime initialization
 
-This is a very small wrapper IR helper. It subclasses `WrapperLine` and simply
-emits literal Python call strings into the generated wrapper body.
+The lack of `wait_h2d(...)` is intentional for the tensor-object path used by
+the current wrapper: `_h2d_prefetch_tensor(...)` records an event on the H2D
+stream and immediately makes the current stream wait on that event.
 
-There is no custom operator registration and no special lowering path here.
+## 6. How `ScheduleAdapter` Maps Trace Indices To Wrapper Indices
 
----
+`ScheduleAdapter` exists because the scheduler trace and the generated wrapper
+do not share the same indexing scheme.
 
-## 4. Trace-to-Wrapper Mapping
+The scheduler trace can contain interleaved CPU and GPU nodes. The wrapper only
+has a limited number of compute insertion points, and kernel fusion means that
+the wrapper often has fewer kernel calls than the original GPU trace did.
 
-The scheduler trace and the wrapper body do not have the same indexing scheme.
+### GPU classification
 
-- The scheduler trace contains CPU and GPU nodes.
-- The generated Inductor wrapper only has explicit insertion points around GPU
-  kernel dispatches.
-
-`ScheduleAdapter` exists to bridge that mismatch.
-
-### GPU/CPU classification
-
-The adapter treats a node as GPU if either:
+A node is treated as GPU if either:
 
 - `resource_kind` is `gpu_stream` or `gpu`
 - or, if `resource_kind` is missing, `name` starts with one of:
@@ -320,379 +336,260 @@ The adapter treats a node as GPU if either:
   - `cudnn`
   - `cutlass`
 
-Every GPU trace node gets assigned a wrapper kernel index:
+### Initial trace-level attachment
 
-- first GPU node -> wrapper kernel `0`
-- second GPU node -> wrapper kernel `1`
-- etc.
+The adapter builds:
 
-### Prefetch remapping
+- `_before_kernel` from:
+  - `PrefetchOp`
+  - `H2DPrefetchOp`
+- `_after_kernel` from:
+  - `EvictVramOp`
+  - `EvictDramOp`
 
-For each `PrefetchOp`, the adapter uses `before_node` and maps it with
-`_snap_to_gpu_next(trace_idx)`.
+### CPU-node snapping behavior
 
-Behavior:
+If an op targets a CPU trace node:
 
-- if `before_node` is already a GPU trace node, use that exact wrapper kernel
-  index
-- if `before_node` is a CPU trace node, snap forward to the next GPU trace node
-- if there is no later GPU node, drop the prefetch
+- prefetch-like ops snap forward to the next GPU node
+- eviction-like ops snap backward to the previous GPU node
 
-The result is stored in `before_kernel`, a mapping of:
+Out-of-range ops are dropped.
 
-```python
-wrapper_kernel_idx -> list[PrefetchOp]
-```
+### Fusion-aware rescaling
 
-### Eviction remapping
-
-For each `EvictOp`, the adapter uses `evict_after_node` and maps it with
-`_snap_to_gpu_prev(trace_idx)`.
-
-Behavior:
-
-- if `evict_after_node` is already a GPU trace node, use that exact wrapper
-  kernel index
-- if `evict_after_node` is a CPU trace node, snap backward to the previous GPU
-  trace node
-- if there is no earlier GPU node, drop the eviction
-
-The result is stored in `after_kernel`, a mapping of:
+After trace-level mapping, the adapter rescales to the actual wrapper kernel
+count using linear interpolation:
 
 ```python
-wrapper_kernel_idx -> list[EvictOp]
+wrapper_idx = min(gpu_idx * n_wrapper_kernels // n_gpu, n_wrapper_kernels - 1)
 ```
 
-### Cold starts
+This is the mechanism that adapts a dense scheduler trace to a smaller fused
+Inductor wrapper.
 
-`cold_starts` are not remapped by node index in the current code. The adapter
-simply preserves the list as `startup_ops`, and wrapper codegen emits every
-startup op before any kernel dispatch.
+Important current behavior:
 
----
+- the adapter can map `H2DPrefetchOp` and `EvictVramOp`
+- current wrapper injection only consumes the rescaled `PrefetchOp` and
+  `EvictDramOp` results
 
-## 5. Runtime Implementation Details
+## 7. What `WeightStreamRuntime` Actually Tracks
 
-`WeightStreamRuntime` is a singleton. Generated wrapper code assumes it has
-already been initialized and accesses it with:
-
-```python
-_ws_rt = WeightStreamRuntime.instance()
-```
-
-### Important current behavior
-
-The wrapper code does not initialize the runtime. That means some external
-driver still has to do something equivalent to:
-
-```python
-from torch._inductor.weight_streaming.plan import load_io_schedule
-from torch._inductor.weight_streaming.runtime import WeightStreamRuntime
-
-schedule = load_io_schedule(plan_path, nodes_csv=nodes_csv_path)
-WeightStreamRuntime.initialize(schedule, torch.device("cuda"))
-```
-
-If that has not happened, the generated wrapper will assert when it calls
-`WeightStreamRuntime.instance()`.
-
-### Internal state
-
-The runtime owns:
+`WeightStreamRuntime` is a singleton with these main pieces of state:
 
 - `_schedule`
 - `_device`
 - `_ssd_pool = ThreadPoolExecutor(max_workers=4)`
-- `_inflight_reads: dict[str, Future]`
-- `_dram_buffers: dict[str, torch.Tensor]`
-- `_h2d_stream = torch.cuda.Stream(device=device)`
-- `_h2d_events: dict[str, torch.cuda.Event]`
-- `_vram_tensors: dict[str, torch.Tensor]`
-- `_location: dict[str, str]`
+- `_inflight_reads`
+- `_dram_buffers`
+- `_h2d_stream`
+- `_h2d_events`
+- `_vram_tensors`
+- `_location`
+- `_weight_backups`
+- `_weight_storage_nbytes`
 
-Each tensor named in `schedule.tensors` starts in location `"ssd"`.
+For every tensor in `schedule.tensors`, the initial tracked location is `"ssd"`.
 
-### `register_dram_tensor`
+### `register_dram_tensor(...)`
 
-`register_dram_tensor(tensor_name, tensor)` is a manual escape hatch for the
-case where the caller already has the tensor in CPU memory. It stores the
-tensor in `_dram_buffers` and marks the location as `"dram"`.
+Manual hook for preloaded CPU tensors. Stores the tensor in `_dram_buffers` and
+marks it as `"dram"`.
 
-This is not automatically called by Inductor codegen today.
+### `register_weight(...)`
 
-### `ssd_prefetch`
+Used by the current driver path for real model weights.
 
-`ssd_prefetch(tensor_name)` does the following:
+It:
 
-1. Return immediately if the tensor is not currently tracked as `"ssd"`.
-2. Return immediately if the tensor already has an inflight read.
-3. Look up tensor metadata in `self._schedule.tensors`.
-4. Return immediately if there is no metadata or no file path.
-5. Submit `_read_from_file(entry)` to the SSD thread pool.
-6. Record the returned `Future` in `_inflight_reads[tensor_name]`.
+- takes a GPU tensor
+- creates a pinned CPU backup with `gpu_tensor.data.cpu().pin_memory()`
+- remembers the original GPU storage size
 
-This gives actual asynchronous host-side prefetch behavior, but it is not
-implemented with explicit `pread`. The current implementation uses a background
-thread plus `torch.UntypedStorage.from_file(...)`.
+This enables the tensor-object VRAM restore/evict path used by the generated
+wrapper.
 
-### `cold_start_prefetch`
+## 8. Runtime Methods Used By The Current Wrapper
 
-`cold_start_prefetch(tensor_name)` is a wrapper-visible helper for startup
-loads.
+### `ssd_prefetch(tensor_name)`
 
-Behavior:
+If the tensor is still tracked as `"ssd"` and file metadata is available, it
+submits `_read_from_file(entry)` to the thread pool and stores the `Future` in
+`_inflight_reads`.
 
-1. If the tensor is already in `"dram"` or `"vram"`, do nothing.
-2. Otherwise call `ssd_prefetch(tensor_name)`.
-3. If that created an inflight read, wait for it immediately with
-   `.result()`.
-4. Store the resulting pinned tensor in `_dram_buffers`.
-5. Mark the tensor location as `"dram"`.
+This is the current SSD -> DRAM async path.
 
-So cold-start prefetch is synchronous from the perspective of wrapper
-execution: it ensures the tensor is in DRAM before the first kernel runs.
+### `cold_start_prefetch(tensor_name)`
 
-### `h2d_prefetch`
+If the tensor is not already in DRAM or VRAM, it:
 
-`h2d_prefetch(tensor_name)` exists in the runtime even though wrapper code does
-not currently emit it.
+1. calls `ssd_prefetch(...)`
+2. waits for the result immediately
+3. stores the pinned CPU tensor in `_dram_buffers`
+4. marks the tensor as `"dram"`
 
-Behavior:
+So cold-start prefetch is synchronous from the wrapper's perspective.
 
-1. If there is an inflight SSD read, wait for it and move the result into
-   `_dram_buffers`.
-2. Else, if the tensor is still marked `"ssd"` and has a file entry, call
-   `_read_from_file(entry)` synchronously.
-3. Read the CPU tensor from `_dram_buffers`.
-4. Launch `cpu_tensor.to(self._device, non_blocking=True)` on the dedicated
-   `_h2d_stream`.
-5. Create a `torch.cuda.Event()`.
-6. Record the event on `_h2d_stream`.
-7. Save the event in `_h2d_events[tensor_name]`.
-8. Save the GPU tensor in `_vram_tensors[tensor_name]`.
-9. Mark the location as `"vram"`.
-10. Return the GPU tensor.
+### `h2d_prefetch(tensor_or_name)`
 
-This is the runtime primitive intended for DRAM->VRAM overlap.
+This has two paths.
 
-### `wait_h2d`
+#### Tensor-object path
 
-`wait_h2d(tensor_name)` also exists but is not wired into wrapper codegen.
+This is the path used by the current wrapper for graph inputs.
 
-Behavior:
+If the tensor was registered with `register_weight(...)` and its storage has
+been evicted, the runtime:
 
-1. Look up `_h2d_events[tensor_name]`.
-2. If present, call `torch.cuda.current_stream(self._device).wait_event(event)`.
-3. Delete the event entry.
-4. Return `_vram_tensors[tensor_name]`.
+1. resizes the GPU storage back to its original size
+2. launches `gpu_tensor.copy_(backup, non_blocking=True)` on `_h2d_stream`
+3. records a CUDA event on `_h2d_stream`
+4. makes the current stream wait on that event immediately
 
-This is the synchronization point that would make H2D prefetch safe for
-consumers on the main compute stream.
+This path restores the weight in VRAM without needing a separate emitted
+`wait_h2d(...)` call.
 
-### `evict_vram`
+#### String-name path
 
-`evict_vram(tensor_name)`:
+This is the legacy path.
 
-1. Pop the tensor from `_vram_tensors`.
-2. If present, call `gpu_tensor.untyped_storage().resize_(0)`.
-3. If the location was `"vram"`, change it to `"dram"`.
+It:
 
-The `resize_(0)` detail matters. It is explicitly trying to release the
-underlying CUDA allocation even if some Python reference still exists in the
-compiled wrapper.
+1. completes any pending SSD read
+2. or does a blocking `_read_from_file(...)` if the tensor is still on `"ssd"`
+3. launches `cpu_tensor.to(device, non_blocking=True)` on `_h2d_stream`
+4. records a CUDA event
+5. stores the event and the GPU tensor for later `wait_h2d(...)`
 
-### `evict_dram`
+### `evict_vram(tensor_or_name)`
 
-`evict_dram(tensor_name)`:
+Also has two paths.
 
-1. Remove the CPU tensor from `_dram_buffers`.
-2. If the location was `"dram"` or `"vram"`, change it to `"ssd"`.
+#### Tensor-object path
 
-### `evict`
+If the tensor was registered with `register_weight(...)`, it frees GPU memory
+by calling:
 
-`evict(tensor_name)` is the method that wrapper codegen currently emits.
+```python
+gpu_tensor.untyped_storage().resize_(0)
+```
 
-It simply calls:
+#### String-name path
+
+Pops the tensor from `_vram_tensors`, resizes its storage to `0`, and updates
+location bookkeeping from `"vram"` to `"dram"`.
+
+### `evict_dram(tensor_name)`
+
+Drops the pinned CPU buffer from `_dram_buffers` and updates bookkeeping back
+to `"ssd"`.
+
+### `evict(tensor_name)`
+
+Still exists as a convenience helper:
 
 1. `evict_vram(tensor_name)`
 2. `evict_dram(tensor_name)`
 
-That means every scheduled eviction currently drops both copies. The schedule
-does not currently distinguish:
+The current wrapper does not emit this combined helper anymore. It emits
+`evict_vram(...)` and `evict_dram(...)` separately.
 
-- evict only from VRAM
-- evict only from DRAM
+## 9. File-Backed Read Path
 
-even though the runtime has separate methods for those operations.
+`_read_from_file(entry)` does not use explicit `pread`.
 
-### `_read_from_file`
+It currently:
 
-The file-read path is:
+1. maps the dtype string through `_DTYPE_MAP`
+2. derives `nbytes` from `shape` and `dtype`
+3. creates file-backed storage with `torch.UntypedStorage.from_file(...)`
+4. slices to the recorded byte range
+5. wraps it as a typed tensor
+6. reshapes it
+7. calls `.pin_memory()`
+8. returns the pinned CPU tensor
 
-1. Map the schedule dtype string through `_DTYPE_MAP`.
-2. Compute `numel` from the recorded `shape`.
-3. Compute `nbytes = numel * element_size(dtype)`.
-4. Create a file-backed `torch.UntypedStorage` with:
-   `torch.UntypedStorage.from_file(entry.file, False, entry.file_offset + nbytes)`.
-5. Slice that storage to `[entry.file_offset : entry.file_offset + nbytes]`.
-6. Wrap the sliced storage in a `torch.TypedStorage`.
-7. Create a tensor with `.set_(...)`.
-8. Reshape to the recorded shape.
-9. Call `.pin_memory()` and return the pinned CPU tensor.
+Important current behavior:
 
-Two important implications:
+- `size_bytes` is loaded, but the runtime computes the read size from
+  `shape * dtype`
+- file-backed SSD reads depend on `entry.file` and `entry.file_offset`
 
-- The current implementation relies on file-backed storage plus a pinned-memory
-  copy, not an explicit async `pread`.
-- The runtime derives `nbytes` from `dtype` and `shape`, not from
-  `TensorEntry.size_bytes`.
+## 10. What `weight_streaming_generated.py` Is
 
----
+When `config.weight_streaming_output_code` is set, wrapper codegen writes:
 
-## 6. What Prefetch/Eviction Behavior Exists Today
+- `<output_dir>/weight_streaming_generated.py`
 
-The currently implemented end-to-end behavior is:
+This file is produced by writing `result.getvalue()` from the final generated
+wrapper buffer.
 
-1. Parse a scheduler-generated JSON schedule.
-2. Optionally enrich node `resource_kind` from `runtime_nodes.csv`.
-3. Convert trace-node indices into wrapper kernel indices.
-4. Inject Python runtime calls around generated GPU kernel dispatches.
-5. Use a background thread pool to prefetch tensors from file into pinned DRAM.
-6. Use runtime eviction methods to free tracked GPU/CPU copies later.
+That means it is:
 
-Concretely, the wrapper can now do this kind of thing:
+- the actual Inductor-generated Python wrapper
+- after weight-streaming injection
+- not a hand-edited export
+- not a prettified or reduced representation
 
-```python
-_ws_rt.cold_start_prefetch("tok_embeddings.weight")
-_ws_rt.ssd_prefetch("layers.0.attn.q_proj.weight")
-call_kernel_0(...)
-call_kernel_1(...)
-_ws_rt.evict("layers.0.attn.q_proj.weight")
-```
+The visible `_ws_rt.*` calls in that file are the ones the wrapper genuinely
+compiled with.
 
-That is the real support that has landed for prefetch/eviction.
+## 11. What The Current End-To-End System Supports
 
----
+Today, the codebase supports this overall flow:
 
-## 7. What Has Not Been Wired Up Yet
+1. load a scheduler-produced plan
+2. optionally enrich node kinds from `runtime_nodes.csv`
+3. optionally load tensor metadata from `pytorch_runtime_tensors.csv`
+4. initialize the runtime
+5. register model weights
+6. compile the model with Inductor
+7. generate wrapper code that can:
+   - synchronously cold-start weights into DRAM
+   - schedule SSD -> DRAM prefetches
+   - restore registered weights from DRAM -> VRAM before first use
+   - evict registered weights from VRAM after last use
+   - evict named tensors from DRAM after scheduled use
 
-This section is important because the previous version of this document
-overstated what existed.
+This is real generated-code behavior, not just a dry-run adapter.
 
-### Not implemented in the compile path
+## 12. Important Current Limitations
 
-- No FX pass rewrites weight uses.
-- No `torch.library` custom ops were added.
-- No graph-level replacement of `get_attr` or placeholder weights exists.
-- No emitted `_ws_rt.h2d_prefetch(...)` calls exist.
-- No emitted `_ws_rt.wait_h2d(...)` calls exist.
-- No emitted `evict_vram` or `evict_dram` calls exist; wrapper emits only
-  `evict`.
-- No wrapper-side runtime initialization exists.
+The current implementation still has important constraints:
 
-### Parsed but not used for scheduling decisions
+- there is no FX-level weight replacement pass
+- there are no `torch.library` custom ops
+- wrapper-side runtime initialization is external to generated code
+- `H2DPrefetchOp` and `EvictVramOp` are parsed and adapter-mapped, but the
+  wrapper currently uses graph-input first-use / last-use analysis instead of
+  directly emitting those scheduled VRAM ops
+- `PrefetchOp.after_node`, `PrefetchOp.eager_start`, and
+  `ColdStartOp.attach_before_node` are parsed but do not currently affect
+  placement
+- CPU trace nodes are not first-class insertion points; they are snapped to
+  neighboring GPU nodes
+- the SSD read path depends on tensor metadata carrying file information
+- there is no pinned-buffer reuse policy or explicit global pinned-memory cap
+- there is no compile-time/runtime compatibility validation beyond using the
+  same schedule inputs in the driver
 
-- `PrefetchOp.after_node`
-- `PrefetchOp.eager_start`
-- `ColdStartOp.attach_before_node`
+## 13. Tests In Tree
 
-These fields survive parsing, but they do not currently influence wrapper
-placement.
+[`test/inductor/test_weight_streaming.py`](/data/pytorch-source/test/inductor/test_weight_streaming.py)
+currently covers:
 
-### Limitations of the current schedule mapping
+- scheduler-format schedule loading
+- CSV node enrichment
+- schedule dataclasses
+- GPU/CPU classification
+- trace-index snapping
+- H2D and VRAM op adapter mapping
+- runtime singleton behavior
+- VRAM eviction behavior
+- H2D behavior
+- manual DRAM registration
+- file-backed SSD -> DRAM -> VRAM flow
 
-- CPU trace nodes are not first-class insertion points in the wrapper.
-- Prefetches targeted at CPU nodes are snapped forward to the next GPU kernel.
-- Evictions targeted at CPU nodes are snapped backward to the previous GPU
-  kernel.
-- Prefetches beyond the last GPU node are dropped.
-- Evictions before the first GPU node are dropped.
-
-### Limitations of the current runtime
-
-- No pinned-buffer reuse or pool management.
-- No cap on aggregate pinned memory.
-- No rate limiting for inflight SSD reads or H2D copies beyond the fixed thread
-  pool width.
-- No explicit check that `size_bytes` matches `shape * dtype`.
-- No schedule compatibility validation between compile time and runtime
-  initialization.
-
-### Most important functional gap
-
-The runtime already knows how to do:
-
-- SSD->DRAM prefetch
-- DRAM->VRAM prefetch
-- wait-on-H2D
-- VRAM-only eviction
-- DRAM-only eviction
-
-But the generated Inductor wrapper currently uses only:
-
-- `cold_start_prefetch`
-- `ssd_prefetch`
-- `evict`
-
-So the codebase has real schedule-driven prefetch/eviction support, but it is
-currently wrapper-level host-side scheduling support, not a complete
-weight-substitution path for compiled kernels.
-
----
-
-## 8. Tests Added
-
-`test/inductor/test_weight_streaming.py` covers the following:
-
-- `TestIOSchedule`
-  - schedule JSON loading
-  - CSV enrichment of `resource_kind`
-  - basic dataclass construction
-
-- `TestScheduleAdapter`
-  - GPU/CPU classification using `resource_kind`
-  - fallback GPU classification using name prefixes
-  - exact mapping for GPU-targeted prefetches/evictions
-  - snapping behavior for CPU-targeted prefetches/evictions
-  - multiple ops attached to the same wrapper kernel
-  - dropping out-of-range prefetches/evictions
-  - cold-start preservation
-
-- `TestWeightStreamRuntime` (CUDA-only)
-  - singleton initialize/reset behavior
-  - VRAM eviction releasing underlying storage
-  - DRAM eviction behavior
-  - combined eviction behavior
-  - H2D prefetch and wait behavior
-  - separate H2D stream creation
-  - manual DRAM registration
-  - cold-start no-op when already in DRAM
-  - end-to-end file-backed SSD->DRAM->VRAM flow
-
-There is not currently an end-to-end test that compiles a model, initializes
-the runtime, and asserts that the generated wrapper emits the expected injected
-weight-streaming calls.
-
----
-
-## 9. Short Summary
-
-What has actually changed for prefetch/eviction is:
-
-- a new `torch._inductor.weight_streaming` package
-- a real JSON schedule loader
-- optional node classification enrichment from `runtime_nodes.csv`
-- a trace-to-wrapper adapter that maps scheduler nodes to kernel indices
-- wrapper codegen that injects weight streaming runtime calls
-- a runtime singleton that can asynchronously prefetch from file into pinned
-  DRAM, asynchronously copy to VRAM on a dedicated CUDA stream, and evict DRAM
-  and/or VRAM state
-- tests for the loader, adapter, and runtime
-
-What has not changed yet is equally important:
-
-- there is no FX-level weight replacement
-- the wrapper does not emit H2D/wait calls
-- the wrapper does not initialize the runtime
-- scheduled evictions currently drop both DRAM and VRAM copies, not one level at
-  a time
+It does not yet provide a full end-to-end assertion over a compiled exported
+wrapper file.
