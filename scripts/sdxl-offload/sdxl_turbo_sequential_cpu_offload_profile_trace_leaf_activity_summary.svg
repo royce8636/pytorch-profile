@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="830" viewBox="0 0 1600 830">
+<rect width="100%" height="100%" fill="#f6f8fa" />
+<text x="30" y="24" font-size="20" font-family="monospace" font-weight="bold" fill="#1f2328">Leaf Event Activity Summary (top 10)</text>
+<g transform="translate(30,50)">
+<rect x="0" y="0" width="760" height="360" rx="10" fill="#ffffff" stroke="#d0d7de" />
+<text x="20" y="28" font-size="18" font-family="monospace" font-weight="bold" fill="#1f2328">Leaf CPU Top 10 by Count</text>
+<text x="20" y="72" font-size="12" font-family="monospace" fill="#24292f">aten::to</text>
+<rect x="300" y="60" width="430" height="16" fill="#0969da" rx="4" />
+<text x="740" y="72" font-size="11" font-family="monospace" fill="#57606a">count=27542 total_us=223282.7 avg_us=8.1</text>
+<text x="20" y="100" font-size="12" font-family="monospace" fill="#24292f">aten::empty_strided</text>
+<rect x="300" y="88" width="233" height="16" fill="#0969da" rx="4" />
+<text x="740" y="100" font-size="11" font-family="monospace" fill="#57606a">count=14968 total_us=193482.0 avg_us=12.9</text>
+<text x="20" y="128" font-size="12" font-family="monospace" fill="#24292f">detach</text>
+<rect x="300" y="116" width="232" height="16" fill="#0969da" rx="4" />
+<text x="740" y="128" font-size="11" font-family="monospace" fill="#57606a">count=14867 total_us=58303.4 avg_us=3.9</text>
+<text x="20" y="156" font-size="12" font-family="monospace" fill="#24292f">aten::view</text>
+<rect x="300" y="144" width="156" height="16" fill="#0969da" rx="4" />
+<text x="740" y="156" font-size="11" font-family="monospace" fill="#57606a">count=10036 total_us=80432.5 avg_us=8.0</text>
+<text x="20" y="184" font-size="12" font-family="monospace" fill="#24292f">aten::as_strided</text>
+<rect x="300" y="172" width="148" height="16" fill="#0969da" rx="4" />
+<text x="740" y="184" font-size="11" font-family="monospace" fill="#57606a">count=9510 total_us=78737.1 avg_us=8.3</text>
+<text x="20" y="212" font-size="12" font-family="monospace" fill="#24292f">cudaStreamSynchronize</text>
+<rect x="300" y="200" width="128" height="16" fill="#0969da" rx="4" />
+<text x="740" y="212" font-size="11" font-family="monospace" fill="#57606a">count=8207 total_us=200380.0 avg_us=24.4</text>
+<text x="20" y="240" font-size="12" font-family="monospace" fill="#24292f">cudaStreamIsCapturing</text>
+<rect x="300" y="228" width="116" height="16" fill="#0969da" rx="4" />
+<text x="740" y="240" font-size="11" font-family="monospace" fill="#57606a">count=7493 total_us=6938.3 avg_us=0.9</text>
+<text x="20" y="268" font-size="12" font-family="monospace" fill="#24292f">cudaMemcpyAsync</text>
+<rect x="300" y="256" width="116" height="16" fill="#0969da" rx="4" />
+<text x="740" y="268" font-size="11" font-family="monospace" fill="#57606a">count=7448 total_us=1465002.8 avg_us=196.7</text>
+<text x="20" y="296" font-size="12" font-family="monospace" fill="#24292f">aten::copy_</text>
+<rect x="300" y="284" width="116" height="16" fill="#0969da" rx="4" />
+<text x="740" y="296" font-size="11" font-family="monospace" fill="#57606a">count=7438 total_us=51996.9 avg_us=7.0</text>
+<text x="20" y="324" font-size="12" font-family="monospace" fill="#24292f">cudaLaunchKernel</text>
+<rect x="300" y="312" width="104" height="16" fill="#0969da" rx="4" />
+<text x="740" y="324" font-size="11" font-family="monospace" fill="#57606a">count=6668 total_us=43506.6 avg_us=6.5</text>
+</g>
+<g transform="translate(810,50)">
+<rect x="0" y="0" width="760" height="360" rx="10" fill="#ffffff" stroke="#d0d7de" />
+<text x="20" y="28" font-size="18" font-family="monospace" font-weight="bold" fill="#1f2328">Leaf CPU Top 10 by Total Time (us)</text>
+<text x="20" y="72" font-size="12" font-family="monospace" fill="#24292f">cudaMemcpyAsync</text>
+<rect x="300" y="60" width="430" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="72" font-size="11" font-family="monospace" fill="#57606a">total_us=1465002.8 count=7448 avg_us=196.7</text>
+<text x="20" y="100" font-size="12" font-family="monospace" fill="#24292f">aten::to</text>
+<rect x="300" y="88" width="65" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="100" font-size="11" font-family="monospace" fill="#57606a">total_us=223282.7 count=27542 avg_us=8.1</text>
+<text x="20" y="128" font-size="12" font-family="monospace" fill="#24292f">cudaStreamSynchronize</text>
+<rect x="300" y="116" width="58" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="128" font-size="11" font-family="monospace" fill="#57606a">total_us=200380.0 count=8207 avg_us=24.4</text>
+<text x="20" y="156" font-size="12" font-family="monospace" fill="#24292f">aten::empty_strided</text>
+<rect x="300" y="144" width="56" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="156" font-size="11" font-family="monospace" fill="#57606a">total_us=193482.0 count=14968 avg_us=12.9</text>
+<text x="20" y="184" font-size="12" font-family="monospace" fill="#24292f">cuMemUnmap</text>
+<rect x="300" y="172" width="28" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="184" font-size="11" font-family="monospace" fill="#57606a">total_us=96210.5 count=795 avg_us=121.0</text>
+<text x="20" y="212" font-size="12" font-family="monospace" fill="#24292f">aten::view</text>
+<rect x="300" y="200" width="23" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="212" font-size="11" font-family="monospace" fill="#57606a">total_us=80432.5 count=10036 avg_us=8.0</text>
+<text x="20" y="240" font-size="12" font-family="monospace" fill="#24292f">aten::as_strided</text>
+<rect x="300" y="228" width="23" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="240" font-size="11" font-family="monospace" fill="#57606a">total_us=78737.1 count=9510 avg_us=8.3</text>
+<text x="20" y="268" font-size="12" font-family="monospace" fill="#24292f">aten::empty</text>
+<rect x="300" y="256" width="20" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="268" font-size="11" font-family="monospace" fill="#57606a">total_us=70202.4 count=6574 avg_us=10.7</text>
+<text x="20" y="296" font-size="12" font-family="monospace" fill="#24292f">detach</text>
+<rect x="300" y="284" width="17" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="296" font-size="11" font-family="monospace" fill="#57606a">total_us=58303.4 count=14867 avg_us=3.9</text>
+<text x="20" y="324" font-size="12" font-family="monospace" fill="#24292f">aten::copy_</text>
+<rect x="300" y="312" width="15" height="16" fill="#1a7f37" rx="4" />
+<text x="740" y="324" font-size="11" font-family="monospace" fill="#57606a">total_us=51996.9 count=7438 avg_us=7.0</text>
+</g>
+<g transform="translate(30,430)">
+<rect x="0" y="0" width="760" height="360" rx="10" fill="#ffffff" stroke="#d0d7de" />
+<text x="20" y="28" font-size="18" font-family="monospace" font-weight="bold" fill="#1f2328">True GPU Top 10 by Count</text>
+<text x="20" y="72" font-size="12" font-family="monospace" fill="#24292f">void cutlass::Kernel2&lt;cutlass_80_wmma_ten...</text>
+<rect x="300" y="60" width="430" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="72" font-size="11" font-family="monospace" fill="#57606a">count=2204 total_us=17600.5 avg_us=8.0</text>
+<text x="20" y="100" font-size="12" font-family="monospace" fill="#24292f">void at::native::vectorized_elementwise_k...</text>
+<rect x="300" y="88" width="204" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="100" font-size="11" font-family="monospace" fill="#57606a">count=1046 total_us=1136.0 avg_us=1.1</text>
+<text x="20" y="128" font-size="12" font-family="monospace" fill="#24292f">void at::native::(anonymous namespace)::v...</text>
+<rect x="300" y="116" width="181" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="128" font-size="11" font-family="monospace" fill="#57606a">count=930 total_us=2550.8 avg_us=2.7</text>
+<text x="20" y="156" font-size="12" font-family="monospace" fill="#24292f">void cutlass::Kernel2&lt;cutlass_80_wmma_ten...</text>
+<rect x="300" y="144" width="151" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="156" font-size="11" font-family="monospace" fill="#57606a">count=776 total_us=6126.5 avg_us=7.9</text>
+<text x="20" y="184" font-size="12" font-family="monospace" fill="#24292f">void cublasLt::splitKreduce_kernel&lt;32, 16...</text>
+<rect x="300" y="172" width="138" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="184" font-size="11" font-family="monospace" fill="#57606a">count=712 total_us=1033.9 avg_us=1.5</text>
+<text x="20" y="212" font-size="12" font-family="monospace" fill="#24292f">void at::native::vectorized_elementwise_k...</text>
+<rect x="300" y="200" width="123" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="212" font-size="11" font-family="monospace" fill="#57606a">count=632 total_us=656.7 avg_us=1.0</text>
+<text x="20" y="240" font-size="12" font-family="monospace" fill="#24292f">void pytorch_flash::flash_fwd_kernel&lt;Flas...</text>
+<rect x="300" y="228" width="109" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="240" font-size="11" font-family="monospace" fill="#57606a">count=560 total_us=4198.8 avg_us=7.5</text>
+<text x="20" y="268" font-size="12" font-family="monospace" fill="#24292f">void cublasLt::splitKreduce_kernel&lt;32, 16...</text>
+<rect x="300" y="256" width="63" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="268" font-size="11" font-family="monospace" fill="#57606a">count=324 total_us=554.7 avg_us=1.7</text>
+<text x="20" y="296" font-size="12" font-family="monospace" fill="#24292f">void at::native::elementwise_kernel&lt;128, ...</text>
+<rect x="300" y="284" width="56" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="296" font-size="11" font-family="monospace" fill="#57606a">count=292 total_us=510.5 avg_us=1.7</text>
+<text x="20" y="324" font-size="12" font-family="monospace" fill="#24292f">void at::native::elementwise_kernel&lt;128, ...</text>
+<rect x="300" y="312" width="54" height="16" fill="#bf8700" rx="4" />
+<text x="740" y="324" font-size="11" font-family="monospace" fill="#57606a">count=280 total_us=631.8 avg_us=2.3</text>
+</g>
+<g transform="translate(810,430)">
+<rect x="0" y="0" width="760" height="360" rx="10" fill="#ffffff" stroke="#d0d7de" />
+<text x="20" y="28" font-size="18" font-family="monospace" font-weight="bold" fill="#1f2328">True GPU Top 10 by Total Time (us)</text>
+<text x="20" y="72" font-size="12" font-family="monospace" fill="#24292f">void cutlass::Kernel2&lt;cutlass_80_wmma_ten...</text>
+<rect x="300" y="60" width="430" height="16" fill="#8250df" rx="4" />
+<text x="740" y="72" font-size="11" font-family="monospace" fill="#57606a">total_us=17600.5 count=2204 avg_us=8.0</text>
+<text x="20" y="100" font-size="12" font-family="monospace" fill="#24292f">void cutlass::Kernel2&lt;cutlass_80_wmma_ten...</text>
+<rect x="300" y="88" width="149" height="16" fill="#8250df" rx="4" />
+<text x="740" y="100" font-size="11" font-family="monospace" fill="#57606a">total_us=6126.5 count=776 avg_us=7.9</text>
+<text x="20" y="128" font-size="12" font-family="monospace" fill="#24292f">void pytorch_flash::flash_fwd_kernel&lt;Flas...</text>
+<rect x="300" y="116" width="102" height="16" fill="#8250df" rx="4" />
+<text x="740" y="128" font-size="11" font-family="monospace" fill="#57606a">total_us=4198.8 count=560 avg_us=7.5</text>
+<text x="20" y="156" font-size="12" font-family="monospace" fill="#24292f">void at::native::(anonymous namespace)::v...</text>
+<rect x="300" y="144" width="62" height="16" fill="#8250df" rx="4" />
+<text x="740" y="156" font-size="11" font-family="monospace" fill="#57606a">total_us=2550.8 count=930 avg_us=2.7</text>
+<text x="20" y="184" font-size="12" font-family="monospace" fill="#24292f">void cutlass::Kernel2&lt;cutlass_80_wmma_ten...</text>
+<rect x="300" y="172" width="46" height="16" fill="#8250df" rx="4" />
+<text x="740" y="184" font-size="11" font-family="monospace" fill="#57606a">total_us=1910.5 count=100 avg_us=19.1</text>
+<text x="20" y="212" font-size="12" font-family="monospace" fill="#24292f">void at::native::vectorized_elementwise_k...</text>
+<rect x="300" y="200" width="27" height="16" fill="#8250df" rx="4" />
+<text x="740" y="212" font-size="11" font-family="monospace" fill="#57606a">total_us=1136.0 count=1046 avg_us=1.1</text>
+<text x="20" y="240" font-size="12" font-family="monospace" fill="#24292f">void cublasLt::splitKreduce_kernel&lt;32, 16...</text>
+<rect x="300" y="228" width="25" height="16" fill="#8250df" rx="4" />
+<text x="740" y="240" font-size="11" font-family="monospace" fill="#57606a">total_us=1033.9 count=712 avg_us=1.5</text>
+<text x="20" y="268" font-size="12" font-family="monospace" fill="#24292f">void cutlass::Kernel2&lt;cutlass_80_wmma_ten...</text>
+<rect x="300" y="256" width="24" height="16" fill="#8250df" rx="4" />
+<text x="740" y="268" font-size="11" font-family="monospace" fill="#57606a">total_us=1019.6 count=96 avg_us=10.6</text>
+<text x="20" y="296" font-size="12" font-family="monospace" fill="#24292f">void at::native::vectorized_elementwise_k...</text>
+<rect x="300" y="284" width="16" height="16" fill="#8250df" rx="4" />
+<text x="740" y="296" font-size="11" font-family="monospace" fill="#57606a">total_us=656.7 count=632 avg_us=1.0</text>
+<text x="20" y="324" font-size="12" font-family="monospace" fill="#24292f">void at::native::elementwise_kernel&lt;128, ...</text>
+<rect x="300" y="312" width="15" height="16" fill="#8250df" rx="4" />
+<text x="740" y="324" font-size="11" font-family="monospace" fill="#57606a">total_us=631.8 count=280 avg_us=2.3</text>
+</g>
+</svg>

@@ -6,7 +6,9 @@ import contextlib
 import dataclasses
 import dis
 import functools
+import hashlib
 import inspect
+import json
 import logging
 import operator
 import os
@@ -579,6 +581,7 @@ class ExitDeviceContextManagerLine(WrapperLine):
 class ExternKernelAllocLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     node: ir.ExternKernelAlloc
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         node = self.node
@@ -593,6 +596,7 @@ class ExternKernelAllocLine(WrapperLine):
 class ExternKernelOutLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     node: ir.ExternKernelOut
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         node = self.node
@@ -630,6 +634,7 @@ class ExternKernelMultiOutLine(WrapperLine):
 
     wrapper: PythonWrapperCodegen
     node: ir.ExternKernelMultiOut
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         node = self.node
@@ -675,6 +680,7 @@ class KernelCallLine(WrapperLine):
     device: torch.device
     graph_name: str
     original_fxnode_name: str
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         self.wrapper._generate_kernel_call_helper(
@@ -715,6 +721,136 @@ class KernelDefinitionLine(WrapperLine):
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_kernel_definition
+
+
+_COMPUTE_LINE_TYPES = (
+    KernelCallLine,
+    ExternKernelOutLine,
+    ExternKernelAllocLine,
+    ExternKernelMultiOutLine,
+)
+
+
+@dataclasses.dataclass
+class LaunchMarkerLine(WrapperLine):
+    """Wraps a compute line with a record_function marker for profiling."""
+
+    wrapper: PythonWrapperCodegen
+    inner: WrapperLine
+    launch_id: int
+    graph_id: int
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        tag = f"ws_launch:{self.graph_id}:{self.launch_id}"
+        code.writeline(f"_ws_m{self.launch_id} = record_function({tag!r}).__enter__()")
+        code.writeline("try:")
+        with code.indent():
+            self.inner.codegen(code)
+        code.writeline("finally:")
+        with code.indent():
+            code.writeline(
+                f"_ws_m{self.launch_id}.__exit__(None, None, None)"
+            )
+
+
+@dataclasses.dataclass
+class DeviceSynchronizeLine(WrapperLine):
+    """Typed WrapperLine for ``torch.cuda.synchronize()``."""
+
+    wrapper: PythonWrapperCodegen
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(V.graph.device_ops.synchronize())
+
+
+@dataclasses.dataclass
+class StreamSynchronizeLine(WrapperLine):
+    """Typed WrapperLine for stream-level synchronization."""
+
+    wrapper: PythonWrapperCodegen
+    stream_idx: int = 0
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(f"{get_stream_name(self.stream_idx)}.synchronize()")
+
+
+@dataclasses.dataclass
+class EventRecordLine(WrapperLine):
+    """Typed WrapperLine for recording a CUDA event on a stream."""
+
+    wrapper: PythonWrapperCodegen
+    event_var: str = ""
+    stream_idx: int = 0
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(f"{self.event_var} = torch.cuda.Event()")
+        code.writeline(
+            f"{self.event_var}.record({get_stream_name(self.stream_idx)})"
+        )
+
+
+@dataclasses.dataclass
+class WaitEventLine(WrapperLine):
+    """Typed WrapperLine for waiting on a CUDA event."""
+
+    wrapper: PythonWrapperCodegen
+    event_var: str = ""
+    stream_idx: int = 0
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(
+            f"{get_stream_name(self.stream_idx)}.wait_event({self.event_var})"
+        )
+
+
+@dataclasses.dataclass
+class EventSynchronizeLine(WrapperLine):
+    """Typed WrapperLine for host-side ``cudaEventSynchronize``."""
+
+    wrapper: PythonWrapperCodegen
+    event_var: str = ""
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(f"{self.event_var}.synchronize()")
+
+
+_SYNC_LINE_TYPES = (
+    DeviceSynchronizeLine,
+    StreamSynchronizeLine,
+    WaitEventLine,
+    EventSynchronizeLine,
+)
+
+
+@dataclasses.dataclass
+class SyncMarkerLine(WrapperLine):
+    """Wraps a sync line with a record_function marker for profiling.
+
+    Emits ``ws_sync:{graph_id}:{sync_id}:{kind}:{launch_ids}`` markers so the
+    runtime exporter can build exact wait edges without temporal heuristics.
+    """
+
+    wrapper: PythonWrapperCodegen
+    inner: WrapperLine
+    sync_id: int
+    graph_id: int
+    kind: str  # "device_sync" | "stream_sync" | "wait_event" | "event_sync"
+    src_launch_ids: tuple[int, ...]
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        ids_str = ",".join(str(lid) for lid in self.src_launch_ids)
+        tag = f"ws_sync:{self.graph_id}:{self.sync_id}:{self.kind}:{ids_str}"
+        code.writeline(
+            f"_ws_s{self.sync_id} = record_function({tag!r}).__enter__()"
+        )
+        code.writeline("try:")
+        with code.indent():
+            self.inner.codegen(code)
+        code.writeline("finally:")
+        with code.indent():
+            code.writeline(
+                f"_ws_s{self.sync_id}.__exit__(None, None, None)"
+            )
 
 
 @dataclasses.dataclass
@@ -1227,6 +1363,8 @@ class PythonWrapperCodegen(CodeGen):
         self.launcher_fn_name = None
         # This function can be overridden to change the launcher name
         self.set_launcher_fn_name()
+        self._next_launch_id: int = 0
+        self._compilation_hash: str = ""
 
         # this is used for tracking which GraphLowering instance---parent graph
         # or (nested) subgraph---is currently codegened; the primary use case is
@@ -1298,6 +1436,11 @@ class PythonWrapperCodegen(CodeGen):
     def set_launcher_fn_name(self) -> None:
         # pyrefly: ignore [bad-assignment]
         self.launcher_fn_name = "call"
+
+    def _assign_launch_id(self) -> int:
+        lid = self._next_launch_id
+        self._next_launch_id += 1
+        return lid
 
     def write_constant(self, name: str, hashed: str) -> None:
         self.header.writeline(f"{name} = None  # {hashed}")
@@ -1593,7 +1736,7 @@ class PythonWrapperCodegen(CodeGen):
 
         with self.prefix.indent(prefix_indent):
             if config.triton.debug_sync_graph:
-                self.prefix.writeline(V.graph.device_ops.synchronize())
+                DeviceSynchronizeLine(self).codegen(self.prefix)
             phase = V.graph.get_training_phase()
             if config.annotate_training:
                 self.prefix.writeline(
@@ -1768,17 +1911,23 @@ class PythonWrapperCodegen(CodeGen):
             if custom_codegen is not None:
                 custom_codegen(node, self.writeline)
                 return
-        self.writeline(ExternKernelAllocLine(self, node))
+        self.writeline(
+            ExternKernelAllocLine(self, node, launch_id=self._assign_launch_id())
+        )
 
     def generate_extern_kernel_multi_out(self, node: ir.ExternKernelMultiOut) -> None:
         """Generate .out() call with pre-allocated output buffers."""
         for out_node in node.out_variant_output_nodes:
             self.codegen_allocation(out_node)
-        self.writeline(ExternKernelMultiOutLine(self, node))
+        self.writeline(
+            ExternKernelMultiOutLine(self, node, launch_id=self._assign_launch_id())
+        )
 
     def generate_extern_kernel_alloc(self, node: ir.ExternKernelAlloc):
         node.codegen_comment(self)
-        self.writeline(ExternKernelAllocLine(self, node))
+        self.writeline(
+            ExternKernelAllocLine(self, node, launch_id=self._assign_launch_id())
+        )
         if isinstance(node.layout, ir.Layout):
             node.codegen_size_asserts(self)
 
@@ -1816,7 +1965,9 @@ class PythonWrapperCodegen(CodeGen):
         node: ir.ExternKernelOut,
     ) -> None:
         node.codegen_comment(self)
-        self.writeline(ExternKernelOutLine(self, node))
+        self.writeline(
+            ExternKernelOutLine(self, node, launch_id=self._assign_launch_id())
+        )
 
     def _generate_extern_kernel_out_helper(
         self,
@@ -1972,6 +2123,47 @@ class PythonWrapperCodegen(CodeGen):
 
             self.run_wrapper_ir_passes(is_inference)
 
+            # Compilation hash (needed by sidecars and schedule validation)
+            self._compute_compilation_hash()
+
+            # Metadata emission (profiling compile pass)
+            if config.weight_streaming_emit_ids:
+                self._write_launch_map_sidecar()
+                self._write_tensor_map_sidecar()
+                self._write_index_file()
+
+            # Schedule injection runs BEFORE marker wrapping so the
+            # injector sees raw _COMPUTE_LINE_TYPES (not LaunchMarkerLine).
+            if config.weight_streaming_plan:
+                self._inject_weight_streaming_io()
+
+            if config.triton.debug_sync_graph:
+                self.lines.append(DeviceSynchronizeLine(self))
+
+            # Launch markers wrap compute lines AFTER injection so both
+            # passes see the original line types.
+            if config.weight_streaming_emit_launch_markers:
+                self.header.writeline(
+                    "from torch.profiler import record_function"
+                )
+                self.lines = [
+                    LaunchMarkerLine(
+                        self, line, line.launch_id, V.graph.graph_id
+                    )
+                    if isinstance(line, _COMPUTE_LINE_TYPES)
+                    else line
+                    for line in self.lines
+                ]
+
+            # Sync markers wrap DeviceSynchronizeLine etc. with
+            # record_function tags recording which launch IDs they wait on.
+            if config.weight_streaming_emit_sync_markers:
+                if not config.weight_streaming_emit_launch_markers:
+                    self.header.writeline(
+                        "from torch.profiler import record_function"
+                    )
+                self._wrap_sync_lines_with_markers()
+
             if config.triton.store_cubin and not config.triton.autotune_at_compile_time:
                 self.generate_reset_kernel_saved_flags()
 
@@ -1989,8 +2181,6 @@ class PythonWrapperCodegen(CodeGen):
 
             output_refs = self.get_output_refs()
             self.mark_output_type()
-            if config.triton.debug_sync_graph:
-                self.wrapper_call.writeline(V.graph.device_ops.synchronize())
 
             if config.profile_bandwidth:
                 self.generate_end_graph()
@@ -2039,10 +2229,464 @@ class PythonWrapperCodegen(CodeGen):
 
         self.add_benchmark_harness(result)
 
+        if config.weight_streaming_plan and config.weight_streaming_output_code:
+            self._export_weight_streaming_code(result)
+
         return (
             result.getvaluewithlinemap(),
             self.kernel_declarations.getvaluewithlinemap(),
         )
+
+    def _export_weight_streaming_code(self, result: IndentedBuffer) -> None:
+        out_dir = config.weight_streaming_output_code
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "weight_streaming_generated.py")
+        with open(out_path, "w") as f:
+            f.write(result.getvalue())
+        log.info("Weight streaming generated code written to %s", out_path)
+
+    def _compute_compilation_hash(self) -> None:
+        h = hashlib.sha256()
+        h.update(f"graph_id:{V.graph.graph_id}".encode())
+        for line in self.lines:
+            if not isinstance(line, _COMPUTE_LINE_TYPES):
+                continue
+            h.update(f"{line.launch_id}:".encode())
+            h.update(f"{type(line).__name__}:".encode())
+            if isinstance(line, KernelCallLine):
+                h.update(f"{line.kernel_name}:".encode())
+            else:
+                kname = getattr(
+                    line.node, "get_kernel_name", lambda: ""
+                )()
+                h.update(f"{kname}:".encode())
+        self._compilation_hash = h.hexdigest()[:16]
+
+    def _get_ws_output_dir(self) -> str:
+        out_dir = config.weight_streaming_output_code or tempfile.gettempdir()
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
+
+    def _write_launch_map_sidecar(self) -> None:
+        entries = []
+        for line in self.lines:
+            if isinstance(line, LaunchMarkerLine):
+                inner = line.inner
+            elif isinstance(line, _COMPUTE_LINE_TYPES):
+                inner = line
+            else:
+                continue
+            entry: dict[str, object] = {
+                "compiled_launch_id": inner.launch_id,
+                "graph_id": V.graph.graph_id,
+                "launch_kind": type(inner).__name__,
+            }
+            if isinstance(inner, KernelCallLine):
+                entry["kernel_name"] = inner.kernel_name
+                entry["original_fxnode_name"] = (
+                    inner.original_fxnode_name or ""
+                )
+            else:
+                entry["kernel_name"] = getattr(
+                    inner.node, "get_kernel_name", lambda: ""
+                )()
+            entries.append(entry)
+        gid = V.graph.graph_id
+        out_dir = self._get_ws_output_dir()
+        path = os.path.join(out_dir, f"compiled_launch_map_graph{gid}.json")
+        with open(path, "w") as f:
+            json.dump(
+                {
+                    "graph_id": gid,
+                    "launches": entries,
+                    "compilation_hash": self._compilation_hash,
+                },
+                f,
+                indent=2,
+            )
+        log.info("Weight streaming launch map written to %s", path)
+
+    def _build_tensor_id_map(self) -> tuple[dict[int, str], list[dict]]:
+        """Build graph-local compiled_tensor_id -> graph_input_name mapping.
+
+        Returns (id_to_input_name, sidecar_entries).  Both sidecar emission
+        and schedule injection call this so the ID assignment is identical.
+        """
+        from torch._inductor.ir import TensorBox
+
+        static_idxs = set(getattr(V.graph, "static_input_idxs", ()))
+        id_to_name: dict[int, str] = {}
+        entries: list[dict] = []
+        tid = 0
+        for idx, name in enumerate(V.graph.graph_input_names):
+            inp = V.graph.graph_inputs.get(name)
+            if not isinstance(inp, TensorBox) or idx not in static_idxs:
+                continue
+            id_to_name[tid] = name
+            buf = inp.data
+            if hasattr(buf, "data"):
+                buf = buf.data
+            layout = buf.layout
+            entries.append(
+                {
+                    "compiled_tensor_id": tid,
+                    "graph_input_name": name,
+                    "graph_input_idx": idx,
+                    "dtype": str(layout.dtype),
+                    "shape": [str(s) for s in layout.size],
+                }
+            )
+            tid += 1
+        return id_to_name, entries
+
+    def _build_input_usage_map(self) -> dict[str, list[int]]:
+        """Map each graph_input_name to sorted list of compiled_launch_ids that use it."""
+        import re
+
+        graph_input_set = set(V.graph.graph_input_names)
+        usage: dict[str, set[int]] = {n: set() for n in graph_input_set}
+        # Pre-build regex: match any graph input name as a whole identifier
+        if not graph_input_set:
+            return {}
+        pattern = re.compile(
+            r"\b(" + "|".join(re.escape(n) for n in graph_input_set) + r")\b"
+        )
+
+        for line in self.lines:
+            if not isinstance(line, _COMPUTE_LINE_TYPES):
+                continue
+            lid = line.launch_id
+            if lid < 0:
+                continue
+
+            # Collect argument strings from each compute line type
+            arg_strs: list[object] = []
+            if isinstance(line, KernelCallLine):
+                arg_strs = list(line.call_args)
+            elif isinstance(line, (ExternKernelOutLine, ExternKernelAllocLine)):
+                arg_strs = [*line.node.codegen_args(), *line.node.codegen_kwargs()]
+            elif isinstance(line, ExternKernelMultiOutLine):
+                arg_strs = [*line.node.codegen_args(), *line.node.codegen_kwargs()]
+
+            for a in arg_strs:
+                if isinstance(a, str):
+                    # Scan for graph input names within expression strings
+                    # (e.g. "reinterpret_tensor(primals_1, ...)")
+                    for m in pattern.finditer(a):
+                        usage[m.group(1)].add(lid)
+
+        return {name: sorted(lids) for name, lids in usage.items() if lids}
+
+    def _write_tensor_map_sidecar(self) -> None:
+        _, entries = self._build_tensor_id_map()
+
+        # Annotate each entry with the launch IDs that reference it
+        input_usage = self._build_input_usage_map()
+        for entry in entries:
+            entry["used_by_launch_ids"] = input_usage.get(
+                entry["graph_input_name"], []
+            )
+
+        gid = V.graph.graph_id
+        out_dir = self._get_ws_output_dir()
+        path = os.path.join(
+            out_dir, f"compiled_tensor_map_graph{gid}.json"
+        )
+        with open(path, "w") as f:
+            json.dump(
+                {
+                    "graph_id": gid,
+                    "tensors": entries,
+                    "compilation_hash": self._compilation_hash,
+                },
+                f,
+                indent=2,
+            )
+        log.info("Weight streaming tensor map written to %s", path)
+
+    def _write_index_file(self) -> None:
+        out_dir = self._get_ws_output_dir()
+        index_path = os.path.join(
+            out_dir, "compiled_weight_streaming_index.json"
+        )
+        # Load existing index if present
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+        else:
+            index = {"graphs": []}
+
+        gid = V.graph.graph_id
+        # Remove any existing entry for this graph_id
+        index["graphs"] = [
+            g for g in index["graphs"] if g.get("graph_id") != gid
+        ]
+        index["graphs"].append(
+            {
+                "graph_id": gid,
+                "launch_map": f"compiled_launch_map_graph{gid}.json",
+                "tensor_map": f"compiled_tensor_map_graph{gid}.json",
+                "compilation_hash": self._compilation_hash,
+            }
+        )
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+        log.info("Weight streaming index written to %s", index_path)
+
+    def _inject_weight_streaming_io(self):
+        """Insert weight streaming IO calls between kernel dispatches.
+
+        Loads the IO schedule from config.weight_streaming_plan, adapts
+        trace-level indices to wrapper kernel indices, and inserts
+        WeightStreamingLine objects into self.lines at the right positions.
+
+        Two placement mechanisms coexist:
+
+        1. **Exact (launch-ID)**: ops with ``before_launch_id`` /
+           ``after_launch_id >= 0`` attach to the compute line whose
+           ``launch_id`` matches.  VRAM ops (H2DPrefetchOp, EvictVramOp)
+           are resolved via ``compiled_tensor_id`` to graph input variable
+           references — hard error if unresolvable.  SSD/DRAM ops
+           (PrefetchOp, EvictDramOp) use string-name calls.
+
+        2. **Rescaled (legacy)**: ops without launch IDs are rescaled from
+           trace-level GPU-node indices to wrapper kernel count. Served by
+           ``adapter.rescale_before_kernel`` / ``rescale_after_kernel``.
+        """
+        from torch._inductor.weight_streaming.codegen import (
+            _op_to_call,
+            _vram_op_to_call,
+            ScheduleAdapter,
+            WeightStreamingLine,
+        )
+        from torch._inductor.weight_streaming.plan import (
+            EvictDramOp,
+            EvictVramOp,
+            H2DPrefetchOp,
+            load_io_schedule,
+            PrefetchOp,
+        )
+
+        schedule = load_io_schedule(
+            config.weight_streaming_plan,
+            nodes_csv=config.weight_streaming_nodes_csv,
+            tensor_csv=config.weight_streaming_tensor_csv,
+        )
+
+        # Validate compilation hash if present in schedule
+        schedule_hash = schedule.compilation_hash
+        if schedule_hash and self._compilation_hash:
+            if schedule_hash != self._compilation_hash:
+                raise RuntimeError(
+                    f"Weight streaming schedule compilation_hash mismatch: "
+                    f"schedule={schedule_hash}, "
+                    f"current={self._compilation_hash}. "
+                    f"Recompile with matching model/config."
+                )
+
+        adapter = ScheduleAdapter(schedule)
+
+        # Build compiled_tensor_id → graph_input_name (shared with sidecar)
+        tensor_id_to_input, _ = self._build_tensor_id_map()
+        stable_tensor_refs: dict[int, str] = {}
+        if tensor_id_to_input:
+            for tid, name in tensor_id_to_input.items():
+                alias = f"_ws_ref_{name}"
+                self.prefix.writeline(f"{alias} = {name}")
+                stable_tensor_refs[tid] = alias
+
+        # Emit runtime import in the header
+        self.header.writeline(
+            "from torch._inductor.weight_streaming.runtime "
+            "import WeightStreamRuntime"
+        )
+        self.header.writeline("_ws_rt = WeightStreamRuntime.instance()")
+
+        # Exact-launch maps: VRAM ops resolved via compiled_tensor_id,
+        # SSD/DRAM ops use string names.
+        before_launch = adapter.before_launch
+        after_launch = adapter.after_launch
+
+        # Collect compute lines (all four types including MultiOut)
+        compute_lines: list[WrapperLine] = []
+        for line in self.lines:
+            if isinstance(line, _COMPUTE_LINE_TYPES):
+                compute_lines.append(line)
+
+        # Legacy rescaling path (only ops WITHOUT launch IDs; the
+        # ScheduleAdapter already filters these out of _before_kernel /
+        # _after_kernel).
+        kernel_only_lines = [
+            cl for cl in compute_lines if isinstance(cl, KernelCallLine)
+        ]
+        n_kernels = len(kernel_only_lines)
+        rescaled_before = adapter.rescale_before_kernel(n_kernels)
+        rescaled_after = adapter.rescale_after_kernel(n_kernels)
+
+        # Map each compute line to its index in compute_lines
+        compute_line_ids = {
+            id(line): idx for idx, line in enumerate(compute_lines)
+        }
+
+        kernel_only_idx = 0
+        new_lines: list = []
+
+        # Cold start prefetches go before any compute
+        if adapter.startup_ops:
+            new_lines.append(
+                WeightStreamingLine(
+                    wrapper=self,
+                    calls=[
+                        f"_ws_rt.cold_start_prefetch({op.tensor_name!r})"
+                        for op in adapter.startup_ops
+                    ],
+                )
+            )
+
+        def _emit_op(op):
+            if isinstance(op, (H2DPrefetchOp, EvictVramOp)):
+                return _vram_op_to_call(op, stable_tensor_refs or tensor_id_to_input)
+            return _op_to_call(op)
+
+        for line in self.lines:
+            cidx = compute_line_ids.get(id(line))
+            is_kernel = isinstance(line, KernelCallLine)
+            is_compute = cidx is not None
+
+            if is_compute:
+                pre_calls: list[str] = []
+
+                # Exact pre-ops (launch-ID keyed)
+                for op in before_launch.get(line.launch_id, []):
+                    pre_calls.append(_emit_op(op))
+
+                # Rescaled pre-ops (legacy, KernelCallLine only)
+                if is_kernel:
+                    for op in rescaled_before.get(kernel_only_idx, []):
+                        if isinstance(op, (PrefetchOp, H2DPrefetchOp)):
+                            pre_calls.append(_op_to_call(op))
+
+                if pre_calls:
+                    new_lines.append(
+                        WeightStreamingLine(
+                            wrapper=self, calls=pre_calls
+                        )
+                    )
+
+                new_lines.append(line)
+
+                post_ops = []
+
+                # Exact post-ops (launch-ID keyed)
+                for op in after_launch.get(line.launch_id, []):
+                    post_ops.append((op, True))
+
+                # Rescaled post-ops (legacy, KernelCallLine only)
+                if is_kernel:
+                    for op in rescaled_after.get(kernel_only_idx, []):
+                        if isinstance(op, (EvictDramOp, EvictVramOp)):
+                            post_ops.append((op, False))
+
+                if any(isinstance(op, EvictVramOp) for op, _ in post_ops):
+                    new_lines.append(DeviceSynchronizeLine(wrapper=self))
+
+                post_calls: list[str] = []
+                for op, is_exact in post_ops:
+                    if is_exact:
+                        post_calls.append(_emit_op(op))
+                    else:
+                        post_calls.append(_op_to_call(op))
+
+                if post_calls:
+                    new_lines.append(
+                        WeightStreamingLine(
+                            wrapper=self, calls=post_calls
+                        )
+                    )
+
+                if is_kernel:
+                    kernel_only_idx += 1
+            else:
+                new_lines.append(line)
+
+        self.lines = new_lines
+
+    def _wrap_sync_lines_with_markers(self):
+        """Wrap sync WrapperLines with SyncMarkerLine for profiling.
+
+        Tracks cumulative launch frontiers per stream and records which launches
+        each sync operation waits on.
+        """
+        frontier_by_stream: dict[int, set[int]] = {}
+        current_stream: int = 0
+        event_frontier: dict[str, tuple[int, ...]] = {}
+        next_sync_id: int = 0
+        new_lines: list = []
+
+        for line in self.lines:
+            inner = line.inner if isinstance(line, LaunchMarkerLine) else line
+
+            if isinstance(inner, EnterCudaStreamContextLine):
+                current_stream = inner.stream_idx
+            elif isinstance(inner, ExitCudaStreamContextLine):
+                current_stream = 0
+
+            if isinstance(inner, _COMPUTE_LINE_TYPES) and inner.launch_id >= 0:
+                frontier_by_stream.setdefault(current_stream, set()).add(
+                    inner.launch_id
+                )
+
+            if isinstance(inner, EventRecordLine):
+                event_frontier[inner.event_var] = tuple(
+                    sorted(frontier_by_stream.get(inner.stream_idx, ()))
+                )
+
+            if isinstance(inner, DeviceSynchronizeLine):
+                src_ids = tuple(
+                    sorted(
+                        {
+                            launch_id
+                            for stream_frontier in frontier_by_stream.values()
+                            for launch_id in stream_frontier
+                        }
+                    )
+                )
+                line = SyncMarkerLine(
+                    self, inner, next_sync_id, V.graph.graph_id,
+                    "device_sync", src_ids,
+                )
+                next_sync_id += 1
+            elif isinstance(inner, StreamSynchronizeLine):
+                src_ids = tuple(
+                    sorted(frontier_by_stream.get(inner.stream_idx, ()))
+                )
+                line = SyncMarkerLine(
+                    self, inner, next_sync_id, V.graph.graph_id,
+                    "stream_sync", src_ids,
+                )
+                next_sync_id += 1
+            elif isinstance(inner, WaitEventLine):
+                src_ids = event_frontier.get(inner.event_var, ())
+                line = SyncMarkerLine(
+                    self, inner, next_sync_id, V.graph.graph_id,
+                    "wait_event", src_ids,
+                )
+                if src_ids:
+                    stream_frontier = frontier_by_stream.setdefault(
+                        inner.stream_idx, set()
+                    )
+                    stream_frontier.update(src_ids)
+                next_sync_id += 1
+            elif isinstance(inner, EventSynchronizeLine):
+                src_ids = event_frontier.get(inner.event_var, ())
+                line = SyncMarkerLine(
+                    self, inner, next_sync_id, V.graph.graph_id,
+                    "event_sync", src_ids,
+                )
+                next_sync_id += 1
+
+            new_lines.append(line)
+        self.lines = new_lines
 
     def generate_and_run_autotune_block(self):
         """
@@ -3154,6 +3798,7 @@ class PythonWrapperCodegen(CodeGen):
                 graph_name=V.graph.name,
                 # pyrefly: ignore [bad-argument-type]
                 original_fxnode_name=original_fxnode_name,
+                launch_id=self._assign_launch_id(),
             )
         )
 

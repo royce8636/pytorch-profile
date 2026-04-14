@@ -8,6 +8,7 @@ import gzip
 import inspect
 import json
 from pathlib import Path
+import re
 import shlex
 import sys
 from typing import Any
@@ -75,6 +76,7 @@ def parse_args(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_dot_level: str,
     default_profile_memory: bool,
     default_record_shapes: bool,
     default_with_stack: bool,
@@ -192,7 +194,7 @@ def parse_args(
             "both",
             "all",
         ),
-        default="none",
+        default=default_dot_level,
         help=(
             "Optional DOT graph outputs. 'fx' exports the logical UNet FX graph, "
             "'execution' exports a DOT converted from ExecutionTraceObserver output, "
@@ -415,7 +417,9 @@ def validate_dot_args(args: argparse.Namespace) -> None:
 
 
 def resolve_output_paths(
-    args: argparse.Namespace, default_output_prefix: str
+    args: argparse.Namespace,
+    default_output_prefix: str,
+    default_llamasim_output_dirname: str | None = None,
 ) -> OutputPaths:
     stem = output_stem(default_output_prefix, args.fusion)
     if args.output_dir is not None:
@@ -466,7 +470,11 @@ def resolve_output_paths(
         llamasim_output_dir = (
             Path(args.llamasim_output_dir)
             if args.llamasim_output_dir is not None
-            else output_dir / f"{stem}_llamasim_runtime"
+            else (
+                output_dir / default_llamasim_output_dirname
+                if default_llamasim_output_dirname is not None
+                else output_dir / f"{stem}_llamasim_runtime"
+            )
         )
     else:
         trace_path = Path(args.trace)
@@ -589,6 +597,11 @@ def synchronize_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def profiler_synchronize_device(device: torch.device) -> None:
+    with torch.autograd.profiler.record_function("profiler_sync:device"):
+        synchronize_device(device)
+
+
 def profile_activities(device: torch.device) -> list[torch.profiler.ProfilerActivity]:
     activities = [torch.profiler.ProfilerActivity.CPU]
     if device.type == "cuda":
@@ -617,11 +630,45 @@ def load_pipeline(model: str, torch_dtype: torch.dtype, device: torch.device) ->
     return pipe
 
 
-def maybe_compile(pipe: Any, args: argparse.Namespace) -> None:
+def configure_llamasim_inductor_markers(output_dir: Path | str | None) -> None:
+    """Enable compile-time provenance needed for exact LLaMASim runtime edges."""
+    if output_dir is None:
+        return
+
+    output_dir_str = str(output_dir)
+    desired = {
+        "weight_streaming_emit_ids": True,
+        "weight_streaming_emit_launch_markers": True,
+        "weight_streaming_emit_sync_markers": True,
+        "weight_streaming_output_code": output_dir_str,
+    }
+    config = torch._inductor.config
+    changed = any(getattr(config, name) != value for name, value in desired.items())
+    for name, value in desired.items():
+        setattr(config, name, value)
+
+    if changed:
+        try:
+            import torch._dynamo as dynamo
+        except ImportError:
+            dynamo = None
+        if dynamo is not None:
+            dynamo.reset()
+
+
+def maybe_compile(
+    pipe: Any,
+    args: argparse.Namespace,
+    output_paths: OutputPaths | None = None,
+) -> None:
     if args.fusion == "none":
         return
     if not hasattr(torch, "compile"):
         raise RuntimeError("torch.compile is not available in this runtime")
+
+    if output_paths is not None and output_paths.llamasim_output_dir is not None:
+        configure_llamasim_inductor_markers(output_paths.llamasim_output_dir)
+
     pipe.unet = torch.compile(
         pipe.unet,
         backend="inductor",
@@ -2039,9 +2086,14 @@ def is_llamasim_gpu_runtime_event(event: Any) -> bool:
 
 def select_llamasim_runtime_events(
     raw_events: list[Any],
+    *,
+    extra_cpu_event_ids: set[int] | None = None,
+    exclude_cpu_event_ids: set[int] | None = None,
 ) -> tuple[list[Any], list[Any], list[Any]]:
     from torch.autograd import DeviceType
 
+    extra_cpu_event_ids = extra_cpu_event_ids or set()
+    exclude_cpu_event_ids = exclude_cpu_event_ids or set()
     node_ids, cpu_parent_edges, _linked_edges, _stream_edges = build_kineto_runtime_graph(
         raw_events
     )
@@ -2051,7 +2103,11 @@ def select_llamasim_runtime_events(
         event
         for event in raw_events
         if event.device_type() == DeviceType.CPU
-        and node_ids[id(event)] not in cpu_parent_node_ids
+        and id(event) not in exclude_cpu_event_ids
+        and (
+            node_ids[id(event)] not in cpu_parent_node_ids
+            or id(event) in extra_cpu_event_ids
+        )
     ]
     selected_gpu_events = [
         event for event in raw_events if is_llamasim_gpu_runtime_event(event)
@@ -2074,6 +2130,8 @@ def build_llamasim_thread_order_edges(
     for thread_events in cpu_events_by_thread.values():
         thread_events.sort(key=raw_event_sort_key)
         for current, nxt in zip(thread_events, thread_events[1:]):
+            if current.end_ns() > nxt.start_ns():
+                continue
             edges.append((node_ids[id(current)], node_ids[id(nxt)], "thread_order"))
     return edges
 
@@ -2158,6 +2216,512 @@ def build_llamasim_submit_edges(
     return submit_edges, runtime_role_by_event_id
 
 
+_AC2G_CPU_ENDPOINT_CATEGORIES = frozenset({"cuda_runtime", "cuda_driver"})
+_AC2G_GPU_ENDPOINT_CATEGORIES = frozenset(
+    {"kernel", "gpu_memcpy", "gpu_memset"}
+)
+_AC2G_TRACE_ENDPOINT_TOLERANCE_US = 1e-3
+_AC2G_RAW_EVENT_MATCH_TOLERANCE_US = 2.0
+
+
+@dataclass(frozen=True)
+class Ac2gTraceEndpoint:
+    correlation_id: int
+    category: str
+    name: str
+    ts_us: float
+    relative_ts_us: float
+    duration_us: float
+    pid: Any
+    tid: Any
+    device_index: int | None
+    resource_id: int | None
+
+
+@dataclass(frozen=True)
+class Ac2gFlowEndpoints:
+    paired_correlation_ids: set[int]
+    # {correlation_id: ts_us} — CPU-side ac2g start timestamp relative to trace start.
+    start_ts_us_by_corr_id: dict[int, float]
+    cpu_endpoint_by_corr_id: dict[int, Ac2gTraceEndpoint]
+    gpu_endpoint_by_corr_id: dict[int, Ac2gTraceEndpoint]
+    trace_start_us: float
+
+
+@dataclass(frozen=True)
+class Ac2gRawEventPair:
+    correlation_id: int
+    cpu_event: Any
+    gpu_event: Any
+    cpu_endpoint: Ac2gTraceEndpoint
+    gpu_endpoint: Ac2gTraceEndpoint
+
+
+@dataclass(frozen=True)
+class Ac2gRawEventMatches:
+    pairs_by_corr_id: dict[int, Ac2gRawEventPair]
+    errors: list[str]
+
+
+def _trace_event_correlation_id(event: dict[str, Any]) -> int | None:
+    args = event.get("args")
+    if not isinstance(args, dict):
+        return None
+    for key in ("correlation", "correlation_id"):
+        value = args.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _trace_event_int_arg(event: dict[str, Any], key: str) -> int | None:
+    args = event.get("args")
+    if not isinstance(args, dict):
+        return None
+    value = args.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_chrome_trace_start_us(trace_events: list[dict[str, Any]]) -> float:
+    for event in trace_events:
+        if event.get("ph") == "X" and event.get("cat") == "Trace":
+            ts = event.get("ts")
+            if ts is not None:
+                return float(ts)
+    for event in trace_events:
+        if event.get("name") == "Iteration Start: PyTorch Profiler":
+            ts = event.get("ts")
+            if ts is not None:
+                return float(ts)
+    return 0.0
+
+
+def _select_ac2g_trace_endpoint(
+    *,
+    correlation_id: int,
+    flow_event: dict[str, Any],
+    x_events: list[dict[str, Any]],
+    categories: frozenset[str],
+    trace_start_us: float,
+) -> Ac2gTraceEndpoint | None:
+    flow_ts = flow_event.get("ts")
+    if flow_ts is None:
+        return None
+    flow_ts_us = float(flow_ts)
+    candidates: list[dict[str, Any]] = []
+    for event in x_events:
+        if event.get("ph") != "X" or event.get("cat") not in categories:
+            continue
+        ts = event.get("ts")
+        dur = event.get("dur")
+        name = event.get("name")
+        if ts is None or dur is None or not isinstance(name, str):
+            continue
+        if abs(float(ts) - flow_ts_us) <= _AC2G_TRACE_ENDPOINT_TOLERANCE_US:
+            candidates.append(event)
+    if len(candidates) != 1:
+        return None
+
+    endpoint_event = candidates[0]
+    category = str(endpoint_event.get("cat"))
+    return Ac2gTraceEndpoint(
+        correlation_id=correlation_id,
+        category=category,
+        name=str(endpoint_event["name"]),
+        ts_us=float(endpoint_event["ts"]),
+        relative_ts_us=float(endpoint_event["ts"]) - trace_start_us,
+        duration_us=float(endpoint_event["dur"]),
+        pid=endpoint_event.get("pid"),
+        tid=endpoint_event.get("tid"),
+        device_index=_trace_event_int_arg(endpoint_event, "device"),
+        resource_id=_trace_event_int_arg(endpoint_event, "stream"),
+    )
+
+
+def parse_ac2g_flow_endpoints(
+    trace_json_path: Path, trace_start_us: float | None = None
+) -> Ac2gFlowEndpoints:
+    with trace_json_path.open(encoding="utf-8") as f:
+        trace_json = json.load(f)
+    trace_events = trace_json.get("traceEvents", [])
+    if not isinstance(trace_events, list):
+        trace_events = []
+    if trace_start_us is None:
+        trace_start_us = _infer_chrome_trace_start_us(trace_events)
+
+    starts: dict[int, list[dict[str, Any]]] = {}
+    ends: dict[int, list[dict[str, Any]]] = {}
+    x_events_by_corr_id: dict[int, list[dict[str, Any]]] = {}
+    for event in trace_events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("ph") == "X":
+            corr_id = _trace_event_correlation_id(event)
+            if corr_id is not None:
+                x_events_by_corr_id.setdefault(corr_id, []).append(event)
+            continue
+
+        if event.get("cat") != "ac2g":
+            continue
+        flow_id = event.get("id")
+        if flow_id is None:
+            continue
+        try:
+            corr_id = int(flow_id)
+        except (TypeError, ValueError):
+            continue
+        ph = event.get("ph")
+        if ph == "s":
+            starts.setdefault(corr_id, []).append(event)
+        elif ph == "f":
+            ends.setdefault(corr_id, []).append(event)
+
+    paired = set(starts) & set(ends)
+    start_ts_us: dict[int, float] = {}
+    cpu_endpoint_by_corr_id: dict[int, Ac2gTraceEndpoint] = {}
+    gpu_endpoint_by_corr_id: dict[int, Ac2gTraceEndpoint] = {}
+    for corr_id in paired:
+        start_events = sorted(starts[corr_id], key=lambda e: float(e.get("ts", 0.0)))
+        end_events = sorted(ends[corr_id], key=lambda e: float(e.get("ts", 0.0)))
+        start_event = start_events[0]
+        end_event = end_events[0]
+        ts = start_event.get("ts")
+        if ts is not None:
+            start_ts_us[corr_id] = float(ts) - trace_start_us
+        x_events = x_events_by_corr_id.get(corr_id, [])
+        cpu_endpoint = _select_ac2g_trace_endpoint(
+            correlation_id=corr_id,
+            flow_event=start_event,
+            x_events=x_events,
+            categories=_AC2G_CPU_ENDPOINT_CATEGORIES,
+            trace_start_us=trace_start_us,
+        )
+        if cpu_endpoint is not None:
+            cpu_endpoint_by_corr_id[corr_id] = cpu_endpoint
+        gpu_endpoint = _select_ac2g_trace_endpoint(
+            correlation_id=corr_id,
+            flow_event=end_event,
+            x_events=x_events,
+            categories=_AC2G_GPU_ENDPOINT_CATEGORIES,
+            trace_start_us=trace_start_us,
+        )
+        if gpu_endpoint is not None:
+            gpu_endpoint_by_corr_id[corr_id] = gpu_endpoint
+
+    return Ac2gFlowEndpoints(
+        paired_correlation_ids=paired,
+        start_ts_us_by_corr_id={k: v for k, v in start_ts_us.items() if k in paired},
+        cpu_endpoint_by_corr_id=cpu_endpoint_by_corr_id,
+        gpu_endpoint_by_corr_id=gpu_endpoint_by_corr_id,
+        trace_start_us=trace_start_us,
+    )
+
+
+def parse_ac2g_paired_correlation_ids(trace_json_path: Path) -> set[int]:
+    return parse_ac2g_flow_endpoints(trace_json_path).paired_correlation_ids
+
+
+def _event_relative_start_us(event: Any, trace_start_ns: int) -> float:
+    return (event.start_ns() - trace_start_ns) / 1000.0
+
+
+def _event_duration_us(event: Any) -> float:
+    return event.duration_ns() / 1000.0
+
+
+def _match_raw_event_to_ac2g_endpoint(
+    raw_events: list[Any],
+    endpoint: Ac2gTraceEndpoint,
+    *,
+    trace_start_ns: int,
+) -> tuple[Any | None, str | None]:
+    from torch.autograd import DeviceType
+
+    is_cpu_endpoint = endpoint.category in _AC2G_CPU_ENDPOINT_CATEGORIES
+    candidates: list[Any] = []
+    for event in raw_events:
+        if event.correlation_id() != endpoint.correlation_id:
+            continue
+        if event.name() != endpoint.name:
+            continue
+        if is_cpu_endpoint:
+            if event.device_type() != DeviceType.CPU:
+                continue
+        else:
+            if event.device_type() == DeviceType.CPU or event.is_user_annotation():
+                continue
+            if (
+                endpoint.device_index is not None
+                and event.device_index() != endpoint.device_index
+            ):
+                continue
+            if (
+                endpoint.resource_id is not None
+                and event.device_resource_id() != endpoint.resource_id
+            ):
+                continue
+        if (
+            abs(_event_relative_start_us(event, trace_start_ns) - endpoint.relative_ts_us)
+            > _AC2G_RAW_EVENT_MATCH_TOLERANCE_US
+        ):
+            continue
+        if (
+            abs(_event_duration_us(event) - endpoint.duration_us)
+            > _AC2G_RAW_EVENT_MATCH_TOLERANCE_US
+        ):
+            continue
+        candidates.append(event)
+
+    if len(candidates) == 1:
+        return candidates[0], None
+    if len(candidates) > 1:
+        return (
+            None,
+            "ambiguous raw Kineto endpoint "
+            f"cid={endpoint.correlation_id} name={endpoint.name!r} "
+            f"category={endpoint.category!r} candidates={len(candidates)}",
+        )
+
+    same_corr = [
+        event.name()
+        for event in raw_events
+        if event.correlation_id() == endpoint.correlation_id
+    ]
+    return (
+        None,
+        "missing raw Kineto endpoint "
+        f"cid={endpoint.correlation_id} name={endpoint.name!r} "
+        f"category={endpoint.category!r} start_us={endpoint.relative_ts_us:.3f} "
+        f"dur_us={endpoint.duration_us:.3f} corr_names={sorted(set(same_corr))[:6]}",
+    )
+
+
+def match_ac2g_endpoints_to_raw_events(
+    raw_events: list[Any],
+    ac2g_endpoints: Ac2gFlowEndpoints,
+    *,
+    trace_start_ns: int = 0,
+) -> Ac2gRawEventMatches:
+    raw_events_by_corr_id: dict[int, list[Any]] = {}
+    for event in raw_events:
+        corr_id = event.correlation_id()
+        if corr_id in ac2g_endpoints.paired_correlation_ids:
+            raw_events_by_corr_id.setdefault(corr_id, []).append(event)
+
+    pairs_by_corr_id: dict[int, Ac2gRawEventPair] = {}
+    errors: list[str] = []
+    for corr_id in sorted(ac2g_endpoints.paired_correlation_ids):
+        cpu_endpoint = ac2g_endpoints.cpu_endpoint_by_corr_id.get(corr_id)
+        gpu_endpoint = ac2g_endpoints.gpu_endpoint_by_corr_id.get(corr_id)
+        if cpu_endpoint is None:
+            errors.append(f"missing Chrome ac2g CPU endpoint cid={corr_id}")
+            continue
+        if gpu_endpoint is None:
+            errors.append(f"missing Chrome ac2g GPU endpoint cid={corr_id}")
+            continue
+        raw_candidates = raw_events_by_corr_id.get(corr_id, [])
+        cpu_event, cpu_error = _match_raw_event_to_ac2g_endpoint(
+            raw_candidates,
+            cpu_endpoint,
+            trace_start_ns=trace_start_ns,
+        )
+        gpu_event, gpu_error = _match_raw_event_to_ac2g_endpoint(
+            raw_candidates,
+            gpu_endpoint,
+            trace_start_ns=trace_start_ns,
+        )
+        if cpu_error is not None:
+            errors.append(cpu_error)
+        if gpu_error is not None:
+            errors.append(gpu_error)
+        if cpu_event is None or gpu_event is None:
+            continue
+        pairs_by_corr_id[corr_id] = Ac2gRawEventPair(
+            correlation_id=corr_id,
+            cpu_event=cpu_event,
+            gpu_event=gpu_event,
+            cpu_endpoint=cpu_endpoint,
+            gpu_endpoint=gpu_endpoint,
+        )
+
+    return Ac2gRawEventMatches(
+        pairs_by_corr_id=pairs_by_corr_id,
+        errors=errors,
+    )
+
+
+def _format_ac2g_match_errors(errors: list[str], *, limit: int = 20) -> str:
+    shown = errors[:limit]
+    suffix = "" if len(errors) <= limit else f"\n... {len(errors) - limit} more"
+    return "\n".join(shown) + suffix
+
+
+def build_llamasim_submit_edges_from_ac2g(
+    node_ids: dict[int, str],
+    cpu_events: list[Any],
+    gpu_events: list[Any],
+    all_raw_events: list[Any],
+    ac2g_correlation_ids: set[int],
+    *,
+    ac2g_endpoints: Ac2gFlowEndpoints | None = None,
+    trace_start_ns: int = 0,
+    ac2g_matches: Ac2gRawEventMatches | None = None,
+    strict: bool = False,
+) -> tuple[list[tuple[str, str, str]], dict[int, str], dict[tuple[str, str], dict[str, str]]]:
+    from torch.autograd import DeviceType
+
+    if ac2g_endpoints is not None:
+        if ac2g_matches is None:
+            ac2g_matches = match_ac2g_endpoints_to_raw_events(
+                all_raw_events,
+                ac2g_endpoints,
+                trace_start_ns=trace_start_ns,
+            )
+        if strict and ac2g_matches.errors:
+            raise RuntimeError(
+                "Failed to match all Chrome ac2g endpoints to raw Kineto events:\n"
+                + _format_ac2g_match_errors(ac2g_matches.errors)
+            )
+
+        submit_edges: list[tuple[str, str, str]] = []
+        submit_edge_attrs: dict[tuple[str, str], dict[str, str]] = {}
+        runtime_role_by_event_id: dict[int, str] = {}
+        seen_pairs: set[tuple[str, str, str]] = set()
+        selected_gpu_event_ids = {id(event) for event in gpu_events}
+        requested_ac2g_correlation_ids = set(ac2g_correlation_ids)
+        missing_node_errors: list[str] = []
+
+        matched_pairs = sorted(
+            ac2g_matches.pairs_by_corr_id.values(),
+            key=lambda pair: raw_event_sort_key(pair.gpu_event),
+        )
+        for pair in matched_pairs:
+            if pair.correlation_id not in requested_ac2g_correlation_ids:
+                continue
+            if id(pair.gpu_event) not in selected_gpu_event_ids:
+                continue
+            if id(pair.cpu_event) not in node_ids:
+                missing_node_errors.append(
+                    f"exact ac2g submit node is not in runtime graph cid={pair.correlation_id} "
+                    f"name={pair.cpu_event.name()!r}"
+                )
+                continue
+            if id(pair.gpu_event) not in node_ids:
+                missing_node_errors.append(
+                    f"exact ac2g GPU node is not in runtime graph cid={pair.correlation_id} "
+                    f"name={pair.gpu_event.name()!r}"
+                )
+                continue
+            edge = (
+                node_ids[id(pair.cpu_event)],
+                node_ids[id(pair.gpu_event)],
+                "submit",
+            )
+            if edge in seen_pairs:
+                continue
+            seen_pairs.add(edge)
+            submit_edges.append(edge)
+            submit_edge_attrs[(edge[0], edge[1])] = {"submit_exact": "true"}
+            runtime_role_by_event_id[id(pair.cpu_event)] = "submit"
+
+        if strict:
+            if missing_node_errors:
+                raise RuntimeError(
+                    "Failed to emit exact ac2g submit edges:\n"
+                    + _format_ac2g_match_errors(missing_node_errors)
+                )
+            expected_gpu_event_ids = {
+                id(pair.gpu_event)
+                for pair in ac2g_matches.pairs_by_corr_id.values()
+                if (
+                    pair.correlation_id in requested_ac2g_correlation_ids
+                    and id(pair.gpu_event) in selected_gpu_event_ids
+                )
+            }
+            submitted_gpu_event_ids = {
+                id(pair.gpu_event)
+                for pair in ac2g_matches.pairs_by_corr_id.values()
+                if (
+                    pair.correlation_id in requested_ac2g_correlation_ids
+                    and id(pair.gpu_event) in selected_gpu_event_ids
+                    and id(pair.cpu_event) in node_ids
+                    and (
+                        node_ids[id(pair.cpu_event)],
+                        node_ids[id(pair.gpu_event)],
+                        "submit",
+                    )
+                    in seen_pairs
+                )
+            }
+            if submitted_gpu_event_ids != expected_gpu_event_ids:
+                raise RuntimeError(
+                    "Failed to emit one exact submit edge per selected ac2g GPU event "
+                    f"(expected={len(expected_gpu_event_ids)}, emitted={len(submitted_gpu_event_ids)})"
+                )
+
+        return submit_edges, runtime_role_by_event_id, submit_edge_attrs
+
+    cpu_events_by_corr_id: dict[int, list[Any]] = {}
+    for event in all_raw_events:
+        if event.device_type() != DeviceType.CPU:
+            continue
+        corr_id = event.correlation_id()
+        if corr_id in ac2g_correlation_ids:
+            cpu_events_by_corr_id.setdefault(corr_id, []).append(event)
+
+    submit_edges: list[tuple[str, str, str]] = []
+    submit_edge_attrs: dict[tuple[str, str], dict[str, str]] = {}
+    runtime_role_by_event_id: dict[int, str] = {}
+    seen_pairs: set[tuple[str, str, str]] = set()
+
+    for gpu_event in gpu_events:
+        corr_id = gpu_event.correlation_id()
+        if corr_id not in ac2g_correlation_ids:
+            continue
+        candidates = list(cpu_events_by_corr_id.get(corr_id, ()))
+        if not candidates:
+            continue
+        in_graph = [e for e in candidates if id(e) in node_ids]
+        if not in_graph:
+            continue
+        candidates = in_graph
+
+        before_start = [
+            event
+            for event in candidates
+            if event.start_ns() <= gpu_event.start_ns()
+        ]
+        if before_start:
+            candidates = before_start
+        submit_event = max(
+            candidates,
+            key=lambda event: (
+                event.end_ns(),
+                event.start_ns(),
+                event.name(),
+            ),
+        )
+
+        edge = (node_ids[id(submit_event)], node_ids[id(gpu_event)], "submit")
+        if edge in seen_pairs:
+            continue
+        seen_pairs.add(edge)
+        submit_edges.append(edge)
+        submit_edge_attrs[(edge[0], edge[1])] = {"submit_exact": "false"}
+        runtime_role_by_event_id[id(submit_event)] = "submit"
+
+    return submit_edges, runtime_role_by_event_id, submit_edge_attrs
+
+
 def build_llamasim_wait_edges(
     node_ids: dict[int, str],
     cpu_events: list[Any],
@@ -2219,6 +2783,285 @@ _CUDA_SYNC_EVENT_NAMES = frozenset({
     "cudaEventSynchronize",
 })
 
+_CUDA_DEVICE_SYNC_EVENT_NAMES = frozenset({
+    "cudaDeviceSynchronize",
+})
+_CUDA_STREAM_SYNC_EVENT_NAMES = frozenset({
+    "cudaStreamSynchronize",
+})
+_CUDA_EVENT_SYNC_EVENT_NAMES = frozenset({
+    "cudaEventSynchronize",
+})
+_CUDA_STREAM_WAIT_EVENT_NAMES = frozenset({
+    "cudaStreamWaitEvent",
+})
+_CUDA_ASYNC_SUBMIT_EVENT_NAMES = frozenset({
+    "cudaLaunchKernel",
+    "cuLaunchKernel",
+    "cudaMemcpyAsync",
+    "cudaMemcpy2DAsync",
+    "cudaMemcpy3DAsync",
+    "cudaMemsetAsync",
+})
+_ATEN_PARENT_SCOPE_EXACT_SYNC_NAMES = frozenset({
+    "aten::copy_",
+    "aten::_to_copy",
+    "aten::nonzero",
+    "aten::_local_scalar_dense",
+})
+_PROFILER_SYNC_RE = re.compile(r"^profiler_sync:(\w+)$")
+
+
+def heuristic_sync_wait_attrs(event_name: str) -> dict[str, str]:
+    attrs = {
+        "wait_exact": "false",
+        "wait_source": "kineto_sync_frontier",
+    }
+    if event_name in _CUDA_EVENT_SYNC_EVENT_NAMES:
+        attrs["wait_kind"] = "event_sync"
+    elif event_name in _CUDA_STREAM_SYNC_EVENT_NAMES:
+        attrs["wait_kind"] = "stream_sync"
+    elif event_name in _CUDA_DEVICE_SYNC_EVENT_NAMES:
+        attrs["wait_kind"] = "device_sync"
+    return attrs
+
+
+def wait_kind_for_sync_event(event_name: str) -> str:
+    if event_name in _CUDA_EVENT_SYNC_EVENT_NAMES:
+        return "event_sync"
+    if event_name in _CUDA_STREAM_SYNC_EVENT_NAMES:
+        return "stream_sync"
+    if event_name in _CUDA_DEVICE_SYNC_EVENT_NAMES:
+        return "device_sync"
+    if event_name in _CUDA_STREAM_WAIT_EVENT_NAMES or event_name.startswith(
+        "cudaStreamWaitEvent"
+    ):
+        return "wait_event"
+    return ""
+
+
+def _collect_cpu_descendant_ids(
+    parent_id: int,
+    parent_to_children: dict[int, list[int]],
+) -> list[int]:
+    descendants: list[int] = []
+    stack = list(parent_to_children.get(parent_id, ()))
+    while stack:
+        event_id = stack.pop()
+        descendants.append(event_id)
+        stack.extend(parent_to_children.get(event_id, ()))
+    return descendants
+
+
+def find_profiler_sync_excluded_cpu_event_ids(raw_events: list[Any]) -> set[int]:
+    """Return CUDA sync leaves nested under profiler_sync:* markers."""
+    from torch.autograd import DeviceType
+
+    _child_to_parent, parent_to_children, event_by_id = _build_cpu_parent_child_maps(
+        raw_events
+    )
+    excluded: set[int] = set()
+    for event in raw_events:
+        if event.device_type() != DeviceType.CPU:
+            continue
+        if _PROFILER_SYNC_RE.match(event.name()) is None:
+            continue
+        for event_id in _collect_cpu_descendant_ids(id(event), parent_to_children):
+            descendant = event_by_id.get(event_id)
+            if descendant is None:
+                continue
+            if wait_kind_for_sync_event(descendant.name()):
+                excluded.add(event_id)
+    return excluded
+
+
+def _nearest_aten_exact_sync_parent_id(
+    event_id: int,
+    child_to_parent: dict[int, int],
+    event_by_id: dict[int, Any],
+) -> int | None:
+    current = child_to_parent.get(event_id)
+    while current is not None:
+        event = event_by_id.get(current)
+        if event is not None and event.name() in _ATEN_PARENT_SCOPE_EXACT_SYNC_NAMES:
+            return current
+        current = child_to_parent.get(current)
+    return None
+
+
+def _gpu_events_linked_to_cpu_submit_descendants(
+    *,
+    gpu_events: list[Any],
+    cpu_descendants: list[Any],
+    parent_event: Any,
+    sync_event: Any,
+    node_ids: dict[int, str],
+) -> list[Any]:
+    submit_corr_ids: set[int] = set()
+    for event in cpu_descendants:
+        if event.name() not in _CUDA_ASYNC_SUBMIT_EVENT_NAMES:
+            continue
+        corr_id = event.correlation_id()
+        if corr_id > 0:
+            submit_corr_ids.add(corr_id)
+    if not submit_corr_ids:
+        return []
+
+    candidates: list[Any] = []
+    for gpu_event in gpu_events:
+        if id(gpu_event) not in node_ids:
+            continue
+        gpu_corr_ids = {
+            cid
+            for cid in (
+                gpu_event.correlation_id(),
+                gpu_event.linked_correlation_id(),
+            )
+            if cid > 0
+        }
+        if not gpu_corr_ids & submit_corr_ids:
+            continue
+        if gpu_event.start_ns() < parent_event.start_ns():
+            continue
+        if gpu_event.end_ns() > sync_event.end_ns():
+            continue
+        candidates.append(gpu_event)
+    return candidates
+
+
+def _select_aten_exact_wait_sources(
+    sync_event: Any,
+    candidate_gpu_events: list[Any],
+) -> list[Any]:
+    if not candidate_gpu_events:
+        return []
+
+    gpu_stream_resource_ids = {
+        event.device_resource_id() for event in candidate_gpu_events
+    }
+    if sync_event.name() == "cudaStreamSynchronize":
+        if sync_event.device_resource_id() in gpu_stream_resource_ids:
+            candidate_gpu_events = [
+                event
+                for event in candidate_gpu_events
+                if event.device_resource_id() == sync_event.device_resource_id()
+            ]
+        elif len(gpu_stream_resource_ids) != 1:
+            return []
+    elif sync_event.name() == "cudaDeviceSynchronize":
+        # A device sync waits all streams. Parent-scope evidence alone does not
+        # prove unrelated earlier stream work, so do not mark it exact here.
+        return []
+
+    latest_by_stream: dict[tuple[Any, int, int], Any] = {}
+    for event in candidate_gpu_events:
+        key = (
+            event.device_type(),
+            event.device_index(),
+            event.device_resource_id(),
+        )
+        current = latest_by_stream.get(key)
+        if current is None or raw_event_sort_key(current) < raw_event_sort_key(event):
+            latest_by_stream[key] = event
+    return sorted(latest_by_stream.values(), key=raw_event_sort_key)
+
+
+def build_llamasim_aten_sync_wait_edges(
+    node_ids: dict[int, str],
+    cpu_events: list[Any],
+    gpu_events: list[Any],
+    raw_events: list[Any],
+    runtime_role_by_event_id: dict[int, str],
+) -> tuple[
+    list[tuple[str, str, str]],
+    dict[int, str],
+    set[int],
+    dict[tuple[str, str], dict[str, str]],
+]:
+    """Build exact wait edges for synchronous ATen runtime waits.
+
+    These are sync leaves inside allowlisted ATen parent scopes where the same
+    parent also launched the GPU memcpy/kernel being synchronized.
+    """
+    child_to_parent, parent_to_children, event_by_id = _build_cpu_parent_child_maps(
+        raw_events
+    )
+    edges: list[tuple[str, str, str]] = []
+    updated_roles = dict(runtime_role_by_event_id)
+    handled: set[int] = set()
+    attrs_by_edge: dict[tuple[str, str], dict[str, str]] = {}
+    seen: set[tuple[str, str]] = set()
+
+    for sync_event in cpu_events:
+        if id(sync_event) in updated_roles:
+            continue
+        if id(sync_event) not in node_ids:
+            continue
+        wait_kind = wait_kind_for_sync_event(sync_event.name())
+        if not wait_kind:
+            continue
+        parent_id = _nearest_aten_exact_sync_parent_id(
+            id(sync_event),
+            child_to_parent,
+            event_by_id,
+        )
+        if parent_id is None:
+            continue
+        parent_event = event_by_id[parent_id]
+        cpu_descendants = [
+            event_by_id[event_id]
+            for event_id in _collect_cpu_descendant_ids(
+                parent_id,
+                parent_to_children,
+            )
+            if event_id in event_by_id
+        ]
+        candidates = _gpu_events_linked_to_cpu_submit_descendants(
+            gpu_events=gpu_events,
+            cpu_descendants=cpu_descendants,
+            parent_event=parent_event,
+            sync_event=sync_event,
+            node_ids=node_ids,
+        )
+        source_gpu_events = _select_aten_exact_wait_sources(sync_event, candidates)
+        if not source_gpu_events:
+            continue
+
+        added = False
+        dst = node_ids[id(sync_event)]
+        source_corr_ids: set[int] = set()
+        for source_gpu in source_gpu_events:
+            src = node_ids[id(source_gpu)]
+            pair = (src, dst)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            edges.append((src, dst, "wait"))
+            attrs_by_edge[pair] = {
+                "wait_exact": "true",
+                "wait_source": "aten_parent_scope_exact",
+                "wait_kind": wait_kind,
+                "wait_source_launch_ids": "",
+            }
+            for corr_id in (
+                source_gpu.correlation_id(),
+                source_gpu.linked_correlation_id(),
+            ):
+                if corr_id > 0:
+                    source_corr_ids.add(corr_id)
+            added = True
+        if added:
+            updated_roles[id(sync_event)] = "wait"
+            handled.add(id(sync_event))
+            if source_corr_ids:
+                corr_text = ",".join(str(cid) for cid in sorted(source_corr_ids))
+                for source_gpu in source_gpu_events:
+                    pair = (node_ids[id(source_gpu)], dst)
+                    if pair in attrs_by_edge:
+                        attrs_by_edge[pair]["wait_source_correlation_ids"] = corr_text
+
+    return edges, updated_roles, handled, attrs_by_edge
+
 
 def build_llamasim_sync_wait_edges(
     node_ids: dict[int, str],
@@ -2228,14 +3071,17 @@ def build_llamasim_sync_wait_edges(
 ) -> tuple[list[tuple[str, str, str]], dict[int, str]]:
     from torch.autograd import DeviceType
 
-    gpu_last_by_stream: dict[tuple[Any, int, int], Any] = {}
-    for event in sorted(gpu_events, key=raw_event_sort_key):
+    gpu_events_by_stream: dict[tuple[Any, int, int], list[Any]] = {}
+    for event in gpu_events:
         key = (
             event.device_type(),
             event.device_index(),
             event.device_resource_id(),
         )
-        gpu_last_by_stream[key] = event
+        gpu_events_by_stream.setdefault(key, []).append(event)
+    for stream_events in gpu_events_by_stream.values():
+        stream_events.sort(key=raw_event_sort_key)
+    gpu_stream_resource_ids = {key[2] for key in gpu_events_by_stream}
 
     sync_wait_edges: list[tuple[str, str, str]] = []
     updated_roles = dict(runtime_role_by_event_id)
@@ -2249,17 +3095,27 @@ def build_llamasim_sync_wait_edges(
         if id(cpu_event) not in node_ids:
             continue
 
-        added = False
-        for stream_key, last_gpu in gpu_last_by_stream.items():
-            if last_gpu.end_ns() > cpu_event.end_ns():
-                continue
+        source_gpu_events: list[Any] = []
+        for stream_key, stream_events in gpu_events_by_stream.items():
             if cpu_event.name() == "cudaStreamSynchronize":
-                # Only wait on the specific stream matching this sync's resource.
-                # The CPU-side cudaStreamSynchronize correlation_id matches the
-                # stream it synchronizes; use device_resource_id as a heuristic.
-                if last_gpu.device_resource_id() != cpu_event.device_resource_id():
+                # Kineto does not reliably expose the synchronized CUDA stream
+                # on the CPU event.  When it does, restrict to that stream;
+                # otherwise fall back to the latest completed event per stream.
+                if (
+                    cpu_event.device_resource_id() in gpu_stream_resource_ids
+                    and stream_key[2] != cpu_event.device_resource_id()
+                ):
                     continue
-            edge = (node_ids[id(last_gpu)], node_ids[id(cpu_event)], "wait")
+            completed = [
+                event for event in stream_events if event.end_ns() <= cpu_event.end_ns()
+            ]
+            if not completed:
+                continue
+            source_gpu_events.append(max(completed, key=raw_event_sort_key))
+
+        added = False
+        for source_gpu in source_gpu_events:
+            edge = (node_ids[id(source_gpu)], node_ids[id(cpu_event)], "wait")
             if edge in seen_pairs:
                 continue
             seen_pairs.add(edge)
@@ -2319,15 +3175,407 @@ def _propagate_parent_tensor_io(
     }
 
 
+_WS_LAUNCH_RE = re.compile(r"^ws_launch:(\d+):(\d+)$")
+
+
+def build_ws_launch_index(
+    raw_events: list[Any],
+) -> dict[int, tuple[int, int]]:
+    """Map ``id(event) → (graph_id, launch_id)`` via ws_launch markers.
+
+    ``LaunchMarkerLine`` (wrapper.py) emits ``record_function("ws_launch:{graph_id}:{launch_id}")``
+    wrapping each compute line.  In the Kineto trace this creates a CPU
+    parent event.  GPU kernels link back via ``linked_correlation_id``.
+    We walk these chains to propagate the IDs to every event.
+    """
+    from torch.autograd import DeviceType
+
+    # 1. Identify ws_launch CPU markers.
+    ws_markers: dict[int, tuple[int, int]] = {}
+    for event in raw_events:
+        m = _WS_LAUNCH_RE.match(event.name())
+        if m and event.device_type() == DeviceType.CPU:
+            ws_markers[id(event)] = (int(m.group(1)), int(m.group(2)))
+
+    if not ws_markers:
+        return {}
+
+    # 2. Build child→parent map using CPU event nesting (same algorithm as
+    #    build_kineto_runtime_graph lines 1346-1360).
+    cpu_sync_events_by_thread: dict[int, list[Any]] = {}
+    for event in raw_events:
+        is_async = event.is_async() or (
+            event.start_thread_id() != event.end_thread_id()
+        )
+        if event.device_type() == DeviceType.CPU and not is_async:
+            cpu_sync_events_by_thread.setdefault(
+                event.start_thread_id(), []
+            ).append(event)
+
+    child_to_parent: dict[int, int] = {}
+    for thread_events in cpu_sync_events_by_thread.values():
+        thread_events.sort(key=lambda e: (e.start_ns(), -e.end_ns()))
+        stack: list[Any] = []
+        for event in thread_events:
+            while stack:
+                parent = stack[-1]
+                if (
+                    event.start_ns() >= parent.end_ns()
+                    or event.end_ns() > parent.end_ns()
+                ):
+                    stack.pop()
+                else:
+                    child_to_parent[id(event)] = id(parent)
+                    break
+            stack.append(event)
+
+    # 3. Build correlation_id → id(event) for CPU events.
+    corr_to_event_id: dict[int, int] = {}
+    for event in raw_events:
+        if event.device_type() == DeviceType.CPU:
+            cid = event.correlation_id()
+            if cid > 0:
+                corr_to_event_id[cid] = id(event)
+
+    # 4. For each event, resolve its ws_launch ancestor.
+    def _walk_to_ws_marker(event_id: int) -> tuple[int, int] | None:
+        cur = event_id
+        while cur is not None:
+            hit = ws_markers.get(cur)
+            if hit is not None:
+                return hit
+            cur = child_to_parent.get(cur)
+        return None
+
+    index: dict[int, tuple[int, int]] = {}
+    for event in raw_events:
+        eid = id(event)
+        if event.device_type() == DeviceType.CPU:
+            resolved = _walk_to_ws_marker(eid)
+        else:
+            # GPU event: find CPU launch parent via linked_correlation_id.
+            linked = event.linked_correlation_id()
+            cpu_eid = corr_to_event_id.get(linked) if linked > 0 else None
+            resolved = _walk_to_ws_marker(cpu_eid) if cpu_eid is not None else None
+        if resolved is not None:
+            index[eid] = resolved
+
+    return index
+
+
+_WS_SYNC_RE = re.compile(r"^ws_sync:(\d+):(\d+):(\w+):(.*)$")
+
+
+@dataclass(frozen=True)
+class WsSyncInfo:
+    graph_id: int
+    sync_id: int
+    kind: str  # "device_sync" | "stream_sync" | "wait_event" | "event_sync"
+    src_launch_ids: tuple[int, ...]
+
+
+def _build_cpu_parent_child_maps(
+    raw_events: list[Any],
+) -> tuple[dict[int, int], dict[int, list[int]], dict[int, Any]]:
+    from torch.autograd import DeviceType
+
+    event_by_id = {id(event): event for event in raw_events}
+    cpu_sync_events_by_thread: dict[int, list[Any]] = {}
+    for event in raw_events:
+        is_async = event.is_async() or (
+            event.start_thread_id() != event.end_thread_id()
+        )
+        if event.device_type() == DeviceType.CPU and not is_async:
+            cpu_sync_events_by_thread.setdefault(
+                event.start_thread_id(), []
+            ).append(event)
+
+    child_to_parent: dict[int, int] = {}
+    parent_to_children: dict[int, list[int]] = {}
+    for thread_events in cpu_sync_events_by_thread.values():
+        thread_events.sort(key=lambda e: (e.start_ns(), -e.end_ns()))
+        stack: list[Any] = []
+        for event in thread_events:
+            while stack:
+                parent = stack[-1]
+                if (
+                    event.start_ns() >= parent.end_ns()
+                    or event.end_ns() > parent.end_ns()
+                ):
+                    stack.pop()
+                else:
+                    child_id = id(event)
+                    parent_id = id(parent)
+                    child_to_parent[child_id] = parent_id
+                    parent_to_children.setdefault(parent_id, []).append(child_id)
+                    break
+            stack.append(event)
+
+    return child_to_parent, parent_to_children, event_by_id
+
+
+def _cpu_event_depth(event_id: int, child_to_parent: dict[int, int]) -> int:
+    depth = 0
+    current = event_id
+    while current in child_to_parent:
+        depth += 1
+        current = child_to_parent[current]
+    return depth
+
+
+def _is_ws_sync_leaf_for_kind(event_name: str, kind: str) -> bool:
+    if kind == "device_sync":
+        return event_name in _CUDA_DEVICE_SYNC_EVENT_NAMES
+    if kind == "stream_sync":
+        return event_name in _CUDA_STREAM_SYNC_EVENT_NAMES
+    if kind == "wait_event":
+        return event_name in _CUDA_STREAM_WAIT_EVENT_NAMES or event_name.startswith(
+            "cudaStreamWaitEvent"
+        )
+    if kind == "event_sync":
+        return event_name in _CUDA_EVENT_SYNC_EVENT_NAMES
+    return False
+
+
+def build_ws_sync_index(raw_events: list[Any]) -> dict[int, WsSyncInfo]:
+    """Parse ws_sync:* markers and map id(event) -> WsSyncInfo."""
+    from torch.autograd import DeviceType
+
+    index: dict[int, WsSyncInfo] = {}
+    for event in raw_events:
+        if event.device_type() != DeviceType.CPU:
+            continue
+        m = _WS_SYNC_RE.match(event.name())
+        if m is None:
+            continue
+        ids_str = m.group(4)
+        src_ids = tuple(int(x) for x in ids_str.split(",") if x)
+        index[id(event)] = WsSyncInfo(
+            graph_id=int(m.group(1)),
+            sync_id=int(m.group(2)),
+            kind=m.group(3),
+            src_launch_ids=src_ids,
+        )
+    return index
+
+
+def propagate_ws_sync_to_leaf_events(
+    raw_events: list[Any],
+    ws_sync_marker_index: dict[int, WsSyncInfo],
+) -> dict[int, WsSyncInfo]:
+    """Attach ws_sync marker metadata to the actual CUDA sync child event.
+
+    ``record_function("ws_sync:*")`` appears as a CPU parent range.  The
+    LLaMASim runtime graph keeps CPU leaves, so exact wait edges must point to
+    the child Kineto event such as ``cudaDeviceSynchronize`` rather than the
+    marker range.
+    """
+    if not ws_sync_marker_index:
+        return {}
+
+    child_to_parent, parent_to_children, event_by_id = _build_cpu_parent_child_maps(
+        raw_events
+    )
+    leaf_index: dict[int, WsSyncInfo] = {}
+
+    for marker_id, sync_info in ws_sync_marker_index.items():
+        descendants: list[int] = []
+        stack = list(parent_to_children.get(marker_id, ()))
+        while stack:
+            event_id = stack.pop()
+            descendants.append(event_id)
+            stack.extend(parent_to_children.get(event_id, ()))
+
+        candidates = [
+            event_by_id[event_id]
+            for event_id in descendants
+            if event_id in event_by_id
+            and _is_ws_sync_leaf_for_kind(
+                event_by_id[event_id].name(),
+                sync_info.kind,
+            )
+        ]
+        if not candidates:
+            continue
+
+        leaf = min(
+            candidates,
+            key=lambda event: (
+                -_cpu_event_depth(id(event), child_to_parent),
+                event.duration_ns(),
+                event.start_ns(),
+                event.end_ns(),
+                event.name(),
+            ),
+        )
+        leaf_index[id(leaf)] = sync_info
+
+    return leaf_index
+
+
+def collect_ws_sync_unmatched_marker_samples(
+    raw_events: list[Any],
+    ws_sync_marker_index: dict[int, WsSyncInfo],
+    ws_sync_leaf_index: dict[int, WsSyncInfo],
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    if not ws_sync_marker_index:
+        return []
+
+    _child_to_parent, parent_to_children, event_by_id = _build_cpu_parent_child_maps(
+        raw_events
+    )
+    matched_leaf_ids = set(ws_sync_leaf_index)
+    samples: list[dict[str, Any]] = []
+    for marker_id, sync_info in sorted(
+        ws_sync_marker_index.items(),
+        key=lambda item: (item[1].graph_id, item[1].sync_id),
+    ):
+        descendants: list[int] = []
+        stack = list(parent_to_children.get(marker_id, ()))
+        while stack:
+            event_id = stack.pop()
+            descendants.append(event_id)
+            stack.extend(parent_to_children.get(event_id, ()))
+        if any(event_id in matched_leaf_ids for event_id in descendants):
+            continue
+
+        child_names: list[str] = []
+        for event_id in sorted(
+            descendants,
+            key=lambda eid: (
+                event_by_id[eid].start_ns(),
+                event_by_id[eid].end_ns(),
+                event_by_id[eid].name(),
+            ),
+        ):
+            name = event_by_id[event_id].name()
+            if name not in child_names:
+                child_names.append(name)
+            if len(child_names) >= 8:
+                break
+        marker = event_by_id.get(marker_id)
+        samples.append({
+            "marker": marker.name() if marker is not None else "",
+            "kind": sync_info.kind,
+            "src_launch_ids": ",".join(
+                str(launch_id) for launch_id in sync_info.src_launch_ids
+            ),
+            "child_cpu_event_names": child_names,
+        })
+        if len(samples) >= limit:
+            break
+    return samples
+
+
+def collect_ws_sync_unresolved_launch_samples(
+    gpu_events: list[Any],
+    ws_launch_index: dict[int, tuple[int, int]],
+    ws_sync_index: dict[int, WsSyncInfo],
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    resolved_launches = {
+        ws_launch_index[id(event)]
+        for event in gpu_events
+        if id(event) in ws_launch_index
+    }
+    samples: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, str, tuple[int, ...]]] = set()
+    for sync_info in sorted(
+        ws_sync_index.values(),
+        key=lambda info: (info.graph_id, info.sync_id, info.kind),
+    ):
+        missing = tuple(
+            launch_id
+            for launch_id in sync_info.src_launch_ids
+            if (sync_info.graph_id, launch_id) not in resolved_launches
+        )
+        if not missing:
+            continue
+        key = (sync_info.graph_id, sync_info.sync_id, sync_info.kind, missing)
+        if key in seen:
+            continue
+        seen.add(key)
+        samples.append({
+            "graph_id": sync_info.graph_id,
+            "sync_id": sync_info.sync_id,
+            "kind": sync_info.kind,
+            "missing_launch_ids": ",".join(str(launch_id) for launch_id in missing),
+        })
+        if len(samples) >= limit:
+            break
+    return samples
+
+
+def build_llamasim_exact_wait_edges(
+    node_ids: dict[int, str],
+    cpu_events: list[Any],
+    gpu_events: list[Any],
+    ws_launch_index: dict[int, tuple[int, int]],
+    ws_sync_index: dict[int, WsSyncInfo],
+    runtime_role_by_event_id: dict[int, str],
+) -> tuple[list[tuple[str, str, str]], dict[int, str], set[int]]:
+    """Build exact wait edges from ws_sync markers and ws_launch tags.
+
+    Returns (edges, updated_roles, handled_cpu_event_ids).
+    """
+    # Reverse lookup: (graph_id, launch_id) -> list of GPU events
+    gpu_by_launch: dict[tuple[int, int], list[Any]] = {}
+    for event in gpu_events:
+        key = ws_launch_index.get(id(event))
+        if key is not None:
+            gpu_by_launch.setdefault(key, []).append(event)
+
+    edges: list[tuple[str, str, str]] = []
+    updated_roles = dict(runtime_role_by_event_id)
+    handled: set[int] = set()
+    seen: set[tuple[str, str]] = set()
+
+    for cpu_event in cpu_events:
+        sync_info = ws_sync_index.get(id(cpu_event))
+        if sync_info is None:
+            continue
+        if id(cpu_event) not in node_ids:
+            continue
+        if id(cpu_event) in updated_roles:
+            continue
+
+        cpu_node_id = node_ids[id(cpu_event)]
+        added = False
+        for lid in sync_info.src_launch_ids:
+            for gpu_event in gpu_by_launch.get(
+                (sync_info.graph_id, lid), []
+            ):
+                if id(gpu_event) not in node_ids:
+                    continue
+                gpu_node_id = node_ids[id(gpu_event)]
+                pair = (gpu_node_id, cpu_node_id)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                edges.append((gpu_node_id, cpu_node_id, "wait"))
+                added = True
+        if added:
+            updated_roles[id(cpu_event)] = "wait"
+            handled.add(id(cpu_event))
+
+    return edges, updated_roles, handled
+
+
 def write_llamasim_runtime_bundle(
     prof: Any,
     execution_trace_path: Path,
     output_dir: Path,
+    *,
+    trace_json_path: Path | None = None,
 ) -> None:
     from torch.autograd import DeviceType
     from torch.autograd.profiler_util import _rewrite_name
 
     trace_start_ns, raw_events = get_raw_kineto_events(prof)
+    ws_launch_index = build_ws_launch_index(raw_events)
     execution_nodes = load_execution_trace_nodes(execution_trace_path)
     matched_execution_node_by_event, match_errors, match_warnings = (
         match_execution_nodes_to_gpu_kernels(raw_events, execution_nodes)
@@ -2353,8 +3601,38 @@ def write_llamasim_runtime_bundle(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    ac2g_endpoints = (
+        parse_ac2g_flow_endpoints(trace_json_path)
+        if trace_json_path is not None
+        else None
+    )
+    ac2g_ids = ac2g_endpoints.paired_correlation_ids if ac2g_endpoints else set()
+    ac2g_matches: Ac2gRawEventMatches | None = None
+    exact_submit_cpu_event_ids: set[int] = set()
+    if ac2g_endpoints is not None and ac2g_ids:
+        ac2g_matches = match_ac2g_endpoints_to_raw_events(
+            raw_events,
+            ac2g_endpoints,
+            trace_start_ns=trace_start_ns,
+        )
+        if ac2g_matches.errors:
+            raise RuntimeError(
+                "llamasim runtime export could not exactly resolve Chrome ac2g endpoints.\n"
+                + _format_ac2g_match_errors(ac2g_matches.errors)
+            )
+        exact_submit_cpu_event_ids = {
+            id(pair.cpu_event) for pair in ac2g_matches.pairs_by_corr_id.values()
+        }
+
+    profiler_sync_excluded_cpu_event_ids = find_profiler_sync_excluded_cpu_event_ids(
+        raw_events
+    )
     selected_events, selected_cpu_events, selected_gpu_events = (
-        select_llamasim_runtime_events(raw_events)
+        select_llamasim_runtime_events(
+            raw_events,
+            extra_cpu_event_ids=exact_submit_cpu_event_ids,
+            exclude_cpu_event_ids=profiler_sync_excluded_cpu_event_ids,
+        )
     )
 
     node_ids = {id(event): f"k{index}" for index, event in enumerate(selected_events)}
@@ -2367,13 +3645,76 @@ def write_llamasim_runtime_bundle(
     stream_order_edges = build_llamasim_stream_order_edges(
         node_ids, selected_gpu_events
     )
-    submit_edges, runtime_role_by_event_id = build_llamasim_submit_edges(
-        node_ids,
-        selected_cpu_events,
-        selected_gpu_events,
+    if ac2g_ids:
+        submit_edges, runtime_role_by_event_id, submit_edge_attrs = (
+            build_llamasim_submit_edges_from_ac2g(
+                node_ids,
+                selected_cpu_events,
+                selected_gpu_events,
+                raw_events,
+                ac2g_ids,
+                ac2g_endpoints=ac2g_endpoints,
+                trace_start_ns=trace_start_ns,
+                ac2g_matches=ac2g_matches,
+                strict=True,
+            )
+        )
+        submit_edge_provenance = "ac2g_endpoint_exact"
+    else:
+        submit_edges, runtime_role_by_event_id = build_llamasim_submit_edges(
+            node_ids,
+            selected_cpu_events,
+            selected_gpu_events,
+            raw_events,
+        )
+        submit_edge_attrs = {}
+        submit_edge_provenance = "correlation_id_heuristic"
+    # Exact wait edges from ws_sync markers (takes priority over heuristics).
+    # ws_sync record_function events are parents; propagate their metadata to
+    # the actual CUDA sync/wait leaf nodes selected in the runtime graph.
+    ws_sync_marker_index = build_ws_sync_index(raw_events)
+    ws_sync_index = propagate_ws_sync_to_leaf_events(
         raw_events,
+        ws_sync_marker_index,
     )
-    wait_edges, runtime_role_by_event_id = build_llamasim_wait_edges(
+    exact_wait_edges: list[tuple[str, str, str]] = []
+    exact_handled_ids: set[int] = set()
+    if ws_sync_index:
+        exact_wait_edges, runtime_role_by_event_id, exact_handled_ids = (
+            build_llamasim_exact_wait_edges(
+                node_ids,
+                selected_cpu_events,
+                selected_gpu_events,
+                ws_launch_index,
+                ws_sync_index,
+                runtime_role_by_event_id,
+            )
+        )
+    ws_sync_unmatched_marker_samples = collect_ws_sync_unmatched_marker_samples(
+        raw_events,
+        ws_sync_marker_index,
+        ws_sync_index,
+    )
+    ws_sync_unresolved_launch_samples = collect_ws_sync_unresolved_launch_samples(
+        selected_gpu_events,
+        ws_launch_index,
+        ws_sync_index,
+    )
+    ws_sync_empty_source_count = sum(
+        1 for sync_info in ws_sync_index.values() if not sync_info.src_launch_ids
+    )
+    aten_exact_wait_edges, runtime_role_by_event_id, _aten_handled_ids, aten_wait_attrs = (
+        build_llamasim_aten_sync_wait_edges(
+            node_ids,
+            selected_cpu_events,
+            selected_gpu_events,
+            raw_events,
+            runtime_role_by_event_id,
+        )
+    )
+
+    # Heuristic wait edges (fallback for events not handled by exact path)
+    linked_wait_edges, runtime_role_by_event_id = build_llamasim_wait_edges(
         node_ids,
         selected_cpu_events,
         selected_gpu_events,
@@ -2385,7 +3726,62 @@ def write_llamasim_runtime_bundle(
         selected_gpu_events,
         runtime_role_by_event_id,
     )
-    wait_edges.extend(sync_wait_edges)
+
+    # Provenance: track which edges are exact vs heuristic
+    wait_edge_attrs: dict[tuple[str, str], dict[str, str]] = {}
+    for src, dst, _ in exact_wait_edges:
+        sync_info = None
+        for cpu_event in selected_cpu_events:
+            if node_ids.get(id(cpu_event)) == dst:
+                sync_info = ws_sync_index.get(id(cpu_event))
+                break
+        attr: dict[str, str] = {
+            "wait_exact": "true",
+            "wait_source": "wrapper_ws_sync",
+        }
+        if sync_info is not None:
+            attr["wait_kind"] = sync_info.kind
+            attr["wait_source_launch_ids"] = ",".join(
+                str(lid) for lid in sync_info.src_launch_ids
+            )
+        wait_edge_attrs[(src, dst)] = attr
+    for src, dst, _ in aten_exact_wait_edges:
+        attrs = aten_wait_attrs.get((src, dst))
+        if attrs is not None:
+            wait_edge_attrs[(src, dst)] = attrs
+    for src, dst, _ in linked_wait_edges:
+        if (src, dst) not in wait_edge_attrs:
+            wait_edge_attrs[(src, dst)] = {
+                "wait_exact": "false",
+                "wait_source": "linked_family_heuristic",
+            }
+    for src, dst, _ in sync_wait_edges:
+        if (src, dst) not in wait_edge_attrs:
+            for cpu_event in selected_cpu_events:
+                if node_ids.get(id(cpu_event)) == dst:
+                    wait_edge_attrs[(src, dst)] = heuristic_sync_wait_attrs(
+                        cpu_event.name()
+                    )
+                    break
+            else:
+                wait_edge_attrs[(src, dst)] = {
+                    "wait_exact": "false",
+                    "wait_source": "kineto_sync_frontier",
+                }
+
+    # Merge: exact edges first, then heuristic
+    exact_wait_edges = exact_wait_edges + aten_exact_wait_edges
+    heuristic_wait_edges = linked_wait_edges + sync_wait_edges
+    wait_edges = exact_wait_edges + heuristic_wait_edges
+    wait_source_counts: dict[str, int] = {}
+    wait_kind_counts: dict[str, int] = {}
+    for attrs in wait_edge_attrs.values():
+        source = attrs.get("wait_source", "")
+        if source:
+            wait_source_counts[source] = wait_source_counts.get(source, 0) + 1
+        kind = attrs.get("wait_kind", "")
+        if kind:
+            wait_kind_counts[kind] = wait_kind_counts.get(kind, 0) + 1
 
     tensor_records: dict[str, dict[str, Any]] = {}
     input_edges: list[tuple[str, str]] = []
@@ -2557,6 +3953,10 @@ def write_llamasim_runtime_bundle(
                 attrs.append(f'rf_id="{rf_id}"')
             if isinstance(kernel_file, str) and kernel_file:
                 attrs.append(f'kernel_file="{dot_escape(Path(kernel_file).name)}"')
+            ws = ws_launch_index.get(id(event))
+            if ws is not None:
+                attrs.append(f'compiled_graph_id="{ws[0]}"')
+                attrs.append(f'compiled_launch_id="{ws[1]}"')
             f.write(f'  "{node_id}" [ ' + "; ".join(attrs) + "; ]\n")
 
         for tensor_index, tensor_key in enumerate(tensor_keys_in_order):
@@ -2626,6 +4026,8 @@ def write_llamasim_runtime_bundle(
             "resource_kind",
             "resource_id",
             "runtime_role",
+            "compiled_graph_id",
+            "compiled_launch_id",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -2645,6 +4047,7 @@ def write_llamasim_runtime_bundle(
                 if event.device_type() == DeviceType.CPU
                 else event.device_resource_id()
             )
+            ws = ws_launch_index.get(id(event))
             writer.writerow(
                 {
                     "step": 0,
@@ -2681,6 +4084,8 @@ def write_llamasim_runtime_bundle(
                         if event.device_type() == DeviceType.CPU
                         else "gpu_runtime",
                     ),
+                    "compiled_graph_id": ws[0] if ws is not None else "",
+                    "compiled_launch_id": ws[1] if ws is not None else -1,
                 }
             )
 
@@ -2707,12 +4112,15 @@ def write_llamasim_runtime_bundle(
             "rf_id",
             "kernel_file",
             "has_tensor_io",
+            "compiled_graph_id",
+            "compiled_launch_id",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for event in selected_events:
             execution_node = matched_execution_node_by_event.get(id(event))
             rf_id = execution_rf_id(execution_node) if execution_node is not None else None
+            ws = ws_launch_index.get(id(event))
             writer.writerow(
                 {
                     "step": 0,
@@ -2761,6 +4169,8 @@ def write_llamasim_runtime_bundle(
                         else ""
                     ),
                     "has_tensor_io": int(execution_node is not None),
+                    "compiled_graph_id": ws[0] if ws is not None else "",
+                    "compiled_launch_id": ws[1] if ws is not None else -1,
                 }
             )
 
@@ -2770,6 +4180,12 @@ def write_llamasim_runtime_bundle(
             "src_node_id",
             "dst_node_id",
             "edge_kind",
+            "submit_exact",
+            "wait_kind",
+            "wait_exact",
+            "wait_source",
+            "wait_source_launch_ids",
+            "wait_source_correlation_ids",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -2779,14 +4195,19 @@ def write_llamasim_runtime_bundle(
             *submit_edges,
             *wait_edges,
         ]:
-            writer.writerow(
-                {
-                    "step": 0,
-                    "src_node_id": src,
-                    "dst_node_id": dst,
-                    "edge_kind": edge_kind,
-                }
-            )
+            row: dict[str, Any] = {
+                "step": 0,
+                "src_node_id": src,
+                "dst_node_id": dst,
+                "edge_kind": edge_kind,
+            }
+            s_attrs = submit_edge_attrs.get((src, dst))
+            if s_attrs:
+                row.update(s_attrs)
+            attrs = wait_edge_attrs.get((src, dst))
+            if attrs:
+                row.update(attrs)
+            writer.writerow(row)
         for tensor_key, node_id in input_edges:
             writer.writerow(
                 {
@@ -2885,7 +4306,7 @@ def write_llamasim_runtime_bundle(
 
     manifest = {
         "schema": "pytorch_runtime_v3",
-        "compute_node_scope": "cpu_leaf_plus_all_gpu_runtime",
+        "compute_node_scope": "cpu_leaf_plus_exact_submit_plus_all_gpu_runtime",
         "tensor_io_scope": "cpu_and_gpu",
         "step_dot_files": ["step_0_compute_graph.dot"],
         "timing_csv": timing_csv_path.name,
@@ -2910,7 +4331,40 @@ def write_llamasim_runtime_bundle(
         "cpu_data_input_edge_count": len(input_edges) - gpu_data_input_edge_count,
         "cpu_data_output_edge_count": len(output_edges) - gpu_data_output_edge_count,
         "submit_edge_count": len(submit_edges),
+        "exact_submit_edge_count": sum(
+            1 for a in submit_edge_attrs.values() if a.get("submit_exact") == "true"
+        ),
+        "heuristic_submit_edge_count": len(submit_edges) - sum(
+            1 for a in submit_edge_attrs.values() if a.get("submit_exact") == "true"
+        ),
+        "submit_edge_provenance": submit_edge_provenance,
+        "ac2g_paired_count": len(ac2g_ids),
+        "ac2g_endpoint_matched_count": (
+            len(ac2g_matches.pairs_by_corr_id) if ac2g_matches is not None else 0
+        ),
+        "ac2g_endpoint_match_error_count": (
+            len(ac2g_matches.errors) if ac2g_matches is not None else 0
+        ),
         "wait_edge_count": len(wait_edges),
+        "exact_wait_edge_count": len(exact_wait_edges),
+        "wrapper_exact_wait_edge_count": (
+            len(exact_wait_edges) - len(aten_exact_wait_edges)
+        ),
+        "aten_exact_wait_edge_count": len(aten_exact_wait_edges),
+        "heuristic_wait_edge_count": len(heuristic_wait_edges),
+        "wait_source_counts": wait_source_counts,
+        "wait_kind_counts": wait_kind_counts,
+        "excluded_wait_source_counts": (
+            {"profiler_sync_excluded": len(profiler_sync_excluded_cpu_event_ids)}
+            if profiler_sync_excluded_cpu_event_ids
+            else {}
+        ),
+        "profiler_sync_excluded_count": len(profiler_sync_excluded_cpu_event_ids),
+        "ws_sync_marker_count": len(ws_sync_marker_index),
+        "ws_sync_leaf_count": len(ws_sync_index),
+        "ws_sync_unmatched_marker_samples": ws_sync_unmatched_marker_samples,
+        "ws_sync_unresolved_launch_samples": ws_sync_unresolved_launch_samples,
+        "ws_sync_empty_source_count": ws_sync_empty_source_count,
         "thread_order_edge_count": len(thread_order_edges),
         "stream_order_edge_count": len(stream_order_edges),
         "match_warning_count": len(match_warnings),
@@ -2918,9 +4372,152 @@ def write_llamasim_runtime_bundle(
         "propagation_no_linked_rf_id": propagation_stats["no_linked_rf_id"],
         "propagation_no_execution_node": propagation_stats["no_execution_node"],
         "propagation_ambiguous_rf_id": propagation_stats["ambiguous_rf_id"],
+        "ws_launch_resolved_count": sum(
+            1 for e in selected_events if id(e) in ws_launch_index
+        ),
+        "ws_launch_unresolved_count": sum(
+            1 for e in selected_events if id(e) not in ws_launch_index
+        ),
         **memory_stats,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _format_count_fraction(exact: Any, total: Any) -> str:
+    exact_int = int(exact or 0)
+    total_int = int(total or 0)
+    if total_int <= 0:
+        return f"{exact_int}/{total_int}"
+    return f"{exact_int}/{total_int} ({(exact_int / total_int) * 100.0:.2f}%)"
+
+
+def _format_count_map(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return "{}"
+    return ", ".join(
+        f"{key}={value[key]}"
+        for key in sorted(value)
+    )
+
+
+def print_llamasim_runtime_summary(bundle_dir: Path) -> None:
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.exists():
+        print("llamasim_runtime_summary: manifest missing")
+        return
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    wait_source_counts = manifest.get("wait_source_counts")
+    wait_kind_counts = manifest.get("wait_kind_counts")
+    excluded_wait_source_counts = manifest.get("excluded_wait_source_counts") or {}
+    if not wait_source_counts or not wait_kind_counts:
+        edge_csv_path = bundle_dir / manifest.get("edge_csv", "runtime_edges.csv")
+        if edge_csv_path.exists():
+            wait_source_counts = {}
+            wait_kind_counts = {}
+            with edge_csv_path.open(newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("edge_kind") != "wait":
+                        continue
+                    source = row.get("wait_source", "")
+                    if source:
+                        wait_source_counts[source] = (
+                            wait_source_counts.get(source, 0) + 1
+                        )
+                    kind = row.get("wait_kind", "")
+                    if kind:
+                        wait_kind_counts[kind] = wait_kind_counts.get(kind, 0) + 1
+    submit_total = manifest.get("submit_edge_count", 0)
+    submit_exact = manifest.get("exact_submit_edge_count", 0)
+    wait_total = manifest.get("wait_edge_count", 0)
+    wait_exact = manifest.get("exact_wait_edge_count", 0)
+
+    print("llamasim_runtime_summary:")
+    print(
+        "  nodes: "
+        f"total={manifest.get('node_count', 0)} "
+        f"gpu={manifest.get('gpu_node_count', 0)} "
+        f"cpu={manifest.get('cpu_node_count', 0)}"
+    )
+    print(
+        "  submit_edges: "
+        f"exact={_format_count_fraction(submit_exact, submit_total)} "
+        f"heuristic={manifest.get('heuristic_submit_edge_count', 0)} "
+        f"provenance={manifest.get('submit_edge_provenance', '')}"
+    )
+    print(
+        "  ac2g: "
+        f"paired={manifest.get('ac2g_paired_count', 0)} "
+        f"matched={manifest.get('ac2g_endpoint_matched_count', 0)} "
+        f"errors={manifest.get('ac2g_endpoint_match_error_count', 0)}"
+    )
+    print(
+        "  wait_edges: "
+        f"exact={_format_count_fraction(wait_exact, wait_total)} "
+        f"heuristic={manifest.get('heuristic_wait_edge_count', 0)}"
+    )
+    print(
+        "  ws_sync: "
+        f"markers={manifest.get('ws_sync_marker_count', 0)} "
+        f"leaves={manifest.get('ws_sync_leaf_count', 0)}"
+    )
+    print(
+        "  wait_sources: "
+        f"{_format_count_map(wait_source_counts)}"
+    )
+    if excluded_wait_source_counts:
+        print(
+            "  excluded_wait_sources: "
+            f"{_format_count_map(excluded_wait_source_counts)}"
+        )
+    print(
+        "  wait_kinds: "
+        f"{_format_count_map(wait_kind_counts)}"
+    )
+    if int(wait_total or 0) > 0 and int(manifest.get("ws_sync_marker_count", 0) or 0) == 0:
+        if int(wait_exact or 0) == 0:
+            print(
+                "  wait_exact_note: wrapper emitted no ws_sync evidence; "
+                "wait edges in this run are heuristic fallback edges"
+            )
+        else:
+            print(
+                "  wait_exact_note: wrapper emitted no ws_sync evidence; "
+                "exact waits came from non-wrapper provenance"
+            )
+    elif (
+        int(manifest.get("ws_sync_marker_count", 0) or 0) > 0
+        and int(manifest.get("ws_sync_leaf_count", 0) or 0) == 0
+    ):
+        print(
+            "  wait_exact_note: ws_sync markers were emitted but not matched "
+            "to CUDA sync leaf events"
+        )
+        samples = manifest.get("ws_sync_unmatched_marker_samples") or []
+        if samples:
+            print(
+                "  ws_sync_unmatched_marker_samples: "
+                f"{json.dumps(samples[:3], sort_keys=True)}"
+            )
+    elif (
+        int(manifest.get("ws_sync_leaf_count", 0) or 0) > 0
+        and int(wait_exact or 0) == 0
+    ):
+        print(
+            "  wait_exact_note: ws_sync leaves were found but no exact wait "
+            "edges were emitted"
+        )
+        unresolved = manifest.get("ws_sync_unresolved_launch_samples") or []
+        if unresolved:
+            print(
+                "  ws_sync_unresolved_launch_samples: "
+                f"{json.dumps(unresolved[:3], sort_keys=True)}"
+            )
+        elif int(manifest.get("ws_sync_empty_source_count", 0) or 0) > 0:
+            print(
+                "  ws_sync_empty_source_count: "
+                f"{manifest.get('ws_sync_empty_source_count', 0)}"
+            )
 
 
 def write_hybrid_profile_dot(prof: Any, dot_path: Path, graph_name: str) -> None:
@@ -3225,6 +4822,8 @@ def main(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_dot_level: str = "none",
+    default_llamasim_output_dirname: str | None = None,
     default_profile_memory: bool = False,
     default_record_shapes: bool = False,
     default_with_stack: bool = False,
@@ -3233,6 +4832,7 @@ def main(
         default_device=default_device,
         default_dtype=default_dtype,
         default_output_prefix=default_output_prefix,
+        default_dot_level=default_dot_level,
         default_profile_memory=default_profile_memory,
         default_record_shapes=default_record_shapes,
         default_with_stack=default_with_stack,
@@ -3245,13 +4845,15 @@ def main(
         args.warmup_runs if args.warmup_runs is not None else int(args.fusion != "none")
     )
     output_paths = resolve_output_paths(
-        args, default_output_prefix
+        args,
+        default_output_prefix,
+        default_llamasim_output_dirname=default_llamasim_output_dirname,
     )
 
     pipe = load_pipeline(args.model, torch_dtype, device)
     if args.disable_progress_bar:
         pipe.set_progress_bar_config(disable=True)
-    maybe_compile(pipe, args)
+    maybe_compile(pipe, args, output_paths)
 
     captured_unet_inputs: dict[str, Any] = {}
     capture_handle = None
@@ -3277,7 +4879,7 @@ def main(
     ) as prof:
         with torch.autograd.profiler.record_function("sdxl_turbo_run", scope_args):
             output = run_pipeline(pipe, args)
-            synchronize_device(device)
+        profiler_synchronize_device(device)
 
     if capture_handle is not None:
         capture_handle.remove()
@@ -3353,6 +4955,7 @@ def main(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
+            trace_json_path=output_paths.trace_path,
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
@@ -3386,6 +4989,7 @@ def main(
         print("runtime_io_dot_path:", output_paths.runtime_io_dot_path)
     if output_paths.llamasim_output_dir is not None:
         print("llamasim_output_dir:", output_paths.llamasim_output_dir)
+        print_llamasim_runtime_summary(output_paths.llamasim_output_dir)
     print("latent_shape:", tuple(output.images.shape))
     print("metadata_json:", metadata_json)
     if metadata_json:

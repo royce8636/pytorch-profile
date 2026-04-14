@@ -31,6 +31,16 @@ These are loaded in:
 The important point is that the bundle contains profiled runtime nodes and
 dependencies, but it usually does **not** contain an explicit SSD lane.
 
+The current splitter also requires strict per-node timing identity:
+
+- `ggml_profile_node_records.csv` must contain `node_id`
+- each timing row must map one-to-one to a `runtime_nodes.csv` row
+- the script does **not** fall back to name-only timing lookup anymore
+
+This was necessary because bundles often contain thousands of repeated names
+like `aten::to` or `cudaMemcpyAsync`, and name-only lookup silently corrupts
+the totals.
+
 ## What Counts as a Transfer
 
 Direct transfer-like nodes are detected by name pattern matching in

@@ -1469,6 +1469,7 @@ class _InProcessFxCompile(FxCompile):
                     const_module=const_graph,
                     inputs_to_check=inputs_to_check,
                     fx_wrapper=fx_wrapper,
+                    static_input_idxs=static_input_idxs,
                 )
                 metrics_helper = metrics.CachedMetricsHelper()
 

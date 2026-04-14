@@ -1,0 +1,10 @@
+{
+  "graphs": [
+    {
+      "graph_id": 0,
+      "launch_map": "compiled_launch_map_graph0.json",
+      "tensor_map": "compiled_tensor_map_graph0.json",
+      "compilation_hash": "590724f61bcdceed"
+    }
+  ]
+}

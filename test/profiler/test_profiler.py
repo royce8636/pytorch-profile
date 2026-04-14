@@ -7,11 +7,13 @@ import csv
 import gc
 import io
 import importlib.util
+import argparse
 import builtins
 import json
 import mmap
 import os
 import pickle
+from pathlib import Path
 import random
 import re
 import struct
@@ -2988,6 +2990,101 @@ def _load_run_qwen_image():
     return module
 
 
+def _load_run_sdxl_turbo_gpu():
+    module_name = "_test_run_sdxl_turbo_gpu"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "run_sdxl_turbo_gpu.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_run_accelerate_cpu_offload():
+    module_name = "_test_run_accelerate_cpu_offload"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "run_accelerate_cpu_offload.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_run_weight_streaming():
+    module_name = "_test_run_weight_streaming"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "run_weight_streaming.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_profile_accelerate_cpu_offload():
+    module_name = "_test_profile_accelerate_cpu_offload"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "profile_accelerate_cpu_offload.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_demo_profile_time_split():
+    module_name = "_test_demo_profile_time_split"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "demo_profile_time_split.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_split_trace_csv_leaf_events():
     module_name = "_test_split_trace_csv_leaf_events"
     module = sys.modules.get(module_name)
@@ -3007,7 +3104,714 @@ def _load_split_trace_csv_leaf_events():
     return module
 
 
+def _load_verify_llamasim_bundle():
+    module_name = "_test_verify_llamasim_bundle"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "verify_llamasim_bundle.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class TestExperimentalUtils(TestCase):
+    def _write_csv_rows(self, path: Path, fieldnames, rows) -> None:
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _write_synthetic_llamasim_fixture(self, root: Path) -> tuple[Path, object]:
+        verifier = _load_verify_llamasim_bundle()
+        bundle_dir = root / "bundle"
+        profile_dir = root / "profile"
+        bundle_dir.mkdir(parents=True)
+        profile_dir.mkdir(parents=True)
+
+        node_rows = [
+            {
+                "step": 0,
+                "node_id": "k0",
+                "node_n": 0,
+                "node_name": "aten::empty",
+                "op_name": "aten::empty",
+                "node_kind": "cpu_leaf",
+                "resource_kind": "cpu_thread",
+                "resource_id": 1,
+                "runtime_role": "cpu_leaf",
+                "device_type": "CPU",
+                "device_index": 0,
+                "thread_id": 1,
+                "stream_id": 0,
+                "start_ns": 10000,
+                "end_ns": 20000,
+                "duration_ns": 10000,
+                "correlation_id": 2,
+                "linked_correlation_id": 0,
+                "rf_id": "",
+                "kernel_file": "",
+                "has_tensor_io": 0,
+            },
+            {
+                "step": 0,
+                "node_id": "k1",
+                "node_n": 1,
+                "node_name": "cudaLaunchKernel",
+                "op_name": "cudaLaunchKernel",
+                "node_kind": "cpu_leaf",
+                "resource_kind": "cpu_thread",
+                "resource_id": 1,
+                "runtime_role": "submit",
+                "device_type": "CPU",
+                "device_index": 0,
+                "thread_id": 1,
+                "stream_id": 0,
+                "start_ns": 21000,
+                "end_ns": 25000,
+                "duration_ns": 4000,
+                "correlation_id": 3,
+                "linked_correlation_id": 999,
+                "rf_id": "",
+                "kernel_file": "",
+                "has_tensor_io": 0,
+            },
+            {
+                "step": 0,
+                "node_id": "k2",
+                "node_n": 2,
+                "node_name": "triton_kernel_0",
+                "op_name": "triton_kernel_0",
+                "node_kind": "gpu_runtime",
+                "resource_kind": "gpu_stream",
+                "resource_id": 7,
+                "runtime_role": "gpu_runtime",
+                "device_type": "CUDA",
+                "device_index": 0,
+                "thread_id": 1,
+                "stream_id": 7,
+                "start_ns": 26000,
+                "end_ns": 40000,
+                "duration_ns": 14000,
+                "correlation_id": 3,
+                "linked_correlation_id": 999,
+                "rf_id": 999,
+                "kernel_file": "",
+                "has_tensor_io": 1,
+            },
+        ]
+        self._write_csv_rows(
+            bundle_dir / "runtime_nodes.csv",
+            [
+                "step",
+                "node_id",
+                "node_n",
+                "node_name",
+                "op_name",
+                "node_kind",
+                "resource_kind",
+                "resource_id",
+                "runtime_role",
+                "device_type",
+                "device_index",
+                "thread_id",
+                "stream_id",
+                "start_ns",
+                "end_ns",
+                "duration_ns",
+                "correlation_id",
+                "linked_correlation_id",
+                "rf_id",
+                "kernel_file",
+                "has_tensor_io",
+            ],
+            node_rows,
+        )
+
+        edge_rows = [
+            {
+                "step": 0,
+                "src_node_id": "k0",
+                "dst_node_id": "k1",
+                "edge_kind": "thread_order",
+            },
+            {
+                "step": 0,
+                "src_node_id": "k1",
+                "dst_node_id": "k2",
+                "edge_kind": "submit",
+                "submit_exact": "true",
+            },
+            {
+                "step": 0,
+                "src_node_id": "t0",
+                "dst_node_id": "k2",
+                "edge_kind": "data_input",
+            },
+            {
+                "step": 0,
+                "src_node_id": "k2",
+                "dst_node_id": "t1",
+                "edge_kind": "data_output",
+            },
+        ]
+        self._write_csv_rows(
+            bundle_dir / "runtime_edges.csv",
+            [
+                "step",
+                "src_node_id",
+                "dst_node_id",
+                "edge_kind",
+                "submit_exact",
+                "wait_kind",
+                "wait_exact",
+                "wait_source",
+                "wait_source_launch_ids",
+            ],
+            edge_rows,
+        )
+
+        tensor_rows = [
+            {
+                "step": 0,
+                "tensor_n": 0,
+                "tensor_name": "param_1_10",
+                "tensor_node_id": "t0",
+                "tensor_kind": "WEIGHT",
+                "tensor_id": 1,
+                "storage_id": 10,
+                "offset": 0,
+                "numel": 4,
+                "itemsize": 2,
+                "tensor_size_bytes": 8,
+                "device": "cuda",
+                "dtype": "f16",
+                "shape": "[2,2]",
+                "producer_count": 0,
+                "consumer_count": 1,
+            },
+            {
+                "step": 0,
+                "tensor_n": 1,
+                "tensor_name": "cache_2_20",
+                "tensor_node_id": "t1",
+                "tensor_kind": "CONTEXT",
+                "tensor_id": 2,
+                "storage_id": 20,
+                "offset": 0,
+                "numel": 4,
+                "itemsize": 2,
+                "tensor_size_bytes": 8,
+                "device": "cuda",
+                "dtype": "f16",
+                "shape": "[2,2]",
+                "producer_count": 1,
+                "consumer_count": 0,
+            },
+        ]
+        self._write_csv_rows(
+            bundle_dir / "pytorch_runtime_tensors.csv",
+            [
+                "step",
+                "tensor_n",
+                "tensor_name",
+                "tensor_node_id",
+                "tensor_kind",
+                "tensor_id",
+                "storage_id",
+                "offset",
+                "numel",
+                "itemsize",
+                "tensor_size_bytes",
+                "device",
+                "dtype",
+                "shape",
+                "producer_count",
+                "consumer_count",
+            ],
+            tensor_rows,
+        )
+
+        timing_rows = [
+            {
+                "step": 0,
+                "node_n": row["node_n"],
+                "node_name": row["node_name"],
+                "tensor_addr": "",
+                "node_compute_time_ns": row["duration_ns"],
+                "node_tensor_size_bytes": 0,
+                "start_ns": row["start_ns"],
+                "end_ns": row["end_ns"],
+                "node_id": row["node_id"],
+                "device_type": row["device_type"],
+                "device_index": row["device_index"],
+                "thread_id": row["thread_id"],
+                "stream_id": row["stream_id"],
+                "correlation_id": row["correlation_id"],
+                "linked_correlation_id": row["linked_correlation_id"],
+                "rf_id": row["rf_id"],
+                "kernel_file": row["kernel_file"],
+                "node_kind": row["node_kind"],
+                "resource_kind": row["resource_kind"],
+                "resource_id": row["resource_id"],
+                "runtime_role": row["runtime_role"],
+            }
+            for row in node_rows
+        ]
+        self._write_csv_rows(
+            bundle_dir / "ggml_profile_node_records.csv",
+            [
+                "step",
+                "node_n",
+                "node_name",
+                "tensor_addr",
+                "node_compute_time_ns",
+                "node_tensor_size_bytes",
+                "start_ns",
+                "end_ns",
+                "node_id",
+                "device_type",
+                "device_index",
+                "thread_id",
+                "stream_id",
+                "correlation_id",
+                "linked_correlation_id",
+                "rf_id",
+                "kernel_file",
+                "node_kind",
+                "resource_kind",
+                "resource_id",
+                "runtime_role",
+            ],
+            timing_rows,
+        )
+
+        manifest = {
+            "schema": "pytorch_runtime_v3",
+            "compute_node_scope": "cpu_leaf_plus_exact_submit_plus_all_gpu_runtime",
+            "tensor_io_scope": "cpu_and_gpu",
+            "step_dot_files": ["step_0_compute_graph.dot"],
+            "timing_csv": "ggml_profile_node_records.csv",
+            "node_csv": "runtime_nodes.csv",
+            "edge_csv": "runtime_edges.csv",
+            "tensor_csv": "pytorch_runtime_tensors.csv",
+            "trace_start_ns": 0,
+            "node_count": 3,
+            "gpu_node_count": 1,
+            "cpu_node_count": 2,
+            "tensor_count": 2,
+            "data_input_edge_count": 1,
+            "data_output_edge_count": 1,
+            "submit_edge_count": 1,
+            "wait_edge_count": 0,
+            "thread_order_edge_count": 1,
+            "stream_order_edge_count": 0,
+        }
+        (bundle_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        (bundle_dir / "step_0_compute_graph.dot").write_text(
+            "\n".join(
+                [
+                    "digraph G {",
+                    '  "k0" [ label="aten::empty" ]',
+                    '  "k1" [ label="cudaLaunchKernel" ]',
+                    '  "k2" [ label="triton_kernel_0" ]',
+                    '  "t0" [ label="param_1_10" ]',
+                    '  "t1" [ label="cache_2_20" ]',
+                    '  "k0" -> "k1" [ label = "thread_order"; ]',
+                    '  "k1" -> "k2" [ label = "submit"; ]',
+                    '  "t0" -> "k2";',
+                    '  "k2" -> "t1";',
+                    "}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self._write_csv_rows(
+            profile_dir / "synthetic_trace.csv",
+            [
+                "event_index",
+                "id",
+                "name",
+                "overload_name",
+                "trace_name",
+                "start_us",
+                "end_us",
+                "duration_us",
+                "self_cpu_time_total_us",
+                "cpu_time_total_us",
+                "self_device_time_total_us",
+                "device_time_total_us",
+                "thread",
+                "fwd_thread",
+                "device_type",
+                "device_index",
+                "device_resource_id",
+                "node_id",
+                "sequence_nr",
+                "scope",
+                "depth",
+                "cpu_parent_id",
+                "cpu_children",
+                "kernel_count",
+                "kernel_names",
+                "kernel_durations_us",
+                "is_async",
+                "is_remote",
+                "is_legacy",
+                "is_user_annotation",
+                "flops",
+                "cpu_memory_usage",
+                "self_cpu_memory_usage",
+                "device_memory_usage",
+                "self_device_memory_usage",
+                "input_shapes",
+                "concrete_inputs",
+                "kwinputs",
+                "stack",
+                "metadata_json",
+            ],
+            [
+                {
+                    "event_index": 0,
+                    "id": 1,
+                    "name": "top",
+                    "overload_name": "",
+                    "trace_name": "top",
+                    "start_us": 0.0,
+                    "end_us": 100.0,
+                    "duration_us": 100.0,
+                    "self_cpu_time_total_us": 100.0,
+                    "cpu_time_total_us": 100.0,
+                    "self_device_time_total_us": 0.0,
+                    "device_time_total_us": 0.0,
+                    "thread": 1,
+                    "fwd_thread": 0,
+                    "device_type": "CPU",
+                    "device_index": 0,
+                    "device_resource_id": 0,
+                    "node_id": -1,
+                    "sequence_nr": -1,
+                    "scope": 7,
+                    "depth": 0,
+                    "cpu_parent_id": "",
+                    "cpu_children": 2,
+                    "kernel_count": 0,
+                    "kernel_names": "[]",
+                    "kernel_durations_us": "[]",
+                    "is_async": "False",
+                    "is_remote": "False",
+                    "is_legacy": "False",
+                    "is_user_annotation": "True",
+                    "flops": 0,
+                    "cpu_memory_usage": 0,
+                    "self_cpu_memory_usage": 0,
+                    "device_memory_usage": 0,
+                    "self_device_memory_usage": 0,
+                    "input_shapes": "[]",
+                    "concrete_inputs": "[]",
+                    "kwinputs": "{}",
+                    "stack": "[]",
+                    "metadata_json": "",
+                },
+                {
+                    "event_index": 1,
+                    "id": 2,
+                    "name": "aten::empty",
+                    "overload_name": "",
+                    "trace_name": "aten::empty",
+                    "start_us": 10.0,
+                    "end_us": 20.0,
+                    "duration_us": 10.0,
+                    "self_cpu_time_total_us": 10.0,
+                    "cpu_time_total_us": 10.0,
+                    "self_device_time_total_us": 0.0,
+                    "device_time_total_us": 0.0,
+                    "thread": 1,
+                    "fwd_thread": 0,
+                    "device_type": "CPU",
+                    "device_index": 0,
+                    "device_resource_id": 0,
+                    "node_id": -1,
+                    "sequence_nr": -1,
+                    "scope": 0,
+                    "depth": 1,
+                    "cpu_parent_id": 1,
+                    "cpu_children": 0,
+                    "kernel_count": 0,
+                    "kernel_names": "[]",
+                    "kernel_durations_us": "[]",
+                    "is_async": "False",
+                    "is_remote": "False",
+                    "is_legacy": "False",
+                    "is_user_annotation": "False",
+                    "flops": 0,
+                    "cpu_memory_usage": 0,
+                    "self_cpu_memory_usage": 0,
+                    "device_memory_usage": 0,
+                    "self_device_memory_usage": 0,
+                    "input_shapes": "[]",
+                    "concrete_inputs": "[]",
+                    "kwinputs": "{}",
+                    "stack": "[]",
+                    "metadata_json": "",
+                },
+                {
+                    "event_index": 2,
+                    "id": 3,
+                    "name": "cudaLaunchKernel",
+                    "overload_name": "",
+                    "trace_name": "cudaLaunchKernel",
+                    "start_us": 21.0,
+                    "end_us": 25.0,
+                    "duration_us": 4.0,
+                    "self_cpu_time_total_us": 4.0,
+                    "cpu_time_total_us": 4.0,
+                    "self_device_time_total_us": 0.0,
+                    "device_time_total_us": 0.0,
+                    "thread": 1,
+                    "fwd_thread": 0,
+                    "device_type": "CPU",
+                    "device_index": 0,
+                    "device_resource_id": 0,
+                    "node_id": -1,
+                    "sequence_nr": -1,
+                    "scope": 0,
+                    "depth": 1,
+                    "cpu_parent_id": 1,
+                    "cpu_children": 0,
+                    "kernel_count": 0,
+                    "kernel_names": "[]",
+                    "kernel_durations_us": "[]",
+                    "is_async": "False",
+                    "is_remote": "False",
+                    "is_legacy": "False",
+                    "is_user_annotation": "False",
+                    "flops": 0,
+                    "cpu_memory_usage": 0,
+                    "self_cpu_memory_usage": 0,
+                    "device_memory_usage": 0,
+                    "self_device_memory_usage": 0,
+                    "input_shapes": "[]",
+                    "concrete_inputs": "[]",
+                    "kwinputs": "{}",
+                    "stack": "[]",
+                    "metadata_json": "",
+                },
+                {
+                    "event_index": 3,
+                    "id": 4,
+                    "name": "triton_kernel_0",
+                    "overload_name": "",
+                    "trace_name": "triton_kernel_0",
+                    "start_us": 26.0,
+                    "end_us": 40.0,
+                    "duration_us": 14.0,
+                    "self_cpu_time_total_us": 0.0,
+                    "cpu_time_total_us": 0.0,
+                    "self_device_time_total_us": 14.0,
+                    "device_time_total_us": 14.0,
+                    "thread": 1,
+                    "fwd_thread": 0,
+                    "device_type": "CUDA",
+                    "device_index": 0,
+                    "device_resource_id": 7,
+                    "node_id": -1,
+                    "sequence_nr": -1,
+                    "scope": 0,
+                    "depth": 0,
+                    "cpu_parent_id": "",
+                    "cpu_children": 0,
+                    "kernel_count": 1,
+                    "kernel_names": '["triton_kernel_0"]',
+                    "kernel_durations_us": "[14.0]",
+                    "is_async": "False",
+                    "is_remote": "False",
+                    "is_legacy": "False",
+                    "is_user_annotation": "False",
+                    "flops": 0,
+                    "cpu_memory_usage": 0,
+                    "self_cpu_memory_usage": 0,
+                    "device_memory_usage": 0,
+                    "self_device_memory_usage": 0,
+                    "input_shapes": "[]",
+                    "concrete_inputs": "[]",
+                    "kwinputs": "{}",
+                    "stack": "[]",
+                    "metadata_json": "",
+                },
+            ],
+        )
+
+        self._write_csv_rows(
+            profile_dir / "synthetic_kineto_map.csv",
+            [
+                "kineto_node_id",
+                "kineto_correlation_id",
+                "kineto_linked_correlation_id",
+                "kineto_name",
+                "kineto_device_type",
+                "kineto_device_index",
+                "kineto_device_resource_id",
+                "kineto_start_us",
+                "kineto_duration_us",
+                "csv_match_count",
+                "csv_event_indexes",
+                "csv_ids",
+                "csv_trace_names",
+                "csv_names",
+                "csv_device_types",
+                "csv_start_us",
+                "csv_duration_us",
+                "csv_depths",
+            ],
+            [
+                {
+                    "kineto_node_id": "k0",
+                    "kineto_correlation_id": 1,
+                    "kineto_linked_correlation_id": 0,
+                    "kineto_name": "top",
+                    "kineto_device_type": "CPU",
+                    "kineto_device_index": 0,
+                    "kineto_device_resource_id": 0,
+                    "kineto_start_us": 0.0,
+                    "kineto_duration_us": 100.0,
+                    "csv_match_count": 1,
+                    "csv_event_indexes": "[0]",
+                    "csv_ids": "[1]",
+                    "csv_trace_names": '["top"]',
+                    "csv_names": '["top"]',
+                    "csv_device_types": '["CPU"]',
+                    "csv_start_us": "[0.0]",
+                    "csv_duration_us": "[100.0]",
+                    "csv_depths": "[0]",
+                },
+                {
+                    "kineto_node_id": "k1",
+                    "kineto_correlation_id": 2,
+                    "kineto_linked_correlation_id": 0,
+                    "kineto_name": "aten::empty",
+                    "kineto_device_type": "CPU",
+                    "kineto_device_index": 0,
+                    "kineto_device_resource_id": 0,
+                    "kineto_start_us": 10.0,
+                    "kineto_duration_us": 10.0,
+                    "csv_match_count": 1,
+                    "csv_event_indexes": "[1]",
+                    "csv_ids": "[2]",
+                    "csv_trace_names": '["aten::empty"]',
+                    "csv_names": '["aten::empty"]',
+                    "csv_device_types": '["CPU"]',
+                    "csv_start_us": "[10.0]",
+                    "csv_duration_us": "[10.0]",
+                    "csv_depths": "[1]",
+                },
+                {
+                    "kineto_node_id": "k2",
+                    "kineto_correlation_id": 3,
+                    "kineto_linked_correlation_id": 999,
+                    "kineto_name": "cudaLaunchKernel",
+                    "kineto_device_type": "CPU",
+                    "kineto_device_index": 0,
+                    "kineto_device_resource_id": 0,
+                    "kineto_start_us": 21.0,
+                    "kineto_duration_us": 4.0,
+                    "csv_match_count": 1,
+                    "csv_event_indexes": "[2]",
+                    "csv_ids": "[3]",
+                    "csv_trace_names": '["cudaLaunchKernel"]',
+                    "csv_names": '["cudaLaunchKernel"]',
+                    "csv_device_types": '["CPU"]',
+                    "csv_start_us": "[21.0]",
+                    "csv_duration_us": "[4.0]",
+                    "csv_depths": "[1]",
+                },
+                {
+                    "kineto_node_id": "k3",
+                    "kineto_correlation_id": 3,
+                    "kineto_linked_correlation_id": 999,
+                    "kineto_name": "triton_kernel_0",
+                    "kineto_device_type": "CUDA",
+                    "kineto_device_index": 0,
+                    "kineto_device_resource_id": 7,
+                    "kineto_start_us": 26.0,
+                    "kineto_duration_us": 14.0,
+                    "csv_match_count": 1,
+                    "csv_event_indexes": "[3]",
+                    "csv_ids": "[4]",
+                    "csv_trace_names": '["triton_kernel_0"]',
+                    "csv_names": '["triton_kernel_0"]',
+                    "csv_device_types": '["CUDA"]',
+                    "csv_start_us": "[26.0]",
+                    "csv_duration_us": "[14.0]",
+                    "csv_depths": "[0]",
+                },
+            ],
+        )
+
+        (profile_dir / "synthetic_trace.json").write_text(
+            json.dumps({"traceEvents": [
+                {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 21.0, "dur": 4.0, "args": {"correlation": 3}},
+                {"ph": "s", "cat": "ac2g", "id": 3, "pid": 1, "tid": 1, "ts": 21.0},
+                {"ph": "X", "cat": "kernel", "name": "triton_kernel_0", "pid": 0, "tid": 7, "ts": 26.0, "dur": 14.0, "args": {"correlation": 3, "device": 0, "stream": 7}},
+                {"ph": "f", "cat": "ac2g", "id": 3, "pid": 1, "tid": 7, "ts": 26.0},
+            ]}) + "\n",
+            encoding="utf-8",
+        )
+        (profile_dir / "synthetic_execution_trace.json").write_text(
+            json.dumps(
+                {
+                    "nodes": [
+                        {
+                            "id": 100,
+                            "name": "triton_kernel_0",
+                            "ctrl_deps": 0,
+                            "attrs": [
+                                {"name": "rf_id", "type": "uint64", "value": 999},
+                                {
+                                    "name": "kernel_backend",
+                                    "type": "string",
+                                    "value": "triton",
+                                },
+                            ],
+                            "inputs": {
+                                "values": [[1, 10, 0, 4, 2, "cuda"]],
+                                "shapes": [[2, 2]],
+                                "types": ["Tensor(float16)"],
+                            },
+                            "outputs": {
+                                "values": [[2, 20, 0, 4, 2, "cuda"]],
+                                "shapes": [[2, 2]],
+                                "types": ["Tensor(float16)"],
+                            },
+                        }
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        return bundle_dir, verifier.SourceArtifacts(
+            trace_csv=profile_dir / "synthetic_trace.csv",
+            trace_json=profile_dir / "synthetic_trace.json",
+            kineto_map_csv=profile_dir / "synthetic_kineto_map.csv",
+            execution_trace=profile_dir / "synthetic_execution_trace.json",
+        )
+
     def make_tree(self) -> list[MockNode]:
         tree = {
             "root_0": {
@@ -3151,6 +3955,1621 @@ class TestExperimentalUtils(TestCase):
             ["cpu_submit", "triton_kernel_0"],
         )
 
+    def test_build_ws_launch_index_propagates_ids(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(
+                self,
+                name,
+                *,
+                device_type,
+                start_ns,
+                end_ns,
+                correlation_id=0,
+                linked_correlation_id=0,
+                thread_id=1,
+            ):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._thread_id = thread_id
+
+            def name(self):
+                return self._name
+
+            def device_type(self):
+                return self._device_type
+
+            def start_ns(self):
+                return self._start_ns
+
+            def end_ns(self):
+                return self._end_ns
+
+            def correlation_id(self):
+                return self._correlation_id
+
+            def linked_correlation_id(self):
+                return self._linked_correlation_id
+
+            def start_thread_id(self):
+                return self._thread_id
+
+            def end_thread_id(self):
+                return self._thread_id
+
+            def is_async(self):
+                return False
+
+        # ws_launch:0:5 wraps a cuLaunchKernel, which links to a GPU kernel
+        ws_marker = MockEvent(
+            "ws_launch:0:5",
+            device_type=DeviceType.CPU,
+            start_ns=100,
+            end_ns=200,
+            correlation_id=10,
+            thread_id=1,
+        )
+        launch_call = MockEvent(
+            "cuLaunchKernel",
+            device_type=DeviceType.CPU,
+            start_ns=120,
+            end_ns=130,
+            correlation_id=42,
+            thread_id=1,
+        )
+        gpu_kernel = MockEvent(
+            "triton_kernel_0",
+            device_type=DeviceType.CUDA,
+            start_ns=150,
+            end_ns=180,
+            correlation_id=99,
+            linked_correlation_id=42,
+        )
+        # CPU event outside any ws_launch scope
+        unrelated_cpu = MockEvent(
+            "aten::add",
+            device_type=DeviceType.CPU,
+            start_ns=300,
+            end_ns=310,
+            correlation_id=50,
+            thread_id=1,
+        )
+
+        raw_events = [ws_marker, launch_call, gpu_kernel, unrelated_cpu]
+        index = sdxl_profiler.build_ws_launch_index(raw_events)
+
+        # ws_launch marker itself should be in the index
+        self.assertEqual(index[id(ws_marker)], (0, 5))
+        # cuLaunchKernel nested inside ws_launch should resolve
+        self.assertEqual(index[id(launch_call)], (0, 5))
+        # GPU kernel linked via correlation_id should resolve
+        self.assertEqual(index[id(gpu_kernel)], (0, 5))
+        # Unrelated CPU event should NOT be in the index
+        self.assertNotIn(id(unrelated_cpu), index)
+
+    def test_build_ws_launch_index_empty_when_no_markers(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+
+            def name(self):
+                return self._name
+
+            def device_type(self):
+                return self._device_type
+
+            def start_ns(self):
+                return self._start_ns
+
+            def end_ns(self):
+                return self._end_ns
+
+            def correlation_id(self):
+                return 0
+
+            def linked_correlation_id(self):
+                return 0
+
+            def start_thread_id(self):
+                return 1
+
+            def end_thread_id(self):
+                return 1
+
+            def is_async(self):
+                return False
+
+        raw_events = [
+            MockEvent("aten::mm", device_type=DeviceType.CPU, start_ns=0, end_ns=10),
+        ]
+        index = sdxl_profiler.build_ws_launch_index(raw_events)
+        self.assertEqual(index, {})
+
+    def test_parse_ws_sync_markers(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type):
+                self._name = name
+                self._device_type = device_type
+
+            def name(self):
+                return self._name
+
+            def device_type(self):
+                return self._device_type
+
+        raw_events = [
+            MockEvent(
+                "ws_sync:0:0:device_sync:3,5",
+                device_type=DeviceType.CPU,
+            ),
+            MockEvent(
+                "ws_sync:1:2:stream_sync:7",
+                device_type=DeviceType.CPU,
+            ),
+            MockEvent(
+                "ws_sync:0:1:device_sync:",
+                device_type=DeviceType.CPU,
+            ),
+            # GPU event should be ignored
+            MockEvent(
+                "ws_sync:0:9:device_sync:1",
+                device_type=DeviceType.CUDA,
+            ),
+            MockEvent("aten::mm", device_type=DeviceType.CPU),
+        ]
+        index = sdxl_profiler.build_ws_sync_index(raw_events)
+
+        self.assertEqual(len(index), 3)
+
+        info0 = index[id(raw_events[0])]
+        self.assertEqual(info0.graph_id, 0)
+        self.assertEqual(info0.sync_id, 0)
+        self.assertEqual(info0.kind, "device_sync")
+        self.assertEqual(info0.src_launch_ids, (3, 5))
+
+        info1 = index[id(raw_events[1])]
+        self.assertEqual(info1.graph_id, 1)
+        self.assertEqual(info1.sync_id, 2)
+        self.assertEqual(info1.kind, "stream_sync")
+        self.assertEqual(info1.src_launch_ids, (7,))
+
+        info2 = index[id(raw_events[2])]
+        self.assertEqual(info2.src_launch_ids, ())
+
+        # GPU event not in index
+        self.assertNotIn(id(raw_events[3]), index)
+        # Unrelated CPU event not in index
+        self.assertNotIn(id(raw_events[4]), index)
+
+    def test_ws_sync_marker_propagates_to_sync_leaf(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+
+        marker = MockEvent(
+            "ws_sync:0:0:device_sync:3",
+            device_type=DeviceType.CPU,
+            start_ns=100,
+            end_ns=200,
+        )
+        leaf = MockEvent(
+            "cudaDeviceSynchronize",
+            device_type=DeviceType.CPU,
+            start_ns=120,
+            end_ns=180,
+        )
+        raw_events = [marker, leaf]
+
+        marker_index = sdxl_profiler.build_ws_sync_index(raw_events)
+        leaf_index = sdxl_profiler.propagate_ws_sync_to_leaf_events(
+            raw_events,
+            marker_index,
+        )
+
+        self.assertIn(id(marker), marker_index)
+        self.assertNotIn(id(marker), leaf_index)
+        self.assertIn(id(leaf), leaf_index)
+        self.assertEqual(leaf_index[id(leaf)].kind, "device_sync")
+        self.assertEqual(leaf_index[id(leaf)].src_launch_ids, (3,))
+
+    def test_ws_sync_event_sync_marker_propagates_to_event_sync_leaf(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+
+        marker = MockEvent(
+            "ws_sync:0:0:event_sync:1,2",
+            device_type=DeviceType.CPU,
+            start_ns=100,
+            end_ns=200,
+        )
+        leaf = MockEvent(
+            "cudaEventSynchronize",
+            device_type=DeviceType.CPU,
+            start_ns=120,
+            end_ns=180,
+        )
+        raw_events = [marker, leaf]
+
+        leaf_index = sdxl_profiler.propagate_ws_sync_to_leaf_events(
+            raw_events,
+            sdxl_profiler.build_ws_sync_index(raw_events),
+        )
+
+        self.assertIn(id(leaf), leaf_index)
+        self.assertEqual(leaf_index[id(leaf)].kind, "event_sync")
+        self.assertEqual(leaf_index[id(leaf)].src_launch_ids, (1, 2))
+
+    def test_exact_wait_edges_target_sync_leaf_not_marker(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        gpu_kernel = MockEvent(
+            "triton_kernel_0",
+            device_type=DeviceType.CUDA,
+            start_ns=100,
+            end_ns=200,
+        )
+        marker = MockEvent(
+            "ws_sync:0:0:device_sync:3",
+            device_type=DeviceType.CPU,
+            start_ns=210,
+            end_ns=260,
+        )
+        leaf = MockEvent(
+            "cudaDeviceSynchronize",
+            device_type=DeviceType.CPU,
+            start_ns=220,
+            end_ns=250,
+        )
+        raw_events = [gpu_kernel, marker, leaf]
+        node_ids = {id(gpu_kernel): "k0", id(leaf): "k1"}
+        ws_sync_index = sdxl_profiler.propagate_ws_sync_to_leaf_events(
+            raw_events,
+            sdxl_profiler.build_ws_sync_index(raw_events),
+        )
+
+        edges, roles, handled = sdxl_profiler.build_llamasim_exact_wait_edges(
+            node_ids,
+            [leaf],
+            [gpu_kernel],
+            {id(gpu_kernel): (0, 3)},
+            ws_sync_index,
+            {},
+        )
+
+        self.assertEqual(edges, [("k0", "k1", "wait")])
+        self.assertEqual(roles[id(leaf)], "wait")
+        self.assertIn(id(leaf), handled)
+        self.assertNotIn(id(marker), node_ids)
+
+    def test_exact_wait_handled_sync_skips_heuristic_wait(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        gpu_kernel = MockEvent(
+            "kernel_0",
+            device_type=DeviceType.CUDA,
+            start_ns=100,
+            end_ns=200,
+            linked_correlation_id=99,
+        )
+        marker = MockEvent(
+            "ws_sync:0:0:device_sync:3",
+            device_type=DeviceType.CPU,
+            start_ns=210,
+            end_ns=260,
+        )
+        leaf = MockEvent(
+            "cudaDeviceSynchronize",
+            device_type=DeviceType.CPU,
+            start_ns=220,
+            end_ns=250,
+            linked_correlation_id=99,
+        )
+        raw_events = [gpu_kernel, marker, leaf]
+        node_ids = {id(gpu_kernel): "k0", id(leaf): "k1"}
+        ws_sync_index = sdxl_profiler.propagate_ws_sync_to_leaf_events(
+            raw_events,
+            sdxl_profiler.build_ws_sync_index(raw_events),
+        )
+        exact_edges, roles, handled = sdxl_profiler.build_llamasim_exact_wait_edges(
+            node_ids,
+            [leaf],
+            [gpu_kernel],
+            {id(gpu_kernel): (0, 3)},
+            ws_sync_index,
+            {},
+        )
+        heuristic_edges, roles = sdxl_profiler.build_llamasim_wait_edges(
+            node_ids,
+            [leaf],
+            [gpu_kernel],
+            roles,
+        )
+        sync_edges, roles = sdxl_profiler.build_llamasim_sync_wait_edges(
+            node_ids,
+            [leaf],
+            [gpu_kernel],
+            roles,
+        )
+
+        self.assertEqual(exact_edges, [("k0", "k1", "wait")])
+        self.assertIn(id(leaf), handled)
+        self.assertEqual(heuristic_edges, [])
+        self.assertEqual(sync_edges, [])
+
+    def test_aten_copy_stream_sync_emits_exact_wait_edge(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        parent = MockEvent(
+            "aten::copy_", device_type=DeviceType.CPU, start_ns=0, end_ns=100,
+        )
+        submit = MockEvent(
+            "cudaMemcpyAsync", device_type=DeviceType.CPU, start_ns=10, end_ns=20,
+            correlation_id=11,
+        )
+        sync = MockEvent(
+            "cudaStreamSynchronize", device_type=DeviceType.CPU,
+            start_ns=30, end_ns=90,
+        )
+        gpu_memcpy = MockEvent(
+            "Memcpy HtoD", device_type=DeviceType.CUDA, start_ns=20, end_ns=80,
+            correlation_id=101, linked_correlation_id=11,
+        )
+        raw_events = [parent, submit, sync, gpu_memcpy]
+        node_ids = {
+            id(submit): "k0",
+            id(sync): "k1",
+            id(gpu_memcpy): "k2",
+        }
+
+        edges, roles, handled, attrs = (
+            sdxl_profiler.build_llamasim_aten_sync_wait_edges(
+                node_ids,
+                [submit, sync],
+                [gpu_memcpy],
+                raw_events,
+                {},
+            )
+        )
+
+        self.assertEqual(edges, [("k2", "k1", "wait")])
+        self.assertEqual(roles[id(sync)], "wait")
+        self.assertIn(id(sync), handled)
+        self.assertEqual(attrs[("k2", "k1")]["wait_exact"], "true")
+        self.assertEqual(
+            attrs[("k2", "k1")]["wait_source"],
+            "aten_parent_scope_exact",
+        )
+        self.assertEqual(attrs[("k2", "k1")]["wait_kind"], "stream_sync")
+
+    def test_aten_nonzero_stream_sync_emits_exact_wait_edge(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        parent = MockEvent(
+            "aten::nonzero", device_type=DeviceType.CPU, start_ns=0, end_ns=150,
+        )
+        submit = MockEvent(
+            "cudaLaunchKernel", device_type=DeviceType.CPU,
+            start_ns=20, end_ns=30, correlation_id=22,
+        )
+        sync = MockEvent(
+            "cudaStreamSynchronize", device_type=DeviceType.CPU,
+            start_ns=90, end_ns=140,
+        )
+        gpu_kernel = MockEvent(
+            "nonzero_kernel", device_type=DeviceType.CUDA,
+            start_ns=35, end_ns=120, correlation_id=22,
+        )
+        raw_events = [parent, submit, sync, gpu_kernel]
+        node_ids = {
+            id(submit): "k0",
+            id(sync): "k1",
+            id(gpu_kernel): "k2",
+        }
+
+        edges, roles, handled, attrs = (
+            sdxl_profiler.build_llamasim_aten_sync_wait_edges(
+                node_ids,
+                [submit, sync],
+                [gpu_kernel],
+                raw_events,
+                {},
+            )
+        )
+
+        self.assertEqual(edges, [("k2", "k1", "wait")])
+        self.assertEqual(roles[id(sync)], "wait")
+        self.assertIn(id(sync), handled)
+        self.assertEqual(
+            attrs[("k2", "k1")]["wait_source"],
+            "aten_parent_scope_exact",
+        )
+
+    def test_profiler_sync_device_leaf_is_excluded_from_runtime_nodes(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return 0
+            def linked_correlation_id(self): return 0
+            def device_index(self): return 0
+            def device_resource_id(self): return 0
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        marker = MockEvent(
+            "profiler_sync:device", device_type=DeviceType.CPU,
+            start_ns=100, end_ns=200,
+        )
+        sync = MockEvent(
+            "cudaDeviceSynchronize", device_type=DeviceType.CPU,
+            start_ns=120, end_ns=180,
+        )
+        cpu_work = MockEvent(
+            "aten::add", device_type=DeviceType.CPU, start_ns=210, end_ns=220,
+        )
+        raw_events = [marker, sync, cpu_work]
+        excluded = sdxl_profiler.find_profiler_sync_excluded_cpu_event_ids(
+            raw_events
+        )
+
+        selected_events, selected_cpu_events, _selected_gpu_events = (
+            sdxl_profiler.select_llamasim_runtime_events(
+                raw_events,
+                exclude_cpu_event_ids=excluded,
+            )
+        )
+
+        self.assertIn(id(sync), excluded)
+        self.assertNotIn(sync, selected_events)
+        self.assertNotIn(sync, selected_cpu_events)
+        self.assertIn(cpu_work, selected_cpu_events)
+
+    def test_aten_sync_without_same_parent_gpu_source_is_not_exact(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        parent = MockEvent(
+            "aten::copy_", device_type=DeviceType.CPU, start_ns=0, end_ns=100,
+        )
+        sync = MockEvent(
+            "cudaStreamSynchronize", device_type=DeviceType.CPU,
+            start_ns=30, end_ns=90,
+        )
+        unrelated_gpu = MockEvent(
+            "Memcpy HtoD", device_type=DeviceType.CUDA, start_ns=20, end_ns=80,
+            correlation_id=99,
+        )
+        node_ids = {id(sync): "k0", id(unrelated_gpu): "k1"}
+
+        edges, roles, handled, attrs = (
+            sdxl_profiler.build_llamasim_aten_sync_wait_edges(
+                node_ids,
+                [sync],
+                [unrelated_gpu],
+                [parent, sync, unrelated_gpu],
+                {},
+            )
+        )
+
+        self.assertEqual(edges, [])
+        self.assertEqual(roles, {})
+        self.assertEqual(handled, set())
+        self.assertEqual(attrs, {})
+
+    def test_aten_sync_gpu_source_must_complete_before_sync_return(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        parent = MockEvent(
+            "aten::copy_", device_type=DeviceType.CPU, start_ns=0, end_ns=200,
+        )
+        submit = MockEvent(
+            "cudaMemcpyAsync", device_type=DeviceType.CPU, start_ns=10, end_ns=20,
+            correlation_id=11,
+        )
+        sync = MockEvent(
+            "cudaStreamSynchronize", device_type=DeviceType.CPU,
+            start_ns=30, end_ns=50,
+        )
+        gpu_memcpy = MockEvent(
+            "Memcpy HtoD", device_type=DeviceType.CUDA, start_ns=20, end_ns=100,
+            correlation_id=101, linked_correlation_id=11,
+        )
+        node_ids = {
+            id(submit): "k0",
+            id(sync): "k1",
+            id(gpu_memcpy): "k2",
+        }
+
+        edges, roles, handled, attrs = (
+            sdxl_profiler.build_llamasim_aten_sync_wait_edges(
+                node_ids,
+                [submit, sync],
+                [gpu_memcpy],
+                [parent, submit, sync, gpu_memcpy],
+                {},
+            )
+        )
+
+        self.assertEqual(edges, [])
+        self.assertEqual(roles, {})
+        self.assertEqual(handled, set())
+        self.assertEqual(attrs, {})
+
+    def test_sync_wait_fallback_uses_latest_completed_before_sync_return(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         device_resource_id=7):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._device_resource_id = device_resource_id
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def correlation_id(self): return 0
+            def linked_correlation_id(self): return 0
+            def start_thread_id(self): return 1
+            def end_thread_id(self): return 1
+            def is_async(self): return False
+            def is_user_annotation(self): return False
+
+        kernel1 = MockEvent(
+            "kernel1", device_type=DeviceType.CUDA,
+            start_ns=10, end_ns=100,
+        )
+        kernel2 = MockEvent(
+            "kernel2", device_type=DeviceType.CUDA,
+            start_ns=110, end_ns=200,
+        )
+        kernel3 = MockEvent(
+            "kernel3", device_type=DeviceType.CUDA,
+            start_ns=210, end_ns=350,
+        )
+        sync = MockEvent(
+            "cudaDeviceSynchronize", device_type=DeviceType.CPU,
+            start_ns=220, end_ns=250,
+        )
+        node_ids = {
+            id(kernel1): "k0",
+            id(kernel2): "k1",
+            id(kernel3): "k2",
+            id(sync): "k3",
+        }
+
+        edges, roles = sdxl_profiler.build_llamasim_sync_wait_edges(
+            node_ids,
+            [sync],
+            [kernel1, kernel2, kernel3],
+            {},
+        )
+
+        self.assertEqual(edges, [("k1", "k3", "wait")])
+        self.assertEqual(roles[id(sync)], "wait")
+
+    def test_cuda_event_sync_fallback_attrs_are_heuristic(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        attrs = sdxl_profiler.heuristic_sync_wait_attrs("cudaEventSynchronize")
+
+        self.assertEqual(attrs["wait_exact"], "false")
+        self.assertEqual(attrs["wait_source"], "kineto_sync_frontier")
+        self.assertEqual(attrs["wait_kind"], "event_sync")
+
+    def test_build_exact_wait_edges(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+
+            def name(self):
+                return self._name
+
+            def device_type(self):
+                return self._device_type
+
+            def start_ns(self):
+                return self._start_ns
+
+            def end_ns(self):
+                return self._end_ns
+
+        # GPU kernel matched to ws_launch:0:3
+        gpu_kernel = MockEvent(
+            "triton_kernel_0",
+            device_type=DeviceType.CUDA,
+            start_ns=100,
+            end_ns=200,
+        )
+        # CPU sync event with ws_sync marker
+        cpu_sync = MockEvent(
+            "ws_sync:0:0:device_sync:3",
+            device_type=DeviceType.CPU,
+            start_ns=200,
+            end_ns=250,
+        )
+        # Another CPU event (not a sync)
+        cpu_other = MockEvent(
+            "aten::mm",
+            device_type=DeviceType.CPU,
+            start_ns=50,
+            end_ns=90,
+        )
+
+        node_ids = {
+            id(gpu_kernel): "k0",
+            id(cpu_sync): "k1",
+            id(cpu_other): "k2",
+        }
+        ws_launch_index = {id(gpu_kernel): (0, 3)}
+        ws_sync_index = {
+            id(cpu_sync): sdxl_profiler.WsSyncInfo(
+                graph_id=0, sync_id=0, kind="device_sync",
+                src_launch_ids=(3,),
+            )
+        }
+
+        edges, roles, handled = sdxl_profiler.build_llamasim_exact_wait_edges(
+            node_ids,
+            [cpu_sync, cpu_other],
+            [gpu_kernel],
+            ws_launch_index,
+            ws_sync_index,
+            {},
+        )
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0], ("k0", "k1", "wait"))
+        self.assertEqual(roles[id(cpu_sync)], "wait")
+        self.assertIn(id(cpu_sync), handled)
+        self.assertNotIn(id(cpu_other), handled)
+
+    def test_exact_wait_edges_fallback(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        # Empty ws_sync_index → no exact edges
+        edges, roles, handled = sdxl_profiler.build_llamasim_exact_wait_edges(
+            {}, [], [], {}, {}, {},
+        )
+        self.assertEqual(edges, [])
+        self.assertEqual(handled, set())
+
+    def test_parse_ac2g_paired_correlation_ids(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "trace.json"
+            trace_path.write_text(
+                json.dumps({"traceEvents": [
+                    # Paired ac2g flow (id=10): start + end
+                    {"ph": "s", "cat": "ac2g", "id": 10, "pid": 1, "tid": 1, "ts": 1.0},
+                    {"ph": "f", "cat": "ac2g", "id": 10, "pid": 1, "tid": 7, "ts": 2.0},
+                    # Unpaired ac2g flow (id=20): start only
+                    {"ph": "s", "cat": "ac2g", "id": 20, "pid": 1, "tid": 1, "ts": 3.0},
+                    # Unpaired ac2g flow (id=30): end only
+                    {"ph": "f", "cat": "ac2g", "id": 30, "pid": 1, "tid": 7, "ts": 4.0},
+                    # Non-ac2g flow (id=10): should be ignored
+                    {"ph": "s", "cat": "other", "id": 40, "pid": 1, "tid": 1, "ts": 5.0},
+                    {"ph": "f", "cat": "other", "id": 40, "pid": 1, "tid": 7, "ts": 6.0},
+                    # Another paired ac2g flow
+                    {"ph": "s", "cat": "ac2g", "id": 50, "pid": 1, "tid": 1, "ts": 7.0},
+                    {"ph": "f", "cat": "ac2g", "id": 50, "pid": 1, "tid": 7, "ts": 8.0},
+                ]}),
+                encoding="utf-8",
+            )
+            result = sdxl_profiler.parse_ac2g_paired_correlation_ids(trace_path)
+        self.assertEqual(result, {10, 50})
+
+    def test_build_submit_edges_from_ac2g(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockRuntimeExportEvent:
+            def __init__(
+                self,
+                name: str,
+                *,
+                device_type: DeviceType,
+                start_ns: int,
+                end_ns: int,
+                correlation_id: int = 0,
+                linked_correlation_id: int = 0,
+                device_resource_id: int = 7,
+                thread_id: int = 1,
+                is_user_annotation: bool = False,
+            ) -> None:
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+                self._is_user_annotation = is_user_annotation
+
+            def name(self) -> str:
+                return self._name
+            def device_type(self) -> DeviceType:
+                return self._device_type
+            def start_ns(self) -> int:
+                return self._start_ns
+            def end_ns(self) -> int:
+                return self._end_ns
+            def duration_ns(self) -> int:
+                return self._end_ns - self._start_ns
+            def correlation_id(self) -> int:
+                return self._correlation_id
+            def linked_correlation_id(self) -> int:
+                return self._linked_correlation_id
+            def device_index(self) -> int:
+                return 0
+            def device_resource_id(self) -> int:
+                return self._device_resource_id
+            def start_thread_id(self) -> int:
+                return self._thread_id
+            def end_thread_id(self) -> int:
+                return self._thread_id
+            def is_async(self) -> bool:
+                return False
+            def is_user_annotation(self) -> bool:
+                return self._is_user_annotation
+
+        # CPU launch events with different correlation IDs
+        cpu_launch_a = MockRuntimeExportEvent(
+            "cudaLaunchKernel",
+            device_type=DeviceType.CPU,
+            start_ns=100,
+            end_ns=110,
+            correlation_id=5,
+        )
+        cpu_launch_b = MockRuntimeExportEvent(
+            "cudaLaunchKernel",
+            device_type=DeviceType.CPU,
+            start_ns=200,
+            end_ns=210,
+            correlation_id=6,
+        )
+        # GPU kernels
+        gpu_kernel_a = MockRuntimeExportEvent(
+            "kernel_a",
+            device_type=DeviceType.CUDA,
+            start_ns=120,
+            end_ns=180,
+            correlation_id=5,
+        )
+        gpu_kernel_b = MockRuntimeExportEvent(
+            "kernel_b",
+            device_type=DeviceType.CUDA,
+            start_ns=220,
+            end_ns=280,
+            correlation_id=6,
+        )
+
+        all_events = [cpu_launch_a, cpu_launch_b, gpu_kernel_a, gpu_kernel_b]
+        cpu_events = [cpu_launch_a, cpu_launch_b]
+        gpu_events = [gpu_kernel_a, gpu_kernel_b]
+        node_ids = {id(e): f"k{i}" for i, e in enumerate(all_events)}
+
+        # Only correlation_id=5 is in the ac2g set
+        ac2g_ids = {5}
+        edges, roles, attrs = sdxl_profiler.build_llamasim_submit_edges_from_ac2g(
+            node_ids, cpu_events, gpu_events, all_events, ac2g_ids,
+        )
+
+        # Only the kernel_a submit edge should be produced
+        self.assertEqual(len(edges), 1)
+        src, dst, kind = edges[0]
+        self.assertEqual(src, node_ids[id(cpu_launch_a)])
+        self.assertEqual(dst, node_ids[id(gpu_kernel_a)])
+        self.assertEqual(kind, "submit")
+        self.assertEqual(roles[id(cpu_launch_a)], "submit")
+        self.assertNotIn(id(cpu_launch_b), roles)
+
+    def test_build_submit_edges_from_ac2g_fallback(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockRuntimeExportEvent:
+            def __init__(
+                self,
+                name: str,
+                *,
+                device_type: DeviceType,
+                start_ns: int,
+                end_ns: int,
+                correlation_id: int = 0,
+                linked_correlation_id: int = 0,
+                device_resource_id: int = 7,
+                thread_id: int = 1,
+                is_user_annotation: bool = False,
+            ) -> None:
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+                self._is_user_annotation = is_user_annotation
+
+            def name(self) -> str:
+                return self._name
+            def device_type(self) -> DeviceType:
+                return self._device_type
+            def start_ns(self) -> int:
+                return self._start_ns
+            def end_ns(self) -> int:
+                return self._end_ns
+            def duration_ns(self) -> int:
+                return self._end_ns - self._start_ns
+            def correlation_id(self) -> int:
+                return self._correlation_id
+            def linked_correlation_id(self) -> int:
+                return self._linked_correlation_id
+            def device_index(self) -> int:
+                return 0
+            def device_resource_id(self) -> int:
+                return self._device_resource_id
+            def start_thread_id(self) -> int:
+                return self._thread_id
+            def end_thread_id(self) -> int:
+                return self._thread_id
+            def is_async(self) -> bool:
+                return False
+            def is_user_annotation(self) -> bool:
+                return self._is_user_annotation
+
+        cpu_launch = MockRuntimeExportEvent(
+            "cudaLaunchKernel",
+            device_type=DeviceType.CPU,
+            start_ns=100,
+            end_ns=110,
+            correlation_id=5,
+        )
+        gpu_kernel = MockRuntimeExportEvent(
+            "kernel_a",
+            device_type=DeviceType.CUDA,
+            start_ns=120,
+            end_ns=180,
+            correlation_id=5,
+        )
+
+        all_events = [cpu_launch, gpu_kernel]
+        cpu_events = [cpu_launch]
+        gpu_events = [gpu_kernel]
+        node_ids = {id(e): f"k{i}" for i, e in enumerate(all_events)}
+
+        # Empty ac2g set — should produce no edges
+        ac2g_edges, ac2g_roles, ac2g_attrs = sdxl_profiler.build_llamasim_submit_edges_from_ac2g(
+            node_ids, cpu_events, gpu_events, all_events, set(),
+        )
+        self.assertEqual(ac2g_edges, [])
+        self.assertEqual(ac2g_roles, {})
+        self.assertEqual(ac2g_attrs, {})
+
+        # Heuristic path should still find the edge
+        heuristic_edges, heuristic_roles = sdxl_profiler.build_llamasim_submit_edges(
+            node_ids, cpu_events, gpu_events, all_events,
+        )
+        self.assertEqual(len(heuristic_edges), 1)
+        self.assertEqual(heuristic_roles[id(cpu_launch)], "submit")
+
+    def test_parse_ac2g_flow_endpoints(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "trace.json"
+            trace_path.write_text(
+                json.dumps({"traceEvents": [
+                    {"ph": "s", "cat": "ac2g", "id": 10, "pid": 1, "tid": 1, "ts": 100.5},
+                    {"ph": "f", "cat": "ac2g", "id": 10, "pid": 1, "tid": 7, "ts": 200.0},
+                    {"ph": "s", "cat": "ac2g", "id": 20, "pid": 1, "tid": 1, "ts": 300.0},
+                    {"ph": "f", "cat": "ac2g", "id": 30, "pid": 1, "tid": 7, "ts": 400.0},
+                    {"ph": "s", "cat": "ac2g", "id": 50, "pid": 1, "tid": 1, "ts": 500.25},
+                    {"ph": "f", "cat": "ac2g", "id": 50, "pid": 1, "tid": 7, "ts": 600.0},
+                ]}),
+                encoding="utf-8",
+            )
+            endpoints = sdxl_profiler.parse_ac2g_flow_endpoints(trace_path)
+        self.assertEqual(endpoints.paired_correlation_ids, {10, 50})
+        self.assertAlmostEqual(endpoints.start_ts_us_by_corr_id[10], 100.5)
+        self.assertAlmostEqual(endpoints.start_ts_us_by_corr_id[50], 500.25)
+        self.assertNotIn(20, endpoints.start_ts_us_by_corr_id)
+        self.assertNotIn(30, endpoints.start_ts_us_by_corr_id)
+
+    def test_parse_ac2g_flow_endpoints_resolves_endpoint_events(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "trace.json"
+            trace_path.write_text(
+                json.dumps({"traceEvents": [
+                    {"ph": "X", "cat": "Trace", "name": "PyTorch Profiler (0)", "ts": 1000.0, "dur": 200.0},
+                    {"ph": "X", "cat": "cuda_driver", "name": "cuLaunchKernel", "ts": 1100.0, "dur": 10.0, "args": {"correlation": 5}},
+                    {"ph": "s", "cat": "ac2g", "id": 5, "pid": 1, "tid": 1, "ts": 1100.0},
+                    {"ph": "X", "cat": "kernel", "name": "kernel_a", "pid": 0, "tid": 7, "ts": 1120.0, "dur": 60.0, "args": {"correlation": 5, "device": 0, "stream": 7}},
+                    {"ph": "f", "cat": "ac2g", "id": 5, "pid": 0, "tid": 7, "ts": 1120.0},
+                ]}),
+                encoding="utf-8",
+            )
+            endpoints = sdxl_profiler.parse_ac2g_flow_endpoints(trace_path)
+
+        self.assertEqual(endpoints.paired_correlation_ids, {5})
+        self.assertEqual(endpoints.cpu_endpoint_by_corr_id[5].name, "cuLaunchKernel")
+        self.assertEqual(endpoints.cpu_endpoint_by_corr_id[5].category, "cuda_driver")
+        self.assertEqual(endpoints.gpu_endpoint_by_corr_id[5].name, "kernel_a")
+        self.assertEqual(endpoints.gpu_endpoint_by_corr_id[5].resource_id, 7)
+        self.assertAlmostEqual(endpoints.start_ts_us_by_corr_id[5], 100.0)
+        self.assertAlmostEqual(endpoints.gpu_endpoint_by_corr_id[5].relative_ts_us, 120.0)
+
+    def test_select_llamasim_runtime_events_keeps_required_submit_parent(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockRuntimeExportEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1,
+                         is_user_annotation=False):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+                self._is_user_annotation = is_user_annotation
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return self._is_user_annotation
+
+        cpu_submit_parent = MockRuntimeExportEvent(
+            "cudaLaunchKernel", device_type=DeviceType.CPU,
+            start_ns=100, end_ns=200, correlation_id=5,
+        )
+        cpu_leaf = MockRuntimeExportEvent(
+            "aten::as_strided", device_type=DeviceType.CPU,
+            start_ns=120, end_ns=180, correlation_id=5,
+        )
+        gpu_kernel = MockRuntimeExportEvent(
+            "kernel_a", device_type=DeviceType.CUDA,
+            start_ns=220, end_ns=260, correlation_id=5,
+        )
+
+        selected_events, selected_cpu_events, selected_gpu_events = (
+            sdxl_profiler.select_llamasim_runtime_events(
+                [cpu_submit_parent, cpu_leaf, gpu_kernel],
+                extra_cpu_event_ids={id(cpu_submit_parent)},
+            )
+        )
+
+        self.assertEqual(
+            [event.name() for event in selected_cpu_events],
+            ["cudaLaunchKernel", "aten::as_strided"],
+        )
+        self.assertEqual([event.name() for event in selected_gpu_events], ["kernel_a"])
+        self.assertEqual(
+            [event.name() for event in selected_events],
+            ["cudaLaunchKernel", "aten::as_strided", "kernel_a"],
+        )
+
+    def test_build_submit_edges_from_ac2g_prefers_cuda_runtime(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockRuntimeExportEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1,
+                         is_user_annotation=False):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+                self._is_user_annotation = is_user_annotation
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return self._is_user_annotation
+
+        # Two CPU events share correlation_id=5. The heuristic would pick
+        # aten::as_strided (later end_ns), but the builder should prefer
+        # cudaLaunchKernel because it's the actual CUDA runtime call.
+        cpu_wrong = MockRuntimeExportEvent(
+            "aten::as_strided", device_type=DeviceType.CPU,
+            start_ns=90, end_ns=115, correlation_id=5,
+        )
+        cpu_right = MockRuntimeExportEvent(
+            "cudaLaunchKernel", device_type=DeviceType.CPU,
+            start_ns=100, end_ns=110, correlation_id=5,
+        )
+        gpu_kernel = MockRuntimeExportEvent(
+            "kernel_a", device_type=DeviceType.CUDA,
+            start_ns=120, end_ns=180, correlation_id=5,
+        )
+
+        all_events = [cpu_wrong, cpu_right, gpu_kernel]
+        cpu_events = [cpu_wrong, cpu_right]
+        gpu_events = [gpu_kernel]
+        node_ids = {id(e): f"k{i}" for i, e in enumerate(all_events)}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "trace.json"
+            trace_path.write_text(
+                json.dumps({"traceEvents": [
+                    {"ph": "X", "cat": "Trace", "name": "PyTorch Profiler (0)", "ts": 0.0, "dur": 1.0},
+                    {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 0.100, "dur": 0.010, "args": {"correlation": 5}},
+                    {"ph": "s", "cat": "ac2g", "id": 5, "pid": 1, "tid": 1, "ts": 0.100},
+                    {"ph": "X", "cat": "kernel", "name": "kernel_a", "pid": 0, "tid": 7, "ts": 0.120, "dur": 0.060, "args": {"correlation": 5, "device": 0, "stream": 7}},
+                    {"ph": "f", "cat": "ac2g", "id": 5, "pid": 0, "tid": 7, "ts": 0.120},
+                ]}),
+                encoding="utf-8",
+            )
+            endpoints = sdxl_profiler.parse_ac2g_flow_endpoints(trace_path)
+        matches = sdxl_profiler.match_ac2g_endpoints_to_raw_events(
+            all_events,
+            endpoints,
+            trace_start_ns=0,
+        )
+        edges, roles, attrs = sdxl_profiler.build_llamasim_submit_edges_from_ac2g(
+            node_ids,
+            cpu_events,
+            gpu_events,
+            all_events,
+            {5},
+            ac2g_endpoints=endpoints,
+            ac2g_matches=matches,
+            strict=True,
+        )
+        self.assertEqual(len(edges), 1)
+        src, dst, kind = edges[0]
+        self.assertEqual(src, node_ids[id(cpu_right)])
+        self.assertEqual(dst, node_ids[id(gpu_kernel)])
+        self.assertEqual(kind, "submit")
+        self.assertEqual(attrs[(src, dst)]["submit_exact"], "true")
+
+    def test_build_submit_edges_from_ac2g_matches_cuda_driver_launch(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockRuntimeExportEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1,
+                         is_user_annotation=False):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+                self._is_user_annotation = is_user_annotation
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return self._is_user_annotation
+
+        cpu_driver_launch = MockRuntimeExportEvent(
+            "cuLaunchKernel", device_type=DeviceType.CPU,
+            start_ns=100_000, end_ns=118_000, correlation_id=9,
+        )
+        gpu_kernel = MockRuntimeExportEvent(
+            "kernel_b", device_type=DeviceType.CUDA,
+            start_ns=121_000, end_ns=150_000, correlation_id=9,
+        )
+        all_events = [cpu_driver_launch, gpu_kernel]
+        node_ids = {id(e): f"k{i}" for i, e in enumerate(all_events)}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "trace.json"
+            trace_path.write_text(
+                json.dumps({"traceEvents": [
+                    {"ph": "X", "cat": "Trace", "name": "PyTorch Profiler (0)", "ts": 0.0, "dur": 200.0},
+                    {"ph": "X", "cat": "cuda_driver", "name": "cuLaunchKernel", "ts": 100.0, "dur": 18.0, "args": {"correlation": 9}},
+                    {"ph": "s", "cat": "ac2g", "id": 9, "pid": 1, "tid": 1, "ts": 100.0},
+                    {"ph": "X", "cat": "kernel", "name": "kernel_b", "pid": 0, "tid": 7, "ts": 121.0, "dur": 29.0, "args": {"correlation": 9, "device": 0, "stream": 7}},
+                    {"ph": "f", "cat": "ac2g", "id": 9, "pid": 0, "tid": 7, "ts": 121.0},
+                ]}),
+                encoding="utf-8",
+            )
+            endpoints = sdxl_profiler.parse_ac2g_flow_endpoints(trace_path)
+        matches = sdxl_profiler.match_ac2g_endpoints_to_raw_events(
+            all_events,
+            endpoints,
+            trace_start_ns=0,
+        )
+
+        edges, roles, attrs = sdxl_profiler.build_llamasim_submit_edges_from_ac2g(
+            node_ids,
+            [cpu_driver_launch],
+            [gpu_kernel],
+            all_events,
+            {9},
+            ac2g_endpoints=endpoints,
+            ac2g_matches=matches,
+            strict=True,
+        )
+
+        self.assertEqual(edges, [(node_ids[id(cpu_driver_launch)], node_ids[id(gpu_kernel)], "submit")])
+        self.assertEqual(roles[id(cpu_driver_launch)], "submit")
+        self.assertEqual(attrs[(edges[0][0], edges[0][1])]["submit_exact"], "true")
+
+    def test_build_submit_edges_from_ac2g_heuristic_fallback(self):
+        """When no CUDA runtime call is in the graph, falls back to heuristic."""
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+
+        class MockRuntimeExportEvent:
+            def __init__(self, name, *, device_type, start_ns, end_ns,
+                         correlation_id=0, linked_correlation_id=0,
+                         device_resource_id=7, thread_id=1,
+                         is_user_annotation=False):
+                self._name = name
+                self._device_type = device_type
+                self._start_ns = start_ns
+                self._end_ns = end_ns
+                self._correlation_id = correlation_id
+                self._linked_correlation_id = linked_correlation_id
+                self._device_resource_id = device_resource_id
+                self._thread_id = thread_id
+                self._is_user_annotation = is_user_annotation
+            def name(self): return self._name
+            def device_type(self): return self._device_type
+            def start_ns(self): return self._start_ns
+            def end_ns(self): return self._end_ns
+            def duration_ns(self): return self._end_ns - self._start_ns
+            def correlation_id(self): return self._correlation_id
+            def linked_correlation_id(self): return self._linked_correlation_id
+            def device_index(self): return 0
+            def device_resource_id(self): return self._device_resource_id
+            def start_thread_id(self): return self._thread_id
+            def end_thread_id(self): return self._thread_id
+            def is_async(self): return False
+            def is_user_annotation(self): return self._is_user_annotation
+
+        # Only a framework-level CPU event (no CUDA runtime call in graph)
+        cpu_aten = MockRuntimeExportEvent(
+            "aten::mm", device_type=DeviceType.CPU,
+            start_ns=100, end_ns=110, correlation_id=5,
+        )
+        gpu_kernel = MockRuntimeExportEvent(
+            "kernel_a", device_type=DeviceType.CUDA,
+            start_ns=120, end_ns=180, correlation_id=5,
+        )
+        all_events = [cpu_aten, gpu_kernel]
+        node_ids = {id(e): f"k{i}" for i, e in enumerate(all_events)}
+
+        # No CUDA runtime call — should use heuristic and mark submit_exact=false
+        edges, roles, attrs = sdxl_profiler.build_llamasim_submit_edges_from_ac2g(
+            node_ids, [cpu_aten], [gpu_kernel], all_events, {5},
+        )
+        self.assertEqual(len(edges), 1)
+        src, dst, _ = edges[0]
+        self.assertEqual(src, node_ids[id(cpu_aten)])
+        self.assertEqual(attrs[(src, dst)]["submit_exact"], "false")
+
+    def test_verify_llamasim_bundle_internal_consistency(self):
+        verifier = _load_verify_llamasim_bundle()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir, _source_artifacts = self._write_synthetic_llamasim_fixture(
+                Path(tmpdir)
+            )
+            report = verifier.verify_bundle(bundle_dir)
+
+        self.assertTrue(report.ok)
+        self.assertEqual(report.errors, [])
+        self.assertEqual(len(report.warnings), 1)
+        self.assertIn("Source-backed verification was not run", report.warnings[0])
+
+    def test_print_llamasim_runtime_summary(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = Path(tmpdir)
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps({
+                    "node_count": 10,
+                    "gpu_node_count": 4,
+                    "cpu_node_count": 6,
+                    "submit_edge_count": 4,
+                    "exact_submit_edge_count": 4,
+                    "heuristic_submit_edge_count": 0,
+                    "submit_edge_provenance": "ac2g_endpoint_exact",
+                    "ac2g_paired_count": 4,
+                    "ac2g_endpoint_matched_count": 4,
+                    "ac2g_endpoint_match_error_count": 0,
+                    "wait_edge_count": 3,
+                    "exact_wait_edge_count": 1,
+                    "heuristic_wait_edge_count": 2,
+                    "ws_sync_marker_count": 1,
+                    "ws_sync_leaf_count": 1,
+                    "wait_source_counts": {
+                        "wrapper_ws_sync": 1,
+                        "kineto_sync_frontier": 2,
+                    },
+                    "excluded_wait_source_counts": {
+                        "profiler_sync_excluded": 1,
+                    },
+                    "wait_kind_counts": {
+                        "device_sync": 1,
+                        "stream_sync": 2,
+                    },
+                }),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                sdxl_profiler.print_llamasim_runtime_summary(bundle_dir)
+
+        output = stdout.getvalue()
+        self.assertIn("submit_edges: exact=4/4 (100.00%)", output)
+        self.assertIn("wait_edges: exact=1/3 (33.33%)", output)
+        self.assertIn("wrapper_ws_sync=1", output)
+        self.assertIn("kineto_sync_frontier=2", output)
+        self.assertIn("excluded_wait_sources: profiler_sync_excluded=1", output)
+
+    def test_print_llamasim_runtime_summary_explains_missing_ws_sync(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = Path(tmpdir)
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps({
+                    "node_count": 10,
+                    "gpu_node_count": 4,
+                    "cpu_node_count": 6,
+                    "submit_edge_count": 4,
+                    "exact_submit_edge_count": 4,
+                    "wait_edge_count": 3,
+                    "exact_wait_edge_count": 0,
+                    "heuristic_wait_edge_count": 3,
+                    "ws_sync_marker_count": 0,
+                    "ws_sync_leaf_count": 0,
+                }),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                sdxl_profiler.print_llamasim_runtime_summary(bundle_dir)
+
+        output = stdout.getvalue()
+        self.assertIn("wait_edges: exact=0/3 (0.00%)", output)
+        self.assertIn("wrapper emitted no ws_sync evidence", output)
+
+    def test_print_llamasim_runtime_summary_reports_unmatched_ws_sync_samples(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = Path(tmpdir)
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps({
+                    "node_count": 10,
+                    "gpu_node_count": 4,
+                    "cpu_node_count": 6,
+                    "submit_edge_count": 4,
+                    "exact_submit_edge_count": 4,
+                    "wait_edge_count": 3,
+                    "exact_wait_edge_count": 0,
+                    "heuristic_wait_edge_count": 3,
+                    "ws_sync_marker_count": 1,
+                    "ws_sync_leaf_count": 0,
+                    "ws_sync_unmatched_marker_samples": [{
+                        "marker": "ws_sync:0:0:event_sync:1,2",
+                        "kind": "event_sync",
+                        "src_launch_ids": "1,2",
+                        "child_cpu_event_names": ["aten::empty"],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                sdxl_profiler.print_llamasim_runtime_summary(bundle_dir)
+
+        output = stdout.getvalue()
+        self.assertIn("ws_sync markers were emitted but not matched", output)
+        self.assertIn("ws_sync:0:0:event_sync:1,2", output)
+        self.assertIn("aten::empty", output)
+
+    def test_print_llamasim_runtime_summary_reports_unresolved_ws_sync_launches(self):
+        sdxl_profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = Path(tmpdir)
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps({
+                    "node_count": 10,
+                    "gpu_node_count": 4,
+                    "cpu_node_count": 6,
+                    "submit_edge_count": 4,
+                    "exact_submit_edge_count": 4,
+                    "wait_edge_count": 3,
+                    "exact_wait_edge_count": 0,
+                    "heuristic_wait_edge_count": 3,
+                    "ws_sync_marker_count": 1,
+                    "ws_sync_leaf_count": 1,
+                    "ws_sync_unresolved_launch_samples": [{
+                        "graph_id": 0,
+                        "sync_id": 0,
+                        "kind": "event_sync",
+                        "missing_launch_ids": "2",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                sdxl_profiler.print_llamasim_runtime_summary(bundle_dir)
+
+        output = stdout.getvalue()
+        self.assertIn("ws_sync leaves were found but no exact wait edges", output)
+        self.assertIn('"missing_launch_ids": "2"', output)
+
+    def test_verify_llamasim_bundle_against_source(self):
+        verifier = _load_verify_llamasim_bundle()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir, source_artifacts = self._write_synthetic_llamasim_fixture(
+                Path(tmpdir)
+            )
+            report = verifier.verify_bundle(
+                bundle_dir,
+                source_artifacts=source_artifacts,
+            )
+
+        self.assertTrue(report.ok)
+        self.assertEqual(report.errors, [])
+        self.assertEqual(report.warnings, [])
+        self.assertTrue(
+            any(
+                "Source-backed verification completed" in info
+                for info in report.infos
+            )
+        )
+
     def test_qwen_parse_args_defaults(self):
         qwen_profiler = _load_profile_qwen_image_common()
 
@@ -3181,6 +5600,1776 @@ class TestExperimentalUtils(TestCase):
         self.assertEqual(args.dtype, "float32")
         self.assertEqual(args.negative_prompt, " ")
         self.assertEqual(args.true_cfg_scale, 4.0)
+
+    def test_run_sdxl_resolve_image_path_includes_steps(self):
+        runner = _load_run_sdxl_turbo_gpu()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                image=None,
+                output_dir=tmpdir,
+                fusion="none",
+                steps=4,
+            )
+
+            image_path = runner.resolve_image_path(args)
+
+            self.assertEqual(
+                image_path,
+                Path(tmpdir) / "sdxl_turbo_gpu_run_steps4_output.png",
+            )
+
+    def test_run_qwen_resolve_image_path_includes_steps(self):
+        runner = _load_run_qwen_image()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                image=None,
+                output_dir=tmpdir,
+                fusion="none",
+                steps=4,
+            )
+
+            image_path = runner.resolve_image_path(args)
+
+            self.assertEqual(
+                image_path,
+                Path(tmpdir) / "qwen_image_run_steps4_output.png",
+            )
+
+    def test_run_sdxl_main_reports_gpu_memory(self):
+        runner = _load_run_sdxl_turbo_gpu()
+
+        class FakeImage:
+            def save(self, path) -> None:
+                Path(path).write_bytes(b"fake-png")
+
+        class FakeOutput:
+            def __init__(self) -> None:
+                self.images = torch.zeros(1, 4, 16, 16)
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.progress_bar_disabled = None
+
+            def set_progress_bar_config(self, *, disable: bool) -> None:
+                self.progress_bar_disabled = disable
+
+            def __call__(self, **kwargs):
+                del kwargs
+                return FakeOutput()
+
+        fake_pipe = FakePipe()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "sdxl_turbo_gpu_run_steps1_output.png"
+            stdout = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_sdxl_turbo_gpu.py",
+                    "--warmup-runs",
+                    "0",
+                    "--output-dir",
+                    tmpdir,
+                ],
+            ), patch.object(
+                runner,
+                "validate_run_device",
+                return_value=torch.device("cuda:0"),
+            ), patch.object(
+                runner,
+                "validate_fusion_runtime",
+            ), patch.object(
+                runner,
+                "load_pipeline",
+                return_value=fake_pipe,
+            ), patch.object(
+                runner,
+                "maybe_compile",
+            ), patch.object(
+                runner,
+                "synchronize_device",
+            ), patch.object(
+                runner,
+                "decode_latents_to_pil",
+                return_value=[FakeImage()],
+            ), patch.object(
+                runner.torch.cuda,
+                "reset_peak_memory_stats",
+            ), patch.object(
+                runner.torch.cuda,
+                "memory_allocated",
+                return_value=int(1753.0 * 1024 * 1024),
+            ), patch.object(
+                runner.torch.cuda,
+                "max_memory_allocated",
+                return_value=int(4920.7 * 1024 * 1024),
+            ), patch.object(
+                sys,
+                "stdout",
+                stdout,
+            ):
+                runner.main()
+
+            output = stdout.getvalue()
+            self.assertTrue(image_path.is_file())
+            self.assertIn(
+                "GPU memory: 1753.0 MB allocated, 4920.7 MB peak",
+                output,
+            )
+
+    def test_run_accelerate_resolve_image_path_includes_steps(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                image=None,
+                output_dir=tmpdir,
+                pipeline="sdxl-turbo",
+                offload_mode="model",
+                fusion="none",
+                steps=4,
+            )
+
+            image_path = runner.resolve_image_path(args)
+
+            self.assertEqual(
+                image_path,
+                Path(tmpdir) / "sdxl_turbo_model_cpu_offload_steps4_output.png",
+            )
+
+    def test_run_accelerate_main_reports_gpu_memory(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        class FakeImage:
+            def save(self, path) -> None:
+                Path(path).write_bytes(b"fake-png")
+
+        class FakeOutput:
+            def __init__(self) -> None:
+                self.images = torch.zeros(1, 4, 16, 16)
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self._execution_device = torch.device("cuda:0")
+                self.progress_bar_disabled = None
+
+            def set_progress_bar_config(self, *, disable: bool) -> None:
+                self.progress_bar_disabled = disable
+
+            def maybe_free_model_hooks(self) -> None:
+                return None
+
+        fake_pipe = FakePipe()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "sdxl_turbo_model_cpu_offload_steps8_output.png"
+            stdout = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_accelerate_cpu_offload.py",
+                    "sdxl-turbo",
+                    "--output-dir",
+                    tmpdir,
+                ],
+            ), patch.object(
+                runner,
+                "validate_run_device",
+                return_value=torch.device("cuda:0"),
+            ), patch.object(
+                runner.sdxl_common,
+                "validate_fusion_runtime",
+            ), patch.object(
+                runner,
+                "ensure_accelerate_available",
+                return_value="1.0",
+            ), patch.object(
+                runner,
+                "load_pipeline",
+                return_value=fake_pipe,
+            ), patch.object(
+                runner,
+                "maybe_compile",
+            ), patch.object(
+                runner,
+                "apply_cpu_offload",
+            ), patch.object(
+                runner.sdxl_common,
+                "synchronize_device",
+            ), patch.object(
+                runner,
+                "run_warmups",
+                return_value=0.1,
+            ), patch.object(
+                runner,
+                "run_inference",
+                return_value=(FakeOutput(), 0.2),
+            ), patch.object(
+                runner,
+                "decode_images",
+                return_value=([FakeImage()], 0.3),
+            ), patch.object(
+                runner.torch.cuda,
+                "reset_peak_memory_stats",
+            ), patch.object(
+                runner.torch.cuda,
+                "memory_allocated",
+                return_value=int(1753.0 * 1024 * 1024),
+            ), patch.object(
+                runner.torch.cuda,
+                "max_memory_allocated",
+                return_value=int(4920.7 * 1024 * 1024),
+            ), patch.object(
+                sys,
+                "stdout",
+                stdout,
+            ):
+                runner.main()
+
+            output = stdout.getvalue()
+            self.assertTrue(image_path.is_file())
+            self.assertIn(
+                "GPU memory: 1753.0 MB allocated, 4920.7 MB peak",
+                output,
+            )
+
+    def test_run_weight_streaming_resolve_image_path_creates_output_dir(self):
+        runner = _load_run_weight_streaming()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "nested", "images")
+            args = argparse.Namespace(image=None, output_dir=output_dir, steps=4)
+
+            image_path = runner.resolve_image_path(args)
+
+            self.assertEqual(
+                image_path,
+                Path(output_dir) / "weight_streaming_run_steps4_output.png",
+            )
+            self.assertTrue(image_path.parent.is_dir())
+
+    def test_run_weight_streaming_main_saves_image(self):
+        runner = _load_run_weight_streaming()
+
+        class FakeSchedule:
+            def __init__(self) -> None:
+                self.nodes = []
+                self.prefetches = []
+                self.h2d_prefetches = []
+                self.evict_vram = []
+                self.evict_dram = []
+                self.cold_starts = []
+                self.tensors = []
+
+        class FakeImage:
+            def save(self, path) -> None:
+                Path(path).write_bytes(b"fake-png")
+
+        class FakeOutput:
+            def __init__(self) -> None:
+                self.images = torch.zeros(1, 4, 16, 16)
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.unet = object()
+                self.progress_bar_disabled = None
+
+            def set_progress_bar_config(self, *, disable: bool) -> None:
+                self.progress_bar_disabled = disable
+
+            def __call__(self, **kwargs):
+                del kwargs
+                return FakeOutput()
+
+        fake_pipe = FakePipe()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "images")
+            stdout = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_weight_streaming.py",
+                    "--plan-dir",
+                    tmpdir,
+                    "--device",
+                    "cpu",
+                    "--warmup-runs",
+                    "0",
+                    "--output-dir",
+                    output_dir,
+                ],
+            ), patch.object(
+                runner,
+                "resolve_schedule_paths",
+                return_value=(Path(tmpdir) / "jit_sim_prune_schedule.json", "", ""),
+            ), patch.object(
+                runner,
+                "load_io_schedule",
+                return_value=FakeSchedule(),
+            ), patch.object(
+                runner.WeightStreamRuntime,
+                "initialize",
+                return_value=unittest.mock.Mock(),
+            ), patch.object(
+                runner.WeightStreamRuntime,
+                "reset",
+            ), patch.object(
+                runner,
+                "load_pipeline",
+                return_value=fake_pipe,
+            ), patch.object(
+                runner,
+                "register_model_weights",
+                return_value=7,
+            ), patch.object(
+                runner,
+                "decode_latents_to_pil",
+                return_value=[FakeImage()],
+            ), patch.object(
+                runner.torch,
+                "compile",
+                return_value=fake_pipe.unet,
+            ), patch.object(
+                runner.torch.cuda,
+                "synchronize",
+                return_value=None,
+            ), patch.object(
+                sys,
+                "stdout",
+                stdout,
+            ):
+                runner.main()
+
+            image_path = Path(output_dir) / "weight_streaming_run_steps1_output.png"
+            output = stdout.getvalue()
+            self.assertTrue(image_path.is_file())
+            self.assertEqual(image_path.read_bytes(), b"fake-png")
+            self.assertEqual(fake_pipe.progress_bar_disabled, True)
+            self.assertIn(f"image_path: {image_path}", output)
+            self.assertIn("steps: 1", output)
+            self.assertIn("load_seconds:", output)
+            self.assertIn("warmup_seconds:", output)
+            self.assertIn("inference_seconds:", output)
+            self.assertIn("decode_seconds:", output)
+            self.assertIn("save_seconds:", output)
+            self.assertIn("e2e_seconds:", output)
+
+    def test_run_accelerate_cpu_offload_defaults(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        with patch.object(
+            sys,
+            "argv",
+            ["run_accelerate_cpu_offload.py", "sdxl-turbo"],
+        ):
+            sdxl_args = runner.parse_args()
+
+        with patch.object(
+            sys,
+            "argv",
+            ["run_accelerate_cpu_offload.py", "qwen-image"],
+        ):
+            qwen_args = runner.parse_args()
+
+        self.assertEqual(sdxl_args.offload_mode, "model")
+        self.assertEqual(sdxl_args.steps, 8)
+        self.assertEqual(sdxl_args.height, 512)
+        self.assertEqual(sdxl_args.width, 512)
+        self.assertEqual(sdxl_args.prompt, "a cute cat and a cute dog in a park")
+        self.assertEqual(qwen_args.offload_mode, "sequential")
+        self.assertEqual(qwen_args.dtype, "bfloat16")
+
+    def test_run_accelerate_cpu_offload_accepts_fusion_inductor(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run_accelerate_cpu_offload.py",
+                "sdxl-turbo",
+                "--fusion",
+                "inductor",
+            ],
+        ):
+            args = runner.parse_args()
+
+        self.assertEqual(args.fusion, "inductor")
+
+    def test_qwen_model_offload_oom_mentions_sequential_guidance(self):
+        runner = _load_run_accelerate_cpu_offload()
+        args = argparse.Namespace(
+            pipeline="qwen-image",
+            offload_mode="model",
+            model="/data/llamasim/models/qwen-image-2512",
+            device="cuda:0",
+            dtype="bfloat16",
+        )
+
+        with patch.object(
+            runner.qwen_common,
+            "run_pipeline",
+            side_effect=torch.OutOfMemoryError("CUDA out of memory"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "--offload-mode sequential",
+            ) as cm:
+                runner.run_qwen_pipeline_with_oom_guidance(
+                    pipe=object(),
+                    args=args,
+                    generator=None,
+                )
+
+        self.assertIn("entire transformer", str(cm.exception))
+
+    def test_profile_accelerate_cpu_offload_defaults(self):
+        profiler = _load_profile_accelerate_cpu_offload()
+
+        with patch.object(
+            sys,
+            "argv",
+            ["profile_accelerate_cpu_offload.py", "sdxl-turbo"],
+        ):
+            sdxl_args = profiler.parse_args()
+
+        with patch.object(
+            sys,
+            "argv",
+            ["profile_accelerate_cpu_offload.py", "qwen-image"],
+        ):
+            qwen_args = profiler.parse_args()
+
+        self.assertEqual(sdxl_args.offload_mode, "model")
+        self.assertEqual(qwen_args.offload_mode, "sequential")
+        self.assertEqual(sdxl_args.warmup_runs, 1)
+        self.assertEqual(qwen_args.warmup_runs, 1)
+        self.assertTrue(qwen_args.profile_memory)
+        self.assertTrue(qwen_args.record_shapes)
+        self.assertTrue(qwen_args.with_stack)
+
+    def test_profile_accelerate_cpu_offload_accepts_fusion_inductor(self):
+        profiler = _load_profile_accelerate_cpu_offload()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "profile_accelerate_cpu_offload.py",
+                "qwen-image",
+                "--fusion",
+                "inductor",
+            ],
+        ):
+            args = profiler.parse_args()
+
+        self.assertEqual(args.fusion, "inductor")
+
+    def test_profile_accelerate_cpu_offload_accepts_none_mode(self):
+        profiler = _load_profile_accelerate_cpu_offload()
+
+        with patch.object(
+            sys,
+            "argv",
+            ["profile_accelerate_cpu_offload.py", "sdxl-turbo", "--offload-mode", "none"],
+        ):
+            args = profiler.parse_args()
+
+        self.assertEqual(args.offload_mode, "none")
+
+    def test_apply_cpu_offload_none_moves_pipeline_to_device_without_hooks(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.to_calls = []
+                self.model_calls = 0
+                self.sequential_calls = 0
+
+            def to(self, device):
+                self.to_calls.append(device)
+                return self
+
+            def enable_model_cpu_offload(self, *, device):
+                del device
+                self.model_calls += 1
+
+            def enable_sequential_cpu_offload(self, *, device):
+                del device
+                self.sequential_calls += 1
+
+        pipe = FakePipe()
+        args = argparse.Namespace(offload_mode="none")
+        runner.apply_cpu_offload(pipe, args, torch.device("cuda:0"))
+
+        self.assertEqual(pipe.to_calls, [torch.device("cuda:0")])
+        self.assertEqual(pipe.model_calls, 0)
+        self.assertEqual(pipe.sequential_calls, 0)
+
+    def test_maybe_compile_sdxl_offload_compiles_unet(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.unet = object()
+
+        pipe = FakePipe()
+        args = argparse.Namespace(
+            fusion="inductor",
+            pipeline="sdxl-turbo",
+            compile_mode="reduce-overhead",
+            fullgraph=True,
+        )
+
+        compiled_unet = object()
+        with patch.object(
+            runner.sdxl_common.torch,
+            "compile",
+            autospec=True,
+            return_value=compiled_unet,
+        ) as compile_mock:
+            runner.maybe_compile(pipe, args)
+
+        compile_mock.assert_called_once_with(
+            unittest.mock.ANY,
+            backend="inductor",
+            mode="reduce-overhead",
+            fullgraph=True,
+        )
+        self.assertIs(pipe.unet, compiled_unet)
+
+    def test_maybe_compile_qwen_offload_compiles_transformer_forward(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        class FakeTransformer:
+            def __init__(self) -> None:
+                self.forward = object()
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.transformer = FakeTransformer()
+
+        pipe = FakePipe()
+        args = argparse.Namespace(
+            fusion="inductor",
+            pipeline="qwen-image",
+            compile_mode="max-autotune",
+            fullgraph=False,
+        )
+
+        compiled_forward = object()
+        with patch.object(
+            runner.qwen_common.torch,
+            "compile",
+            autospec=True,
+            return_value=compiled_forward,
+        ) as compile_mock:
+            runner.maybe_compile(pipe, args)
+
+        compile_mock.assert_called_once_with(
+            unittest.mock.ANY,
+            backend="inductor",
+            mode="max-autotune",
+            fullgraph=False,
+        )
+        self.assertIs(pipe.transformer.forward, compiled_forward)
+
+    def test_profile_accelerate_cpu_offload_output_paths(self):
+        profiler = _load_profile_accelerate_cpu_offload()
+        args = argparse.Namespace(
+            pipeline="qwen-image",
+            offload_mode="sequential",
+            fusion="none",
+            output_dir="/tmp/offload_profile",
+            trace=None,
+            trace_csv=None,
+            execution_trace=None,
+            llamasim_output_dir=None,
+            image=None,
+        )
+
+        output_paths = profiler.resolve_output_paths(args)
+
+        self.assertEqual(
+            os.fspath(output_paths.trace_path),
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_trace.json",
+        )
+        self.assertEqual(
+            os.fspath(output_paths.csv_path),
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_trace.csv",
+        )
+        self.assertEqual(
+            os.fspath(output_paths.image_path),
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_output.png",
+        )
+        self.assertEqual(
+            os.fspath(output_paths.execution_trace_path),
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_execution_trace.json",
+        )
+        self.assertEqual(
+            os.fspath(output_paths.llamasim_output_dir),
+            "/tmp/offload_profile/llama_bundle",
+        )
+
+    def test_profile_sdxl_gpu_output_dir_defaults_to_llama_bundle(self):
+        profiler = _load_profile_sdxl_turbo_common()
+        args = argparse.Namespace(
+            fusion="inductor",
+            output_dir="/tmp/sdxl_gpu_profile",
+            trace=None,
+            trace_csv=None,
+            image=None,
+            dot_level="llamasim-runtime",
+            fx_dot=None,
+            execution_dot=None,
+            execution_trace=None,
+            memory_dot=None,
+            kineto_dot=None,
+            kineto_map=None,
+            hybrid_dot=None,
+            runtime_io_dot=None,
+            llamasim_output_dir=None,
+        )
+
+        output_paths = profiler.resolve_output_paths(
+            args,
+            "sdxl_turbo_gpu",
+            default_llamasim_output_dirname="llama_bundle",
+        )
+
+        self.assertEqual(
+            os.fspath(output_paths.llamasim_output_dir),
+            "/tmp/sdxl_gpu_profile/llama_bundle",
+        )
+
+    def test_maybe_compile_sdxl_enables_ws_markers_for_llamasim_bundle(self):
+        profiler = _load_profile_sdxl_turbo_common()
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.unet = lambda *args, **kwargs: None
+
+        pipe = FakePipe()
+        args = argparse.Namespace(
+            fusion="inductor",
+            compile_mode="default",
+            fullgraph=False,
+        )
+        output_paths = profiler.OutputPaths(
+            trace_path=Path("/tmp/trace.json"),
+            csv_path=Path("/tmp/trace.csv"),
+            image_path=Path("/tmp/out.png"),
+            execution_trace_path=None,
+            fx_dot_path=None,
+            execution_dot_path=None,
+            memory_dot_path=None,
+            kineto_dot_path=None,
+            kineto_map_path=None,
+            hybrid_dot_path=None,
+            runtime_io_dot_path=None,
+            llamasim_output_dir=Path("/tmp/llama_bundle"),
+        )
+
+        old_emit_ids = profiler.torch._inductor.config.weight_streaming_emit_ids
+        old_emit_markers = (
+            profiler.torch._inductor.config.weight_streaming_emit_launch_markers
+        )
+        old_emit_sync_markers = (
+            profiler.torch._inductor.config.weight_streaming_emit_sync_markers
+        )
+        old_output_code = profiler.torch._inductor.config.weight_streaming_output_code
+        try:
+            profiler.torch._inductor.config.weight_streaming_emit_ids = False
+            profiler.torch._inductor.config.weight_streaming_emit_launch_markers = False
+            profiler.torch._inductor.config.weight_streaming_emit_sync_markers = False
+            profiler.torch._inductor.config.weight_streaming_output_code = ""
+            with patch.object(
+                profiler.torch,
+                "compile",
+                autospec=True,
+                side_effect=lambda fn, **kwargs: fn,
+            ) as compile_mock, patch(
+                "torch._dynamo.reset",
+                autospec=True,
+            ) as reset_mock:
+                profiler.maybe_compile(pipe, args, output_paths)
+
+            compile_mock.assert_called_once_with(
+                unittest.mock.ANY,
+                backend="inductor",
+                mode="default",
+                fullgraph=False,
+            )
+            reset_mock.assert_called_once_with()
+            self.assertTrue(
+                profiler.torch._inductor.config.weight_streaming_emit_ids
+            )
+            self.assertTrue(
+                profiler.torch._inductor.config.weight_streaming_emit_launch_markers
+            )
+            self.assertTrue(
+                profiler.torch._inductor.config.weight_streaming_emit_sync_markers
+            )
+            self.assertEqual(
+                profiler.torch._inductor.config.weight_streaming_output_code,
+                "/tmp/llama_bundle",
+            )
+        finally:
+            profiler.torch._inductor.config.weight_streaming_emit_ids = old_emit_ids
+            profiler.torch._inductor.config.weight_streaming_emit_launch_markers = (
+                old_emit_markers
+            )
+            profiler.torch._inductor.config.weight_streaming_emit_sync_markers = (
+                old_emit_sync_markers
+            )
+            profiler.torch._inductor.config.weight_streaming_output_code = (
+                old_output_code
+            )
+
+    def test_maybe_compile_qwen_enables_ws_markers_for_llamasim_bundle(self):
+        qwen_profiler = _load_profile_qwen_image_common()
+
+        class FakeTransformer:
+            def __init__(self) -> None:
+                self.forward = lambda *args, **kwargs: None
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.transformer = FakeTransformer()
+
+        pipe = FakePipe()
+        args = argparse.Namespace(
+            fusion="inductor",
+            compile_mode="default",
+            fullgraph=False,
+        )
+        output_paths = qwen_profiler.sdxl_common.OutputPaths(
+            trace_path=Path("/tmp/trace.json"),
+            csv_path=Path("/tmp/trace.csv"),
+            image_path=Path("/tmp/out.png"),
+            execution_trace_path=None,
+            fx_dot_path=None,
+            execution_dot_path=None,
+            memory_dot_path=None,
+            kineto_dot_path=None,
+            kineto_map_path=None,
+            hybrid_dot_path=None,
+            runtime_io_dot_path=None,
+            llamasim_output_dir=Path("/tmp/qwen_llama_bundle"),
+        )
+
+        config = qwen_profiler.torch._inductor.config
+        old_emit_ids = config.weight_streaming_emit_ids
+        old_emit_markers = config.weight_streaming_emit_launch_markers
+        old_emit_sync_markers = config.weight_streaming_emit_sync_markers
+        old_output_code = config.weight_streaming_output_code
+        try:
+            config.weight_streaming_emit_ids = False
+            config.weight_streaming_emit_launch_markers = False
+            config.weight_streaming_emit_sync_markers = False
+            config.weight_streaming_output_code = ""
+            with patch.object(
+                qwen_profiler.torch,
+                "compile",
+                autospec=True,
+                side_effect=lambda fn, **kwargs: fn,
+            ) as compile_mock, patch(
+                "torch._dynamo.reset",
+                autospec=True,
+            ) as reset_mock:
+                qwen_profiler.maybe_compile(pipe, args, output_paths)
+
+            compile_mock.assert_called_once_with(
+                unittest.mock.ANY,
+                backend="inductor",
+                mode="default",
+                fullgraph=False,
+            )
+            reset_mock.assert_called_once_with()
+            self.assertTrue(config.weight_streaming_emit_ids)
+            self.assertTrue(config.weight_streaming_emit_launch_markers)
+            self.assertTrue(config.weight_streaming_emit_sync_markers)
+            self.assertEqual(
+                config.weight_streaming_output_code,
+                "/tmp/qwen_llama_bundle",
+            )
+        finally:
+            config.weight_streaming_emit_ids = old_emit_ids
+            config.weight_streaming_emit_launch_markers = old_emit_markers
+            config.weight_streaming_emit_sync_markers = old_emit_sync_markers
+            config.weight_streaming_output_code = old_output_code
+
+    def test_demo_profile_time_split_versions(self):
+        splitter = _load_demo_profile_time_split()
+        self.assertEqual(splitter.include_v0_version(["v5"]), ["v0", "v5"])
+        self.assertEqual(splitter.include_v0_version(["v0", "v5"]), ["v0", "v5"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = os.path.join(tmpdir, "manifest.json")
+            node_csv_path = os.path.join(tmpdir, "runtime_nodes.csv")
+            edge_csv_path = os.path.join(tmpdir, "runtime_edges.csv")
+            timing_csv_path = os.path.join(tmpdir, "ggml_profile_node_records.csv")
+
+            with open(manifest_path, "w") as handle:
+                json.dump(
+                    {
+                        "schema": "pytorch_runtime_v3",
+                        "node_csv": "runtime_nodes.csv",
+                        "edge_csv": "runtime_edges.csv",
+                        "timing_csv": "ggml_profile_node_records.csv",
+                    },
+                    handle,
+                )
+
+            node_fieldnames = [
+                "step",
+                "node_id",
+                "node_n",
+                "node_name",
+                "op_name",
+                "node_kind",
+                "resource_kind",
+                "resource_id",
+                "runtime_role",
+                "device_type",
+                "device_index",
+                "duration_ns",
+            ]
+            node_rows = [
+                {
+                    "step": "0",
+                    "node_id": "k0",
+                    "node_n": "0",
+                    "node_name": "aten::empty",
+                    "op_name": "aten::empty",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "10",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k1",
+                    "node_n": "1",
+                    "node_name": "cudaLaunchKernel",
+                    "op_name": "cudaLaunchKernel",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "submit",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "5",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k2",
+                    "node_n": "2",
+                    "node_name": "sgemm_kernel",
+                    "op_name": "sgemm_kernel",
+                    "node_kind": "gpu_runtime",
+                    "resource_kind": "gpu_stream",
+                    "resource_id": "7",
+                    "runtime_role": "gpu_runtime",
+                    "device_type": "CUDA",
+                    "device_index": "0",
+                    "duration_ns": "30",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k3",
+                    "node_n": "3",
+                    "node_name": "cudaMemcpyAsync",
+                    "op_name": "cudaMemcpyAsync",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "submit",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "7",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k4",
+                    "node_n": "4",
+                    "node_name": "Memcpy HtoD (Pageable -> Device)",
+                    "op_name": "Memcpy HtoD (Pageable -> Device)",
+                    "node_kind": "gpu_runtime",
+                    "resource_kind": "gpu_stream",
+                    "resource_id": "7",
+                    "runtime_role": "gpu_runtime",
+                    "device_type": "CUDA",
+                    "device_index": "0",
+                    "duration_ns": "40",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k5",
+                    "node_n": "5",
+                    "node_name": "cudaStreamSynchronize",
+                    "op_name": "cudaStreamSynchronize",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "wait",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "50",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k6",
+                    "node_n": "6",
+                    "node_name": "cudaEventSynchronize",
+                    "op_name": "cudaEventSynchronize",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "wait",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "12",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k7",
+                    "node_n": "7",
+                    "node_name": "cudaStreamIsCapturing",
+                    "op_name": "cudaStreamIsCapturing",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "3",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k8",
+                    "node_n": "8",
+                    "node_name": "cudaDeviceSynchronize",
+                    "op_name": "cudaDeviceSynchronize",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "wait",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "11",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k9",
+                    "node_n": "9",
+                    "node_name": "cudaMemcpyAsync reload",
+                    "op_name": "cudaMemcpyAsync reload",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "submit",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "6",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k10",
+                    "node_n": "10",
+                    "node_name": "cudaStreamSynchronize reload wait",
+                    "op_name": "cudaStreamSynchronize reload wait",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "wait",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "9",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k11",
+                    "node_n": "11",
+                    "node_name": "Memcpy HtoD (Pageable -> Device) reload",
+                    "op_name": "Memcpy HtoD (Pageable -> Device) reload",
+                    "node_kind": "gpu_runtime",
+                    "resource_kind": "gpu_stream",
+                    "resource_id": "7",
+                    "runtime_role": "gpu_runtime",
+                    "device_type": "CUDA",
+                    "device_index": "0",
+                    "duration_ns": "13",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k12",
+                    "node_n": "12",
+                    "node_name": "detach",
+                    "op_name": "detach",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "4",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k13",
+                    "node_n": "13",
+                    "node_name": "cudaStreamSynchronize downstream",
+                    "op_name": "cudaStreamSynchronize downstream",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "2",
+                },
+            ]
+            with open(node_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=node_fieldnames)
+                writer.writeheader()
+                writer.writerows(node_rows)
+
+            edge_fieldnames = ["step", "src_node_id", "dst_node_id", "edge_kind"]
+            edge_rows = [
+                {
+                    "step": "0",
+                    "src_node_id": "k1",
+                    "dst_node_id": "k2",
+                    "edge_kind": "submit",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k3",
+                    "dst_node_id": "k4",
+                    "edge_kind": "submit",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k4",
+                    "dst_node_id": "k5",
+                    "edge_kind": "wait",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k2",
+                    "dst_node_id": "k6",
+                    "edge_kind": "wait",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k3",
+                    "dst_node_id": "k5",
+                    "edge_kind": "thread_order",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k9",
+                    "dst_node_id": "k10",
+                    "edge_kind": "thread_order",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k11",
+                    "dst_node_id": "k10",
+                    "edge_kind": "wait",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k10",
+                    "dst_node_id": "k12",
+                    "edge_kind": "thread_order",
+                },
+                {
+                    "step": "0",
+                    "src_node_id": "k12",
+                    "dst_node_id": "k13",
+                    "edge_kind": "thread_order",
+                },
+            ]
+            with open(edge_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=edge_fieldnames)
+                writer.writeheader()
+                writer.writerows(edge_rows)
+
+            timing_fieldnames = [
+                "step",
+                "node_n",
+                "node_name",
+                "node_compute_time_ns",
+                "node_id",
+                "device_type",
+                "device_index",
+                "node_kind",
+                "resource_kind",
+                "resource_id",
+                "runtime_role",
+            ]
+            timing_rows = [
+                {
+                    "step": row["step"],
+                    "node_n": row["node_n"],
+                    "node_name": row["node_name"],
+                    "node_compute_time_ns": row["duration_ns"],
+                    "node_id": row["node_id"],
+                    "device_type": row["device_type"],
+                    "device_index": row["device_index"],
+                    "node_kind": row["node_kind"],
+                    "resource_kind": row["resource_kind"],
+                    "resource_id": row["resource_id"],
+                    "runtime_role": row["runtime_role"],
+                }
+                for row in node_rows
+            ]
+            with open(timing_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=timing_fieldnames)
+                writer.writeheader()
+                writer.writerows(timing_rows)
+
+            analysis, reports, attributions_by_version = splitter.analyze_bundle(
+                tmpdir,
+                ["v0", "v1", "v2", "v3", "v4", "v5"],
+            )
+
+            self.assertEqual(analysis.paths.bundle_dir, Path(os.path.realpath(tmpdir)))
+            self.assertEqual(reports["v0"].raw_total_ns, 202)
+            self.assertEqual(reports["v0"].raw_total_ns_cpu, 119)
+            self.assertEqual(reports["v0"].raw_total_ns_gpu, 83)
+            self.assertEqual(reports["v0"].pure_compute_ns, 202)
+            self.assertEqual(reports["v1"].pure_compute_ns, 44)
+            self.assertEqual(reports["v1"].ssd_time_ns, 158)
+            self.assertEqual(reports["v2"].pure_compute_ns, 52)
+            self.assertEqual(reports["v2"].ssd_time_ns, 150)
+            self.assertEqual(reports["v3"].pure_compute_ns, 64)
+            self.assertEqual(reports["v3"].pure_compute_ns_cpu, 34)
+            self.assertEqual(reports["v3"].pure_compute_ns_gpu, 30)
+            self.assertEqual(reports["v3"].ssd_time_ns, 138)
+            self.assertEqual(reports["v4"].pure_compute_ns, 77)
+            self.assertEqual(reports["v4"].ssd_time_ns, 125)
+            self.assertEqual(reports["v4"].ssd_time_ns_cpu, 72)
+            self.assertEqual(reports["v4"].ssd_time_ns_gpu, 53)
+            self.assertEqual(reports["v5"].pure_compute_ns, 75)
+            self.assertEqual(reports["v5"].pure_compute_ns_cpu, 45)
+            self.assertEqual(reports["v5"].pure_compute_ns_gpu, 30)
+            self.assertEqual(reports["v5"].ssd_time_ns, 127)
+            self.assertEqual(reports["v5"].ssd_time_ns_cpu, 74)
+            self.assertEqual(reports["v5"].ssd_time_ns_gpu, 53)
+
+            v3_by_node_id = {
+                attribution.node_id: attribution
+                for attribution in attributions_by_version["v3"]
+            }
+            v4_by_node_id = {
+                attribution.node_id: attribution
+                for attribution in attributions_by_version["v4"]
+            }
+            v5_by_node_id = {
+                attribution.node_id: attribution
+                for attribution in attributions_by_version["v5"]
+            }
+            self.assertEqual(v3_by_node_id["k5"].classification, "wait_for_transfer")
+            self.assertEqual(v3_by_node_id["k6"].classification, "pure_cpu_control")
+            self.assertEqual(v3_by_node_id["k8"].classification, "wait_or_sync")
+            self.assertEqual(v3_by_node_id["k13"].classification, "wait_or_sync")
+            self.assertEqual(v4_by_node_id["k8"].classification, "pure_cpu_control")
+            self.assertEqual(v4_by_node_id["k13"].classification, "pure_cpu_control")
+            self.assertEqual(
+                v5_by_node_id["k13"].classification, "wait_for_transfer_ancestor"
+            )
+            self.assertEqual(v5_by_node_id["k13"].ssd_time_ns, 2)
+
+            manifest_analysis = splitter.load_bundle_analysis(manifest_path)
+            self.assertEqual(
+                manifest_analysis.paths.bundle_dir,
+                Path(os.path.realpath(tmpdir)),
+            )
+
+            summary_text = splitter.render_summary_table_with_view(
+                reports,
+                summary_view="split",
+            )
+            self.assertIn("raw_cpu_us", summary_text)
+            self.assertIn("raw_gpu_us", summary_text)
+            self.assertIn("ssd_gpu_us", summary_text)
+
+            output_dir = os.path.join(tmpdir, "reports")
+            written_paths = splitter.write_reports(
+                analysis,
+                reports,
+                attributions_by_version,
+                Path(output_dir),
+            )
+            self.assertTrue(os.path.isfile(written_paths["summary"]))
+            self.assertTrue(os.path.isfile(written_paths["v3"]))
+            self.assertTrue(os.path.isfile(written_paths["v5"]))
+
+    def test_demo_profile_time_split_v6_strips_transfer_lineage_cpu_staging(self):
+        splitter = _load_demo_profile_time_split()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = os.path.join(tmpdir, "manifest.json")
+            node_csv_path = os.path.join(tmpdir, "runtime_nodes.csv")
+            edge_csv_path = os.path.join(tmpdir, "runtime_edges.csv")
+            timing_csv_path = os.path.join(tmpdir, "ggml_profile_node_records.csv")
+
+            with open(manifest_path, "w") as handle:
+                json.dump(
+                    {
+                        "schema": "pytorch_runtime_v3",
+                        "node_csv": "runtime_nodes.csv",
+                        "edge_csv": "runtime_edges.csv",
+                        "timing_csv": "ggml_profile_node_records.csv",
+                    },
+                    handle,
+                )
+
+            node_fieldnames = [
+                "step",
+                "node_id",
+                "node_n",
+                "node_name",
+                "op_name",
+                "node_kind",
+                "resource_kind",
+                "resource_id",
+                "runtime_role",
+                "device_type",
+                "device_index",
+                "duration_ns",
+            ]
+            node_rows = [
+                {
+                    "step": "0",
+                    "node_id": "k0",
+                    "node_n": "0",
+                    "node_name": "cudaMemcpyAsync reload",
+                    "op_name": "cudaMemcpyAsync reload",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "submit",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "5",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k1",
+                    "node_n": "1",
+                    "node_name": "Memcpy HtoD (Pageable -> Device) reload",
+                    "op_name": "Memcpy HtoD (Pageable -> Device) reload",
+                    "node_kind": "gpu_runtime",
+                    "resource_kind": "gpu_stream",
+                    "resource_id": "7",
+                    "runtime_role": "gpu_runtime",
+                    "device_type": "CUDA",
+                    "device_index": "0",
+                    "duration_ns": "13",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k2",
+                    "node_n": "2",
+                    "node_name": "cudaStreamSynchronize reload wait",
+                    "op_name": "cudaStreamSynchronize reload wait",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "wait",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "9",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k3",
+                    "node_n": "3",
+                    "node_name": "aten::empty_strided",
+                    "op_name": "aten::empty_strided",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "17",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k4",
+                    "node_n": "4",
+                    "node_name": "aten::to",
+                    "op_name": "aten::to",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "19",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k5",
+                    "node_n": "5",
+                    "node_name": "TorchDynamo Cache Lookup",
+                    "op_name": "TorchDynamo Cache Lookup",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "23",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k6",
+                    "node_n": "6",
+                    "node_name": "AOTDispatcher Runtime Wrapper Prologue",
+                    "op_name": "AOTDispatcher Runtime Wrapper Prologue",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "29",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k7",
+                    "node_n": "7",
+                    "node_name": "aten::mul",
+                    "op_name": "aten::mul",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "cpu_leaf",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "31",
+                },
+            ]
+            with open(node_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=node_fieldnames)
+                writer.writeheader()
+                writer.writerows(node_rows)
+
+            edge_fieldnames = ["src_node_id", "dst_node_id", "edge_kind"]
+            edge_rows = [
+                {"src_node_id": "k0", "dst_node_id": "k2", "edge_kind": "thread_order"},
+                {"src_node_id": "k1", "dst_node_id": "k2", "edge_kind": "wait"},
+                {"src_node_id": "k2", "dst_node_id": "k3", "edge_kind": "thread_order"},
+                {"src_node_id": "k3", "dst_node_id": "k4", "edge_kind": "thread_order"},
+                {"src_node_id": "k4", "dst_node_id": "k5", "edge_kind": "thread_order"},
+                {"src_node_id": "k5", "dst_node_id": "k6", "edge_kind": "thread_order"},
+                {"src_node_id": "k6", "dst_node_id": "k7", "edge_kind": "thread_order"},
+            ]
+            with open(edge_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=edge_fieldnames)
+                writer.writeheader()
+                writer.writerows(edge_rows)
+
+            timing_fieldnames = [
+                "step",
+                "node_n",
+                "node_name",
+                "node_compute_time_ns",
+                "node_id",
+                "device_type",
+                "device_index",
+                "node_kind",
+                "resource_kind",
+                "resource_id",
+                "runtime_role",
+            ]
+            timing_rows = [
+                {
+                    "step": row["step"],
+                    "node_n": row["node_n"],
+                    "node_name": row["node_name"],
+                    "node_compute_time_ns": row["duration_ns"],
+                    "node_id": row["node_id"],
+                    "device_type": row["device_type"],
+                    "device_index": row["device_index"],
+                    "node_kind": row["node_kind"],
+                    "resource_kind": row["resource_kind"],
+                    "resource_id": row["resource_id"],
+                    "runtime_role": row["runtime_role"],
+                }
+                for row in node_rows
+            ]
+            with open(timing_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=timing_fieldnames)
+                writer.writeheader()
+                writer.writerows(timing_rows)
+
+            _, reports, attributions_by_version = splitter.analyze_bundle(
+                tmpdir,
+                ["v5", "v6"],
+            )
+
+            v5_by_node_id = {
+                attribution.node_id: attribution
+                for attribution in attributions_by_version["v5"]
+            }
+            v6_by_node_id = {
+                attribution.node_id: attribution
+                for attribution in attributions_by_version["v6"]
+            }
+
+            self.assertEqual(v5_by_node_id["k3"].classification, "pure_cpu_compute")
+            self.assertEqual(v5_by_node_id["k4"].classification, "pure_cpu_compute")
+            self.assertEqual(v5_by_node_id["k5"].classification, "pure_cpu_compute")
+            self.assertEqual(v5_by_node_id["k6"].classification, "pure_cpu_compute")
+
+            for node_id in ("k2", "k3", "k4", "k5", "k6"):
+                self.assertGreater(v6_by_node_id[node_id].ssd_time_ns, 0)
+            self.assertEqual(
+                v6_by_node_id["k3"].classification, "offload_cpu_staging_or_control"
+            )
+            self.assertEqual(
+                v6_by_node_id["k4"].classification, "offload_cpu_staging_or_control"
+            )
+            self.assertEqual(
+                v6_by_node_id["k5"].classification, "offload_cpu_staging_or_control"
+            )
+            self.assertEqual(
+                v6_by_node_id["k6"].classification, "offload_cpu_staging_or_control"
+            )
+            self.assertEqual(v6_by_node_id["k7"].ssd_time_ns, 0)
+            self.assertEqual(reports["v6"].pure_compute_ns, 31)
+            self.assertEqual(reports["v6"].ssd_time_ns, 115)
+
+    def test_demo_profile_time_split_compare_report(self):
+        splitter = _load_demo_profile_time_split()
+
+        def write_bundle(bundle_dir: str, node_rows: list[dict[str, str]]) -> None:
+            manifest_path = os.path.join(bundle_dir, "manifest.json")
+            node_csv_path = os.path.join(bundle_dir, "runtime_nodes.csv")
+            edge_csv_path = os.path.join(bundle_dir, "runtime_edges.csv")
+            timing_csv_path = os.path.join(bundle_dir, "ggml_profile_node_records.csv")
+            with open(manifest_path, "w") as handle:
+                json.dump(
+                    {
+                        "schema": "pytorch_runtime_v3",
+                        "node_csv": "runtime_nodes.csv",
+                        "edge_csv": "runtime_edges.csv",
+                        "timing_csv": "ggml_profile_node_records.csv",
+                    },
+                    handle,
+                )
+            node_fieldnames = [
+                "step",
+                "node_id",
+                "node_n",
+                "node_name",
+                "op_name",
+                "node_kind",
+                "resource_kind",
+                "resource_id",
+                "runtime_role",
+                "device_type",
+                "device_index",
+                "duration_ns",
+            ]
+            with open(node_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=node_fieldnames)
+                writer.writeheader()
+                writer.writerows(node_rows)
+
+            with open(edge_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["src_node_id", "dst_node_id", "edge_kind"],
+                )
+                writer.writeheader()
+                writer.writerows([])
+
+            timing_rows = [
+                {
+                    "step": row["step"],
+                    "node_n": row["node_n"],
+                    "node_name": row["node_name"],
+                    "node_compute_time_ns": row["duration_ns"],
+                    "node_id": row["node_id"],
+                    "device_type": row["device_type"],
+                    "device_index": row["device_index"],
+                    "node_kind": row["node_kind"],
+                    "resource_kind": row["resource_kind"],
+                    "resource_id": row["resource_id"],
+                    "runtime_role": row["runtime_role"],
+                }
+                for row in node_rows
+            ]
+            with open(timing_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "step",
+                        "node_n",
+                        "node_name",
+                        "node_compute_time_ns",
+                        "node_id",
+                        "device_type",
+                        "device_index",
+                        "node_kind",
+                        "resource_kind",
+                        "resource_id",
+                        "runtime_role",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(timing_rows)
+
+        with tempfile.TemporaryDirectory() as primary_dir, tempfile.TemporaryDirectory() as secondary_dir:
+            write_bundle(
+                primary_dir,
+                [
+                    {
+                        "step": "0",
+                        "node_id": "k0",
+                        "node_n": "0",
+                        "node_name": "cudaMemcpyAsync",
+                        "op_name": "cudaMemcpyAsync",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "submit",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "duration_ns": "50",
+                    },
+                    {
+                        "step": "0",
+                        "node_id": "k1",
+                        "node_n": "1",
+                        "node_name": "aten::mul",
+                        "op_name": "aten::mul",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "cpu_leaf",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "duration_ns": "10",
+                    },
+                ],
+            )
+            write_bundle(
+                secondary_dir,
+                [
+                    {
+                        "step": "0",
+                        "node_id": "k0",
+                        "node_n": "0",
+                        "node_name": "cudaMemcpyAsync",
+                        "op_name": "cudaMemcpyAsync",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "submit",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "duration_ns": "5",
+                    },
+                    {
+                        "step": "0",
+                        "node_id": "k1",
+                        "node_n": "1",
+                        "node_name": "aten::mul",
+                        "op_name": "aten::mul",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "cpu_leaf",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "duration_ns": "3",
+                    },
+                ],
+            )
+
+            report_text = splitter.render_compare_report(
+                splitter.load_bundle_analysis(primary_dir),
+                splitter.load_bundle_analysis(secondary_dir),
+                version="v6",
+                compare_limit=5,
+                include_retained_compute=True,
+            )
+
+            self.assertIn("Top CPU Raw Deltas", report_text)
+            self.assertIn("cudaMemcpyAsync", report_text)
+            self.assertIn("delta_us", report_text)
+            self.assertIn("Top CPU Nodes Still Counted As Compute In Primary (v6)", report_text)
+            self.assertIn("aten::mul", report_text)
+
+    def test_demo_profile_time_split_requires_strict_node_id_timings(self):
+        splitter = _load_demo_profile_time_split()
+
+        def write_bundle(bundle_dir: str, timing_rows: list[dict[str, str]]) -> None:
+            manifest_path = os.path.join(bundle_dir, "manifest.json")
+            node_csv_path = os.path.join(bundle_dir, "runtime_nodes.csv")
+            edge_csv_path = os.path.join(bundle_dir, "runtime_edges.csv")
+            timing_csv_path = os.path.join(bundle_dir, "ggml_profile_node_records.csv")
+            with open(manifest_path, "w") as handle:
+                json.dump(
+                    {
+                        "schema": "pytorch_runtime_v3",
+                        "node_csv": "runtime_nodes.csv",
+                        "edge_csv": "runtime_edges.csv",
+                        "timing_csv": "ggml_profile_node_records.csv",
+                    },
+                    handle,
+                )
+
+            node_rows = [
+                {
+                    "step": "0",
+                    "node_id": "k0",
+                    "node_n": "0",
+                    "node_name": "cudaMemcpyAsync",
+                    "op_name": "cudaMemcpyAsync",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "submit",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "5",
+                },
+                {
+                    "step": "0",
+                    "node_id": "k1",
+                    "node_n": "1",
+                    "node_name": "cudaMemcpyAsync",
+                    "op_name": "cudaMemcpyAsync",
+                    "node_kind": "cpu_leaf",
+                    "resource_kind": "cpu_thread",
+                    "resource_id": "1",
+                    "runtime_role": "submit",
+                    "device_type": "CPU",
+                    "device_index": "0",
+                    "duration_ns": "50",
+                },
+            ]
+
+            with open(node_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "step",
+                        "node_id",
+                        "node_n",
+                        "node_name",
+                        "op_name",
+                        "node_kind",
+                        "resource_kind",
+                        "resource_id",
+                        "runtime_role",
+                        "device_type",
+                        "device_index",
+                        "duration_ns",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(node_rows)
+
+            with open(edge_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["src_node_id", "dst_node_id", "edge_kind"],
+                )
+                writer.writeheader()
+                writer.writerows([])
+
+            with open(timing_csv_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(timing_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(timing_rows)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_bundle(
+                tmpdir,
+                [
+                    {
+                        "step": "0",
+                        "node_id": "k0",
+                        "node_n": "0",
+                        "node_name": "cudaMemcpyAsync",
+                        "node_compute_time_ns": "5",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "submit",
+                    },
+                    {
+                        "step": "0",
+                        "node_id": "k1",
+                        "node_n": "1",
+                        "node_name": "cudaMemcpyAsync",
+                        "node_compute_time_ns": "50",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "submit",
+                    },
+                ],
+            )
+            analysis = splitter.load_bundle_analysis(tmpdir)
+            self.assertEqual(sum(node.duration_ns for node in analysis.nodes), 55)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_bundle(
+                tmpdir,
+                [
+                    {
+                        "step": "0",
+                        "node_n": "0",
+                        "node_name": "cudaMemcpyAsync",
+                        "node_compute_time_ns": "5",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "submit",
+                    },
+                    {
+                        "step": "0",
+                        "node_n": "1",
+                        "node_name": "cudaMemcpyAsync",
+                        "node_compute_time_ns": "50",
+                        "device_type": "CPU",
+                        "device_index": "0",
+                        "node_kind": "cpu_leaf",
+                        "resource_kind": "cpu_thread",
+                        "resource_id": "1",
+                        "runtime_role": "submit",
+                    },
+                ],
+            )
+            with self.assertRaisesRegex(RuntimeError, "node_id column"):
+                splitter.load_bundle_analysis(tmpdir)
 
     def test_qwen_runtime_error_mentions_qwen25_support(self):
         qwen_profiler = _load_profile_qwen_image_common()

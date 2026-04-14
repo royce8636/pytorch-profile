@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_image_path(args: argparse.Namespace) -> Path:
-    stem = output_stem("qwen_image_run", args.fusion)
+    stem = f"{output_stem('qwen_image_run', args.fusion)}_steps{args.steps}"
     if args.image is not None:
         image_path = Path(args.image)
     elif args.output_dir is not None:
@@ -242,6 +242,7 @@ def main() -> None:
     print("device:", device)
     print("dtype:", args.dtype)
     print("fusion:", args.fusion)
+    print("steps:", args.steps)
     print("warmup_runs:", warmup_runs)
     print("image_path:", image_path)
     print("latent_shape:", tuple(output.images.shape))

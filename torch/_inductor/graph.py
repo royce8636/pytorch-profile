@@ -367,8 +367,10 @@ class GraphLowering(torch.fx.Interpreter):
         name: str | None = None,
         inputs_to_check: Sequence[int] | None = None,
         fx_wrapper: bool = False,
+        static_input_idxs: Sequence[int] = (),
     ) -> None:
         super().__init__(gm)
+        self.static_input_idxs: tuple[int, ...] = tuple(static_input_idxs)
         self.example_inputs = example_inputs
         self.layout_opt = (
             layout_opt

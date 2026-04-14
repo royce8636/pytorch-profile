@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_image_path(args: argparse.Namespace) -> Path:
-    stem = output_stem("sdxl_turbo_gpu_run", args.fusion)
+    stem = f"{output_stem('sdxl_turbo_gpu_run', args.fusion)}_steps{args.steps}"
     if args.image is not None:
         image_path = Path(args.image)
     elif args.output_dir is not None:
@@ -183,6 +183,9 @@ def main() -> None:
         del warmup_output
     warmup_seconds = elapsed_seconds(warmup_start)
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     inference_start = time.perf_counter()
     output = run_pipeline(pipe, args)
     synchronize_device(device)
@@ -203,9 +206,14 @@ def main() -> None:
     print("device:", device)
     print("dtype:", args.dtype)
     print("fusion:", args.fusion)
+    print("steps:", args.steps)
     print("warmup_runs:", warmup_runs)
     print("image_path:", image_path)
     print("latent_shape:", tuple(output.images.shape))
+    if device.type == "cuda":
+        alloc_mb = torch.cuda.memory_allocated(device) / (1024 * 1024)
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+        print(f"GPU memory: {alloc_mb:.1f} MB allocated, {peak_mb:.1f} MB peak")
     print(f"load_seconds: {load_seconds:.6f}")
     print(f"warmup_seconds: {warmup_seconds:.6f}")
     print(f"inference_seconds: {inference_seconds:.6f}")

@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import logging
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import ClassVar
+
+import torch
+from torch._inductor.weight_streaming.plan import IOSchedule, TensorEntry
+
+log = logging.getLogger(__name__)
+
+_DTYPE_MAP = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+}
+
+
+class WeightStreamRuntime:
+    """Singleton that tracks tensor locations and drives SSD->DRAM->VRAM IO."""
+
+    _instance: ClassVar[WeightStreamRuntime | None] = None
+
+    def __init__(self, schedule: IOSchedule, device: torch.device) -> None:
+        self._schedule = schedule
+        self._device = device
+
+        # SSD -> DRAM: thread pool for async reads
+        self._ssd_pool = ThreadPoolExecutor(max_workers=4)
+        self._inflight_reads: dict[str, Future] = {}
+
+        # DRAM buffers (pinned CPU tensors)
+        self._dram_buffers: dict[str, torch.Tensor] = {}
+
+        # H2D: dedicated CUDA stream + events
+        self._h2d_stream = torch.cuda.Stream(device=device)
+        self._h2d_events: dict[str, torch.cuda.Event] = {}
+
+        # VRAM tensors (GPU)
+        self._vram_tensors: dict[str, torch.Tensor] = {}
+
+        # "ssd" | "dram" | "vram"
+        self._location: dict[str, str] = {}
+        for key in schedule.tensors:
+            self._location[key] = "ssd"
+
+        # Registered GPU weight tensors keyed by id(tensor).
+        # Stores CPU backup and original storage size for evict/restore.
+        self._weight_backups: dict[int, torch.Tensor] = {}
+        self._weight_storage_nbytes: dict[int, int] = {}
+
+    @classmethod
+    def instance(cls) -> WeightStreamRuntime:
+        assert cls._instance is not None, "WeightStreamRuntime not initialized"
+        return cls._instance
+
+    @classmethod
+    def initialize(
+        cls, schedule: IOSchedule, device: torch.device
+    ) -> WeightStreamRuntime:
+        cls._instance = cls(schedule, device)
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        if cls._instance is not None:
+            cls._instance._ssd_pool.shutdown(wait=False)
+            cls._instance = None
+
+    def register_dram_tensor(self, tensor_name: str, tensor: torch.Tensor) -> None:
+        """Register a pre-loaded DRAM tensor (for when tensors are already in CPU memory)."""
+        self._dram_buffers[tensor_name] = tensor
+        self._location[tensor_name] = "dram"
+
+    def register_weight(self, gpu_tensor: torch.Tensor) -> None:
+        """Register a GPU weight tensor for VRAM eviction/restore.
+
+        Creates a pinned CPU backup copy. The generated code will pass this
+        tensor object directly to evict_vram/h2d_prefetch (not a string name).
+        """
+        key = id(gpu_tensor)
+        self._weight_backups[key] = gpu_tensor.data.cpu().pin_memory()
+        self._weight_storage_nbytes[key] = gpu_tensor.untyped_storage().nbytes()
+
+    def ssd_prefetch(self, tensor_name: str) -> None:
+        """Submit async SSD->pinned-DRAM read."""
+        if self._location.get(tensor_name) != "ssd":
+            return
+        if tensor_name in self._inflight_reads:
+            return
+        entry = self._schedule.tensors.get(tensor_name)
+        if entry is None or not entry.file:
+            return
+        future = self._ssd_pool.submit(self._read_from_file, entry)
+        self._inflight_reads[tensor_name] = future
+
+    def cold_start_prefetch(self, tensor_name: str) -> None:
+        """Load a tensor at startup (before any kernels run).
+
+        If the tensor is already in DRAM (pre-loaded by user), this is a no-op.
+        Otherwise, initiates an SSD prefetch and waits for completion.
+        """
+        loc = self._location.get(tensor_name, "ssd")
+        if loc in ("dram", "vram"):
+            return
+        self.ssd_prefetch(tensor_name)
+        # Wait for SSD read to complete so it's ready before first kernel
+        if tensor_name in self._inflight_reads:
+            cpu_tensor = self._inflight_reads.pop(tensor_name).result()
+            self._dram_buffers[tensor_name] = cpu_tensor
+            self._location[tensor_name] = "dram"
+
+    def h2d_prefetch(self, tensor_name_or_tensor: str | torch.Tensor) -> torch.Tensor | None:
+        """Restore a tensor's GPU storage from CPU backup, or do SSD->DRAM->VRAM.
+
+        When called with a torch.Tensor (from generated code with numel matching),
+        restores the tensor's storage from the CPU backup created by register_weight().
+
+        When called with a string name (legacy path), does SSD->DRAM->VRAM copy.
+        """
+        if isinstance(tensor_name_or_tensor, torch.Tensor):
+            return self._h2d_prefetch_tensor(tensor_name_or_tensor)
+        return self._h2d_prefetch_by_name(tensor_name_or_tensor)
+
+    def _h2d_prefetch_tensor(self, gpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Restore a GPU tensor's storage from its CPU backup."""
+        key = id(gpu_tensor)
+        backup = self._weight_backups.get(key)
+        if backup is None:
+            return gpu_tensor
+        if gpu_tensor.untyped_storage().nbytes() == 0:
+            nbytes = self._weight_storage_nbytes[key]
+            gpu_tensor.untyped_storage().resize_(nbytes)
+            with torch.no_grad():
+                gpu_tensor.copy_(backup)
+        return gpu_tensor
+
+    def _h2d_prefetch_by_name(self, tensor_name: str) -> torch.Tensor | None:
+        """Legacy string-name path: SSD->DRAM->VRAM copy."""
+        # Complete any pending SSD read
+        if tensor_name in self._inflight_reads:
+            cpu_tensor = self._inflight_reads.pop(tensor_name).result()
+            self._dram_buffers[tensor_name] = cpu_tensor
+            self._location[tensor_name] = "dram"
+        elif self._location.get(tensor_name) == "ssd":
+            entry = self._schedule.tensors.get(tensor_name)
+            if entry and entry.file:
+                self._dram_buffers[tensor_name] = self._read_from_file(entry)
+                self._location[tensor_name] = "dram"
+
+        cpu_tensor = self._dram_buffers.get(tensor_name)
+        if cpu_tensor is None:
+            return None
+
+        # Async copy on dedicated H2D stream
+        with torch.cuda.stream(self._h2d_stream):
+            gpu_tensor = cpu_tensor.to(self._device, non_blocking=True)
+
+        event = torch.cuda.Event()
+        self._h2d_stream.record_event(event)
+        self._h2d_events[tensor_name] = event
+        self._vram_tensors[tensor_name] = gpu_tensor
+        self._location[tensor_name] = "vram"
+        return gpu_tensor
+
+    def wait_h2d(self, tensor_name: str) -> torch.Tensor | None:
+        """Synchronize on the H2D copy event, return the GPU tensor."""
+        event = self._h2d_events.get(tensor_name)
+        if event is not None:
+            torch.cuda.current_stream(self._device).wait_event(event)
+            del self._h2d_events[tensor_name]
+        return self._vram_tensors.get(tensor_name)
+
+    def evict_vram(self, tensor_name_or_tensor: str | torch.Tensor) -> None:
+        """Free GPU memory for this tensor.
+
+        When called with a torch.Tensor (from generated code with numel matching),
+        resizes the tensor's storage to 0 directly.
+
+        When called with a string name (legacy path), pops from _vram_tensors
+        and resizes.
+        """
+        if isinstance(tensor_name_or_tensor, torch.Tensor):
+            self._evict_vram_tensor(tensor_name_or_tensor)
+        else:
+            self._evict_vram_by_name(tensor_name_or_tensor)
+
+    def _evict_vram_tensor(self, gpu_tensor: torch.Tensor) -> None:
+        """Evict a registered GPU tensor by resizing its storage to 0."""
+        key = id(gpu_tensor)
+        if key not in self._weight_backups:
+            return
+        if gpu_tensor.untyped_storage().nbytes() > 0:
+            gpu_tensor.untyped_storage().resize_(0)
+
+    def _evict_vram_by_name(self, tensor_name: str) -> None:
+        """Legacy string-name path: pop from _vram_tensors and resize."""
+        gpu_tensor = self._vram_tensors.pop(tensor_name, None)
+        if gpu_tensor is not None:
+            gpu_tensor.untyped_storage().resize_(0)
+        if self._location.get(tensor_name) == "vram":
+            self._location[tensor_name] = "dram"
+
+    def evict_dram(self, tensor_name: str) -> None:
+        """Free pinned CPU memory for this tensor."""
+        self._dram_buffers.pop(tensor_name, None)
+        if self._location.get(tensor_name) in ("dram", "vram"):
+            self._location[tensor_name] = "ssd"
+
+    def evict(self, tensor_name: str) -> None:
+        """Evict a tensor from both VRAM and DRAM."""
+        self.evict_vram(tensor_name)
+        self.evict_dram(tensor_name)
+
+    def _read_from_file(self, entry: TensorEntry) -> torch.Tensor:
+        """Blocking read from disk, returns a pinned CPU tensor."""
+        dtype = _DTYPE_MAP[entry.dtype]
+        numel = 1
+        for s in entry.shape:
+            numel *= s
+        nbytes = numel * torch._utils._element_size(dtype)
+
+        mmap_storage = torch.UntypedStorage.from_file(
+            entry.file, False, entry.file_offset + nbytes
+        )
+        sliced = mmap_storage[entry.file_offset : entry.file_offset + nbytes]
+        tensor = torch.tensor([], dtype=dtype).set_(
+            torch.TypedStorage(
+                wrap_storage=sliced, dtype=dtype, _internal=True
+            )
+        ).reshape(entry.shape)
+
+        pinned = tensor.pin_memory()
+        del tensor, sliced, mmap_storage
+        return pinned

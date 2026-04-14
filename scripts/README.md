@@ -45,6 +45,9 @@ It only writes annotated CSV / JSON reports when `--write-reports` or
 bundles and print the largest raw CPU-side deltas. Add
 `--compare-include-retained-compute` when you also want the slower section that
 prints the largest CPU nodes still retained as compute under the chosen version.
+Timing rows are matched strictly by `node_id`; the splitter now fails fast if
+`ggml_profile_node_records.csv` is missing `node_id` or cannot be matched
+one-to-one with `runtime_nodes.csv`.
 See `demo_profile_time_split_detection.md` for the exact detection rules and
 their limitations.
 
@@ -90,7 +93,9 @@ This is the `llamasim-runtime` bundle, sometimes referred to here as the
 `--dot-level all` is enabled. The exporter requires a GPU trace and an
 Execution Trace Observer JSON file; if `--output-dir` is set, the default
 bundle directory is `<output-dir>/<stem>_llamasim_runtime`, otherwise it is
-created next to the trace path.
+created next to the trace path. The `profile_sdxl_turbo_gpu.py` entrypoint
+defaults to `--dot-level llamasim-runtime` and writes the bundle to
+`<output-dir>/llama_bundle` unless `--llamasim-output-dir` is provided.
 
 1. Collect the two source views of the run:
 - raw Kineto events and `trace_start_ns` from the profiler result
@@ -133,6 +138,52 @@ created next to the trace path.
   producer/consumer counts
 - `manifest.json`: schema, file names, node/tensor/edge counts, tensor-I/O
   coverage, propagation statistics, match-warning count, and peak memory stats
+
+## How to verify a llamasim bundle
+
+Use `verify_llamasim_bundle.py` when you want a mechanical check that the
+bundle is internally consistent and, when the original profile artifacts are
+still available, that it matches the recorded profiler run.
+
+Bundle-only verification:
+
+```bash
+python3 scripts/verify_llamasim_bundle.py /path/to/llama_bundle
+```
+
+This checks:
+- `manifest.json` counts against the exported CSVs
+- `runtime_nodes.csv` against `ggml_profile_node_records.csv`
+- tensor producer/consumer counts against `runtime_edges.csv`
+- `step_0_compute_graph.dot` node/edge sets against the CSV exports
+
+Source-backed verification:
+
+```bash
+python3 scripts/verify_llamasim_bundle.py \
+  /path/to/llama_bundle \
+  --profile-dir /path/to/profile_output_dir
+```
+
+The profile directory must contain the matching:
+- `*_trace.csv`
+- `*_trace.json`
+- `*_kineto_map.csv`
+- `*_execution_trace.json`
+
+This stronger mode rebuilds the expected runtime node set, runtime edges, and
+tensor I/O overlay from the saved profiler artifacts and compares them against
+the bundle. It proves that the bundle matches the recorded source trace within
+the exact scope exported by the bundle:
+- `cpu_leaf_plus_all_gpu_runtime` for compute nodes
+- exact tensor I/O where the execution trace recorded it
+
+It does not turn profiler limitations into certainty. In particular, some
+bundle fields are still derived from heuristics in the exporter, such as
+selected submit/wait relationships and propagated parent tensor I/O for GPU
+kernels that lack direct execution-trace nodes. The verifier checks that the
+bundle matches those rules; it cannot conjure stronger ground truth than the
+recorded profiler data provides.
 
 ## Example commands
 

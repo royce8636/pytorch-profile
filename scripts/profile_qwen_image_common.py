@@ -614,11 +614,20 @@ def load_pipeline(model: str, torch_dtype: torch.dtype, device: torch.device) ->
     return pipe
 
 
-def maybe_compile(pipe: Any, args: argparse.Namespace) -> None:
+def maybe_compile(
+    pipe: Any,
+    args: argparse.Namespace,
+    output_paths: sdxl_common.OutputPaths | None = None,
+) -> None:
     if args.fusion == "none":
         return
     if not hasattr(torch, "compile"):
         raise RuntimeError("torch.compile is not available in this runtime")
+
+    if output_paths is not None and output_paths.llamasim_output_dir is not None:
+        sdxl_common.configure_llamasim_inductor_markers(
+            output_paths.llamasim_output_dir
+        )
 
     # QwenImagePipeline relies on transformer.cache_context(...), so preserve
     # the module instance and compile only the forward method.
@@ -709,7 +718,7 @@ def main(
     pipe = load_pipeline(args.model, torch_dtype, device)
     if args.disable_progress_bar:
         pipe.set_progress_bar_config(disable=True)
-    maybe_compile(pipe, args)
+    maybe_compile(pipe, args, output_paths)
     generator = build_generator(args, device)
 
     captured_transformer_inputs: dict[str, Any] = {}
@@ -740,7 +749,7 @@ def main(
             RUN_RECORD_FUNCTION_NAME, scope_args
         ):
             output = run_pipeline(pipe, args, generator)
-            sdxl_common.synchronize_device(device)
+        sdxl_common.profiler_synchronize_device(device)
 
     if capture_handle is not None:
         capture_handle.remove()
@@ -834,6 +843,7 @@ def main(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
+            trace_json_path=output_paths.trace_path,
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
@@ -867,6 +877,7 @@ def main(
         print("runtime_io_dot_path:", output_paths.runtime_io_dot_path)
     if output_paths.llamasim_output_dir is not None:
         print("llamasim_output_dir:", output_paths.llamasim_output_dir)
+        sdxl_common.print_llamasim_runtime_summary(output_paths.llamasim_output_dir)
     print("latent_shape:", tuple(output.images.shape))
     print("metadata_json:", metadata_json)
     if metadata_json:

@@ -628,7 +628,7 @@ vae = AutoencoderKLQwenImage.from_pretrained(
     model_path / "vae",
     torch_dtype=torch_dtype,
 )
-pipe = QwenImagePipeline(
+pipe = QwenImagePipeline(p
     scheduler=scheduler,
     vae=vae,
     text_encoder=text_encoder,

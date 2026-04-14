@@ -302,6 +302,39 @@ joint_custom_post_pass: torch._inductor.custom_graph_pass.CustomGraphPassType = 
 # use post-grad passes.
 pre_grad_custom_pass: Callable[[torch.fx.graph.Graph], None] | None = None
 
+# Path to weight streaming IO schedule JSON (from llamasim scheduler).
+# When set, injects IO calls into the Inductor wrapper codegen.
+weight_streaming_plan: str = ""
+
+# Path to runtime_nodes.csv for GPU/CPU node classification.
+# Only needed if the schedule JSON nodes lack "resource_kind" fields.
+weight_streaming_nodes_csv: str = ""
+
+# Path to pytorch_runtime_tensors.csv for tensor metadata (numel, kind).
+# Used to match scheduler tensor names to graph input variables and to
+# filter out CONTEXT tensors from VRAM ops.
+weight_streaming_tensor_csv: str = ""
+
+# Directory to write the generated wrapper code to when weight streaming is
+# enabled. The file will be named "weight_streaming_generated.py".
+weight_streaming_output_code: str = ""
+
+# Emit compiled_launch_map / compiled_tensor_map sidecars.
+# Enable for the profiling compile pass (before a schedule exists).
+weight_streaming_emit_ids: bool = False
+
+# Emit record_function markers per compute launch.
+# Enable for the profiling compile pass.
+weight_streaming_emit_launch_markers: bool = False
+
+# Emit record_function markers around sync operations (device_sync, etc.).
+# Each marker records the exact launch IDs the sync waits on.
+weight_streaming_emit_sync_markers: bool = False
+
+# Path to compiled_tensor_id -> scheduler tensor name crosswalk JSON.
+# Used for validation/annotation when injecting a schedule.
+weight_streaming_tensor_crosswalk: str = ""
+
 # Registers a custom pass to be run right before fusion in Inductor scheduler.
 # WARNING: Inductor scheduler IR is at prototype stage and subject to change,
 # hence custom IR passes built on top of it might break in the future.

@@ -2345,7 +2345,9 @@ class SIMDScheduling(BaseScheduling):
                 return None
 
     def codegen_sync(self):
-        V.graph.wrapper_code.writeline(V.graph.device_ops.synchronize())
+        from .wrapper import DeviceSynchronizeLine
+
+        V.graph.wrapper_code.writeline(DeviceSynchronizeLine(V.graph.wrapper_code))
 
     def generate_combo_kernel_code(
         self,

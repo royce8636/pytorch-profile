@@ -404,3 +404,7 @@ CLAUDE.local.md
 /debug_*.py
 CLAUDE_CONTEXT/
 /.claude/settings.local.json
+*trace.csv
+*trace.json
+*.dot
+*.png
