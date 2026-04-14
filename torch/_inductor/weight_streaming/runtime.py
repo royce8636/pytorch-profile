@@ -56,6 +56,16 @@ class WeightStreamRuntime:
         self._weight_backups: dict[int, torch.Tensor] = {}
         self._weight_storage_nbytes: dict[int, int] = {}
 
+        # VRAM evictions are deferred until the CUDA stream reaches the point
+        # where eviction was requested. This prevents host-side storage resize
+        # from racing outstanding kernels that still read the tensor.
+        self._pending_vram_evictions: dict[
+            int, tuple[torch.Tensor, torch.cuda.Event]
+        ] = {}
+        self._pending_vram_name_evictions: dict[
+            str, tuple[torch.Tensor, torch.cuda.Event]
+        ] = {}
+
     @classmethod
     def instance(cls) -> WeightStreamRuntime:
         assert cls._instance is not None, "WeightStreamRuntime not initialized"
@@ -88,6 +98,7 @@ class WeightStreamRuntime:
         key = id(gpu_tensor)
         self._weight_backups[key] = gpu_tensor.data.cpu().pin_memory()
         self._weight_storage_nbytes[key] = gpu_tensor.untyped_storage().nbytes()
+        self._pending_vram_evictions.pop(key, None)
 
     def ssd_prefetch(self, tensor_name: str) -> None:
         """Submit async SSD->pinned-DRAM read."""
@@ -135,6 +146,18 @@ class WeightStreamRuntime:
         backup = self._weight_backups.get(key)
         if backup is None:
             return gpu_tensor
+
+        pending = self._pending_vram_evictions.get(key)
+        if pending is not None:
+            _, event = pending
+            if event.query():
+                pending_tensor, _ = self._pending_vram_evictions.pop(key)
+                self._free_tensor_storage(pending_tensor)
+            elif gpu_tensor.untyped_storage().nbytes() > 0:
+                del self._pending_vram_evictions[key]
+                return gpu_tensor
+
+        self.flush_ready_vram_evictions()
         if gpu_tensor.untyped_storage().nbytes() == 0:
             nbytes = self._weight_storage_nbytes[key]
             gpu_tensor.untyped_storage().resize_(nbytes)
@@ -144,6 +167,28 @@ class WeightStreamRuntime:
 
     def _h2d_prefetch_by_name(self, tensor_name: str) -> torch.Tensor | None:
         """Legacy string-name path: SSD->DRAM->VRAM copy."""
+        pending = self._pending_vram_name_evictions.get(tensor_name)
+        if pending is not None:
+            gpu_tensor, _ = pending
+            event = pending[1]
+            if event.query():
+                del self._pending_vram_name_evictions[tensor_name]
+                self._free_tensor_storage(gpu_tensor)
+                self._vram_tensors.pop(tensor_name, None)
+                if self._location.get(tensor_name) == "vram":
+                    self._location[tensor_name] = "dram"
+            elif gpu_tensor.untyped_storage().nbytes() > 0:
+                del self._pending_vram_name_evictions[tensor_name]
+                self._vram_tensors[tensor_name] = gpu_tensor
+                self._location[tensor_name] = "vram"
+                return gpu_tensor
+
+        gpu_tensor = self._vram_tensors.get(tensor_name)
+        if gpu_tensor is not None and gpu_tensor.untyped_storage().nbytes() > 0:
+            return gpu_tensor
+
+        self.flush_ready_vram_evictions()
+
         # Complete any pending SSD read
         if tensor_name in self._inflight_reads:
             cpu_tensor = self._inflight_reads.pop(tensor_name).result()
@@ -178,14 +223,57 @@ class WeightStreamRuntime:
             del self._h2d_events[tensor_name]
         return self._vram_tensors.get(tensor_name)
 
+    def _record_vram_eviction_event(self) -> torch.cuda.Event:
+        event = torch.cuda.Event()
+        torch.cuda.current_stream(self._device).record_event(event)
+        return event
+
+    def _free_tensor_storage(self, gpu_tensor: torch.Tensor) -> None:
+        if gpu_tensor.untyped_storage().nbytes() > 0:
+            gpu_tensor.untyped_storage().resize_(0)
+
+    def flush_ready_vram_evictions(self) -> None:
+        """Free pending VRAM evictions whose CUDA completion events are ready."""
+        for key, (gpu_tensor, event) in list(self._pending_vram_evictions.items()):
+            if event.query():
+                self._free_tensor_storage(gpu_tensor)
+                del self._pending_vram_evictions[key]
+
+        for tensor_name, (gpu_tensor, event) in list(
+            self._pending_vram_name_evictions.items()
+        ):
+            if event.query():
+                self._free_tensor_storage(gpu_tensor)
+                del self._pending_vram_name_evictions[tensor_name]
+                self._vram_tensors.pop(tensor_name, None)
+                if self._location.get(tensor_name) == "vram":
+                    self._location[tensor_name] = "dram"
+
+    def flush_all_vram_evictions(self) -> None:
+        """Block until all pending VRAM evictions are safe, then free them."""
+        for key, (gpu_tensor, event) in list(self._pending_vram_evictions.items()):
+            event.synchronize()
+            self._free_tensor_storage(gpu_tensor)
+            del self._pending_vram_evictions[key]
+
+        for tensor_name, (gpu_tensor, event) in list(
+            self._pending_vram_name_evictions.items()
+        ):
+            event.synchronize()
+            self._free_tensor_storage(gpu_tensor)
+            del self._pending_vram_name_evictions[tensor_name]
+            self._vram_tensors.pop(tensor_name, None)
+            if self._location.get(tensor_name) == "vram":
+                self._location[tensor_name] = "dram"
+
     def evict_vram(self, tensor_name_or_tensor: str | torch.Tensor) -> None:
         """Free GPU memory for this tensor.
 
         When called with a torch.Tensor (from generated code with numel matching),
-        resizes the tensor's storage to 0 directly.
+        records an event and defers storage resize until the event completes.
 
         When called with a string name (legacy path), pops from _vram_tensors
-        and resizes.
+        after the deferred eviction event completes.
         """
         if isinstance(tensor_name_or_tensor, torch.Tensor):
             self._evict_vram_tensor(tensor_name_or_tensor)
@@ -193,20 +281,28 @@ class WeightStreamRuntime:
             self._evict_vram_by_name(tensor_name_or_tensor)
 
     def _evict_vram_tensor(self, gpu_tensor: torch.Tensor) -> None:
-        """Evict a registered GPU tensor by resizing its storage to 0."""
+        """Queue eviction of a registered GPU tensor after current-stream work."""
         key = id(gpu_tensor)
         if key not in self._weight_backups:
             return
+        if key in self._pending_vram_evictions:
+            return
         if gpu_tensor.untyped_storage().nbytes() > 0:
-            gpu_tensor.untyped_storage().resize_(0)
+            self._pending_vram_evictions[key] = (
+                gpu_tensor,
+                self._record_vram_eviction_event(),
+            )
 
     def _evict_vram_by_name(self, tensor_name: str) -> None:
-        """Legacy string-name path: pop from _vram_tensors and resize."""
-        gpu_tensor = self._vram_tensors.pop(tensor_name, None)
-        if gpu_tensor is not None:
-            gpu_tensor.untyped_storage().resize_(0)
-        if self._location.get(tensor_name) == "vram":
-            self._location[tensor_name] = "dram"
+        """Legacy string-name path: queue eviction after current-stream work."""
+        if tensor_name in self._pending_vram_name_evictions:
+            return
+        gpu_tensor = self._vram_tensors.get(tensor_name)
+        if gpu_tensor is not None and gpu_tensor.untyped_storage().nbytes() > 0:
+            self._pending_vram_name_evictions[tensor_name] = (
+                gpu_tensor,
+                self._record_vram_eviction_event(),
+            )
 
     def evict_dram(self, tensor_name: str) -> None:
         """Free pinned CPU memory for this tensor."""

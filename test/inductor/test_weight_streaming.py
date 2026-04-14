@@ -893,6 +893,11 @@ if HAS_GPU:
 
             external_ref = gpu_tensor
             rt.evict_vram("w")
+            self.assertEqual(rt._location["w"], "vram")
+            self.assertIn("w", rt._vram_tensors)
+            self.assertGreater(external_ref.untyped_storage().size(), 0)
+
+            rt.flush_all_vram_evictions()
             self.assertEqual(rt._location["w"], "dram")
             self.assertNotIn("w", rt._vram_tensors)
             self.assertEqual(external_ref.untyped_storage().size(), 0)
@@ -914,6 +919,7 @@ if HAS_GPU:
 
             # After VRAM evict: GPU freed, but DRAM still present
             rt.evict_vram("w")
+            rt.flush_all_vram_evictions()
             self.assertEqual(rt._location["w"], "dram")
             self.assertIn("w", rt._dram_buffers)
 
@@ -989,6 +995,32 @@ if HAS_GPU:
                 )
             finally:
                 os.unlink(fpath)
+
+        def test_h2d_prefetch_cancels_pending_tensor_eviction(self):
+            rt = WeightStreamRuntime.initialize(self.schedule, self.device)
+
+            class NotReadyEvent:
+                def query(self):
+                    return False
+
+                def synchronize(self):
+                    pass
+
+            gpu_tensor = torch.ones(8, 8, device="cuda")
+            rt.register_weight(gpu_tensor)
+            rt._record_vram_eviction_event = lambda: NotReadyEvent()
+
+            # Make the CPU backup stale so an actual reload is observable.
+            gpu_tensor.fill_(2)
+            rt.evict_vram(gpu_tensor)
+            self.assertIn(id(gpu_tensor), rt._pending_vram_evictions)
+            self.assertGreater(gpu_tensor.untyped_storage().nbytes(), 0)
+
+            result = rt.h2d_prefetch(gpu_tensor)
+            self.assertIs(result, gpu_tensor)
+            self.assertNotIn(id(gpu_tensor), rt._pending_vram_evictions)
+            self.assertGreater(gpu_tensor.untyped_storage().nbytes(), 0)
+            torch.testing.assert_close(gpu_tensor, torch.full_like(gpu_tensor, 2))
 
 
     class TestMarkerInjectionOrdering(TestCase):
@@ -1182,11 +1214,14 @@ if HAS_GPU:
                 with open(generated_path) as f:
                     generated = f.read()
 
-                sync_idx = generated.find("torch.cuda.synchronize()")
                 evict_idx = generated.find("_ws_rt.evict_vram('w')")
-                self.assertGreaterEqual(sync_idx, 0)
                 self.assertGreaterEqual(evict_idx, 0)
-                self.assertLess(sync_idx, evict_idx)
+                flush_idx = generated.find(
+                    "_ws_rt.flush_ready_vram_evictions()", evict_idx
+                )
+                self.assertGreaterEqual(flush_idx, 0)
+                self.assertLess(evict_idx, flush_idx)
+                self.assertNotIn("torch.cuda.synchronize()", generated)
                 self.assertIn("_ws_rt.h2d_prefetch('w')", generated)
                 self.assertIn("_ws_rt.evict_vram('w')", generated)
             finally:

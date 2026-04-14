@@ -17,6 +17,7 @@ if __name__ == "__main__":
         default_device="cuda:0",
         default_dtype="float16",
         default_output_prefix="sdxl_turbo_gpu",
+        default_fusion="inductor",
         default_dot_level="llamasim-runtime",
         default_llamasim_output_dirname="llama_bundle",
         default_profile_memory=True,

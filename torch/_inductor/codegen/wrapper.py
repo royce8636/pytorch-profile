@@ -2587,15 +2587,17 @@ class PythonWrapperCodegen(CodeGen):
                         if isinstance(op, (EvictDramOp, EvictVramOp)):
                             post_ops.append((op, False))
 
-                if any(isinstance(op, EvictVramOp) for op, _ in post_ops):
-                    new_lines.append(DeviceSynchronizeLine(wrapper=self))
-
                 post_calls: list[str] = []
+                has_vram_evict = any(
+                    isinstance(op, EvictVramOp) for op, _ in post_ops
+                )
                 for op, is_exact in post_ops:
                     if is_exact:
                         post_calls.append(_emit_op(op))
                     else:
                         post_calls.append(_op_to_call(op))
+                if has_vram_evict:
+                    post_calls.append("_ws_rt.flush_ready_vram_evictions()")
 
                 if post_calls:
                     new_lines.append(

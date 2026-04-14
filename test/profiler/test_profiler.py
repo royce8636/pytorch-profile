@@ -16,6 +16,7 @@ import pickle
 from pathlib import Path
 import random
 import re
+import runpy
 import struct
 import subprocess
 import sys
@@ -6247,6 +6248,23 @@ class TestExperimentalUtils(TestCase):
             os.fspath(output_paths.llamasim_output_dir),
             "/tmp/sdxl_gpu_profile/llama_bundle",
         )
+
+    def test_profile_sdxl_gpu_entrypoint_defaults_to_inductor(self):
+        scripts_dir = (
+            Path(__file__).resolve().parents[2] / "scripts"
+        )
+        if os.fspath(scripts_dir) not in sys.path:
+            sys.path.insert(0, os.fspath(scripts_dir))
+        import profile_sdxl_turbo_common as sdxl_common
+
+        with patch.object(sdxl_common, "main", autospec=True) as main_mock:
+            runpy.run_path(
+                os.fspath(scripts_dir / "profile_sdxl_turbo_gpu.py"),
+                run_name="__main__",
+            )
+
+        main_mock.assert_called_once()
+        self.assertEqual(main_mock.call_args.kwargs["default_fusion"], "inductor")
 
     def test_maybe_compile_sdxl_enables_ws_markers_for_llamasim_bundle(self):
         profiler = _load_profile_sdxl_turbo_common()

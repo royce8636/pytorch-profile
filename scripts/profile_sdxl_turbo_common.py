@@ -76,6 +76,7 @@ def parse_args(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_fusion: str = "none",
     default_dot_level: str,
     default_profile_memory: bool,
     default_record_shapes: bool,
@@ -126,7 +127,7 @@ def parse_args(
     parser.add_argument(
         "--fusion",
         choices=("none", "inductor"),
-        default="none",
+        default=default_fusion,
         help=(
             "Execution mode. 'none' keeps eager ops. 'inductor' compiles the UNet "
             "with torch.compile; on CUDA this typically produces fused Triton kernels."
@@ -4822,6 +4823,7 @@ def main(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_fusion: str = "none",
     default_dot_level: str = "none",
     default_llamasim_output_dirname: str | None = None,
     default_profile_memory: bool = False,
@@ -4832,6 +4834,7 @@ def main(
         default_device=default_device,
         default_dtype=default_dtype,
         default_output_prefix=default_output_prefix,
+        default_fusion=default_fusion,
         default_dot_level=default_dot_level,
         default_profile_memory=default_profile_memory,
         default_record_shapes=default_record_shapes,
