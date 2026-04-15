@@ -163,6 +163,16 @@ def parse_args() -> argparse.Namespace:
         help="Log every runtime IO call (ssd_prefetch, evict_vram, etc.).",
     )
     parser.add_argument(
+        "--profile-markers",
+        action="store_true",
+        help=(
+            "Emit ws_launch:K:N / ws_sync:K:N record_function markers in the "
+            "generated wrapper. Purely diagnostic (helps correlate chrome trace "
+            "events back to compiled launch ids). Off by default because "
+            "each marker costs ~5 µs under torch.profiler."
+        ),
+    )
+    parser.add_argument(
         "--component",
         choices=("unet", "full"),
         default="unet",
@@ -382,9 +392,18 @@ def main() -> None:
             inductor_config.weight_streaming_emit_sync_markers
         ),
         "weight_streaming_output_code": inductor_config.weight_streaming_output_code,
+        "force_disable_caches": inductor_config.force_disable_caches,
     }
+    inductor_config.force_disable_caches = True
     marker_output_dir = args.export_code or str(schedule_path.parent)
-    configure_llamasim_inductor_markers(marker_output_dir)
+    # Diagnostic launch/sync markers add ~5 µs per record_function call under
+    # profiler. This script is for production-like inference runs, so keep
+    # them off by default. Enable via --profile-markers for chrome-trace
+    # correlation during debugging.
+    configure_llamasim_inductor_markers(
+        marker_output_dir,
+        include_diagnostic_markers=args.profile_markers,
+    )
 
     # ── Load model ──
     print(f"Loading model from {args.model}...")

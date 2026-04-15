@@ -184,13 +184,51 @@ class ScheduleAdapter:
 
     @property
     def before_launch(self) -> dict[int, list[PreKernelOp]]:
-        """compiled_launch_id -> ops to execute before that launch."""
+        """compiled_launch_id -> ops to execute before that launch.
+
+        Sync H2D prefetches go here (ops without an async start anchor).
+        Cross-iter ops are always async; they're routed through
+        h2d_after_launch / h2d_wait_launch instead.
+        """
         result: dict[int, list[PreKernelOp]] = defaultdict(list)
         for op in self._schedule.prefetches:
             if op.before_launch_id >= 0:
                 result[op.before_launch_id].append(op)
         for op in self._schedule.h2d_prefetches:
-            if op.before_launch_id >= 0:
+            if op.cross_iter:
+                continue
+            if (
+                op.before_launch_id >= 0
+                and (op.after_launch_id < 0 or op.after_launch_id == op.before_launch_id)
+            ):
+                result[op.before_launch_id].append(op)
+        return dict(result)
+
+    @property
+    def h2d_after_launch(self) -> dict[int, list[H2DPrefetchOp]]:
+        """compiled_launch_id -> async H2D starts after that launch."""
+        result: dict[int, list[H2DPrefetchOp]] = defaultdict(list)
+        for op in self._schedule.h2d_prefetches:
+            if op.after_launch_id < 0:
+                continue
+            # Cross-iter ops are always async, regardless of the ordering
+            # between after_launch_id and before_launch_id.
+            if op.cross_iter or op.after_launch_id != op.before_launch_id:
+                result[op.after_launch_id].append(op)
+        return dict(result)
+
+    @property
+    def h2d_wait_launch(self) -> dict[int, list[H2DPrefetchOp]]:
+        """compiled_launch_id -> H2D ops whose async copy must complete.
+
+        Populated for all async ops (ops with after_launch_id set and either
+        cross-iter or after != before).
+        """
+        result: dict[int, list[H2DPrefetchOp]] = defaultdict(list)
+        for op in self._schedule.h2d_prefetches:
+            if op.after_launch_id < 0 or op.before_launch_id < 0:
+                continue
+            if op.cross_iter or op.after_launch_id != op.before_launch_id:
                 result[op.before_launch_id].append(op)
         return dict(result)
 
@@ -229,6 +267,9 @@ def _vram_op_to_call(
 
     The generated code passes the graph input variable directly (not a string),
     routing to the tensor-object runtime path.
+
+    H2D ops with after_launch_id use the async path (h2d_prefetch_async);
+    a separate wait call is emitted at the consumer launch.
     """
     if op.compiled_tensor_id < 0:
         raise ValueError(
@@ -243,8 +284,25 @@ def _vram_op_to_call(
             f"compilation_hash mismatch?"
         )
     if isinstance(op, H2DPrefetchOp):
+        if op.after_launch_id >= 0 and op.after_launch_id != op.before_launch_id:
+            return f"_ws_rt.h2d_prefetch_async({var})"
         return f"_ws_rt.h2d_prefetch({var})"
     return f"_ws_rt.evict_vram({var})"
+
+
+def _vram_wait_to_call(
+    op: H2DPrefetchOp,
+    tensor_id_to_input: dict[int, str],
+) -> str:
+    """Emit a wait call for an async H2D prefetch at the consumer launch."""
+    var = tensor_id_to_input.get(op.compiled_tensor_id)
+    if var is None:
+        raise ValueError(
+            f"compiled_tensor_id {op.compiled_tensor_id} for "
+            f"'{op.tensor_name}' not found in graph inputs — "
+            f"compilation_hash mismatch?"
+        )
+    return f"_ws_rt.h2d_wait({var})"
 
 
 @dataclasses.dataclass

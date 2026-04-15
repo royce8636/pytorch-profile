@@ -701,7 +701,7 @@ def expected_tensor_overlay(
     execution_nodes_by_rf_id = COMMON.index_execution_trace_nodes_by_rf_id(
         execution_nodes
     )
-    cpu_matched, _ambiguous = COMMON.match_execution_nodes_to_kineto_runtime(
+    cpu_matched, _ambiguous, _cpu_match_stats = COMMON.match_execution_nodes_to_kineto_runtime(
         all_events,
         execution_nodes_by_rf_id,
     )

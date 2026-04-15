@@ -29,11 +29,24 @@ class PrefetchOp:
 
 @dataclass
 class H2DPrefetchOp:
-    """DRAM->VRAM prefetch (type="vram_prefetch_h2d" in scheduler io_operations)."""
+    """DRAM->VRAM prefetch (type="vram_prefetch_h2d" in scheduler io_operations).
+
+    Placement uses two anchors when the scheduler provides early-start timing:
+      - after_launch_id: where the async H2D copy is issued (early start)
+      - before_launch_id: where the consumer waits for the copy to finish
+    When only before_launch_id is set, the H2D is issued synchronously there.
+
+    cross_iter=True means the op is a cyclic reload: iter N's post-ops at
+    after_launch_id feed iter N+1's pre-ops at before_launch_id. For these,
+    after_launch_id may equal or exceed before_launch_id; codegen treats them
+    as always async.
+    """
     tensor_name: str
     before_node: int
     before_launch_id: int = -1
+    after_launch_id: int = -1  # early-start anchor from scheduler
     compiled_tensor_id: int = -1  # graph-local, from tensor_map sidecar
+    cross_iter: bool = False
 
 
 @dataclass
@@ -152,7 +165,9 @@ def load_io_schedule(
                 tensor_name=op["tensor_name"],
                 before_node=op["before_node"],
                 before_launch_id=op.get("before_launch_id", -1),
+                after_launch_id=op.get("after_launch_id", -1),
                 compiled_tensor_id=op.get("compiled_tensor_id", -1),
+                cross_iter=op.get("reason") == "h2d_cross_iter_reload",
             ))
         elif op_type == "vram_evict_d2h":
             evict_vram_ops.append(EvictVramOp(

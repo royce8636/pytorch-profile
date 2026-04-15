@@ -25,14 +25,19 @@ from profile_sdxl_turbo_common import (  # noqa: E402
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    *,
+    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_output_prefix: str = "sdxl_turbo_gpu_run",
+    description: str = "Run SDXL Turbo on GPU without profiler instrumentation.",
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run SDXL Turbo on GPU without profiler instrumentation."
+        description=description
     )
     parser.add_argument(
         "--model",
-        default="/data/llamasim/models/sdxl-turbo",
-        help="Path to the SDXL Turbo model directory.",
+        default=default_model,
+        help="Path to the SDXL model directory.",
     )
     parser.add_argument(
         "--prompt",
@@ -111,11 +116,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable diffusers progress output.",
     )
+    parser.set_defaults(output_prefix=default_output_prefix)
     return parser.parse_args()
 
 
 def resolve_image_path(args: argparse.Namespace) -> Path:
-    stem = f"{output_stem('sdxl_turbo_gpu_run', args.fusion)}_steps{args.steps}"
+    output_prefix = getattr(args, "output_prefix", "sdxl_turbo_gpu_run")
+    stem = f"{output_stem(output_prefix, args.fusion)}_steps{args.steps}"
     if args.image is not None:
         image_path = Path(args.image)
     elif args.output_dir is not None:
@@ -156,8 +163,17 @@ def validate_run_device(device_name: str) -> torch.device:
     return device
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    *,
+    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_output_prefix: str = "sdxl_turbo_gpu_run",
+    description: str = "Run SDXL Turbo on GPU without profiler instrumentation.",
+) -> None:
+    args = parse_args(
+        default_model=default_model,
+        default_output_prefix=default_output_prefix,
+        description=description,
+    )
     device = validate_run_device(args.device)
     validate_fusion_runtime(args, device)
     torch_dtype = DTYPE_BY_NAME[args.dtype]

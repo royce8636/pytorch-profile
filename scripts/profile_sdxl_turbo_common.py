@@ -76,6 +76,8 @@ def parse_args(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_component: str = "sdxl_turbo_pipeline",
     default_fusion: str = "none",
     default_dot_level: str,
     default_profile_memory: bool,
@@ -83,12 +85,12 @@ def parse_args(
     default_with_stack: bool,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="SDXL Turbo profiler driver for the patched PyTorch build."
+        description="SDXL profiler driver for the patched PyTorch build."
     )
     parser.add_argument(
         "--model",
-        default="/data/llamasim/models/sdxl-turbo",
-        help="Path to the SDXL Turbo model directory.",
+        default=default_model,
+        help="Path to the SDXL model directory.",
     )
     parser.add_argument(
         "--prompt",
@@ -278,7 +280,7 @@ def parse_args(
     )
     parser.add_argument(
         "--component",
-        default="sdxl_turbo_pipeline",
+        default=default_component,
         help="Component label stored in profiler metadata.",
     )
     parser.add_argument(
@@ -631,17 +633,32 @@ def load_pipeline(model: str, torch_dtype: torch.dtype, device: torch.device) ->
     return pipe
 
 
-def configure_llamasim_inductor_markers(output_dir: Path | str | None) -> None:
-    """Enable compile-time provenance needed for exact LLaMASim runtime edges."""
+def configure_llamasim_inductor_markers(
+    output_dir: Path | str | None,
+    include_diagnostic_markers: bool = True,
+) -> None:
+    """Configure Inductor for weight-streaming codegen.
+
+    `weight_streaming_emit_ids` and `weight_streaming_output_code` are always
+    enabled — they're load-bearing for the tensor-object dispatch path and for
+    writing the generated code out.
+
+    The `ws_launch:K:N` / `ws_sync:K:N` record_function markers
+    (`weight_streaming_emit_launch_markers`, `weight_streaming_emit_sync_markers`)
+    are DIAGNOSTIC — they let chrome traces correlate kernels back to compiled
+    launch ids, but add ~5 µs / call under torch.profiler. Set
+    `include_diagnostic_markers=False` for production/inference runs where
+    profiling isn't active.
+    """
     if output_dir is None:
         return
 
     output_dir_str = str(output_dir)
     desired = {
         "weight_streaming_emit_ids": True,
-        "weight_streaming_emit_launch_markers": True,
-        "weight_streaming_emit_sync_markers": True,
         "weight_streaming_output_code": output_dir_str,
+        "weight_streaming_emit_launch_markers": include_diagnostic_markers,
+        "weight_streaming_emit_sync_markers": include_diagnostic_markers,
     }
     config = torch._inductor.config
     changed = any(getattr(config, name) != value for name, value in desired.items())
@@ -1528,11 +1545,31 @@ def kineto_runtime_node_label_lines(
 def match_execution_nodes_to_kineto_runtime(
     raw_events: list[Any],
     execution_nodes_by_rf_id: dict[int, list[dict[str, Any]]],
-) -> tuple[dict[int, dict[str, Any]], set[int]]:
+    *,
+    sample_limit: int = 5,
+) -> tuple[dict[int, dict[str, Any]], set[int], dict[str, Any]]:
+    """Match execution-trace nodes to Kineto CPU events by rf_id/correlation_id.
+
+    Returns (matches, ambiguous_rf_ids, stats). ``stats`` categorizes the rf_ids
+    that failed to produce a unique match so callers can report them:
+      - ``multiple_execution_nodes``: >1 execution node shares the same rf_id.
+        Unusual; would indicate duplicate rf_ids emitted by the observer.
+      - ``no_runtime_candidate``: no Kineto CPU event has that correlation_id.
+        Common and mostly benign (structural execution nodes such as module
+        boundaries, autograd meta, etc., are in the execution trace but not in
+        Kineto as runtime events).
+      - ``multiple_runtime_candidates``: after name-filtering, more than one
+        Kineto CPU event still matches. Real ambiguity — tensor I/O for this
+        execution node is silently dropped by the runtime-bundle pipeline.
+    """
     from torch.autograd import DeviceType
 
     matched_execution_node_by_event: dict[int, dict[str, Any]] = {}
     ambiguous_rf_ids: set[int] = set()
+    multiple_execution_nodes = 0
+    no_runtime_candidate = 0
+    multiple_runtime_candidates = 0
+    multiple_runtime_candidates_samples: list[dict[str, Any]] = []
 
     raw_events_by_rf_id: dict[int, list[Any]] = {}
     for event in raw_events:
@@ -1545,8 +1582,13 @@ def match_execution_nodes_to_kineto_runtime(
 
     for rf_id, execution_nodes in execution_nodes_by_rf_id.items():
         runtime_candidates = raw_events_by_rf_id.get(rf_id, [])
-        if len(execution_nodes) != 1 or not runtime_candidates:
+        if len(execution_nodes) != 1:
             ambiguous_rf_ids.add(rf_id)
+            multiple_execution_nodes += 1
+            continue
+        if not runtime_candidates:
+            ambiguous_rf_ids.add(rf_id)
+            no_runtime_candidate += 1
             continue
 
         execution_node = execution_nodes[0]
@@ -1557,11 +1599,25 @@ def match_execution_nodes_to_kineto_runtime(
 
         if len(runtime_candidates) != 1:
             ambiguous_rf_ids.add(rf_id)
+            multiple_runtime_candidates += 1
+            if len(multiple_runtime_candidates_samples) < sample_limit:
+                multiple_runtime_candidates_samples.append({
+                    "rf_id": rf_id,
+                    "execution_node_name": name,
+                    "candidate_count": len(runtime_candidates),
+                    "candidate_names": sorted({e.name() for e in runtime_candidates}),
+                })
             continue
 
         matched_execution_node_by_event[id(runtime_candidates[0])] = execution_node
 
-    return matched_execution_node_by_event, ambiguous_rf_ids
+    stats = {
+        "multiple_execution_nodes": multiple_execution_nodes,
+        "no_runtime_candidate": no_runtime_candidate,
+        "multiple_runtime_candidates": multiple_runtime_candidates,
+        "multiple_runtime_candidates_samples": multiple_runtime_candidates_samples,
+    }
+    return matched_execution_node_by_event, ambiguous_rf_ids, stats
 
 
 def write_kineto_event_mapping(
@@ -1756,7 +1812,7 @@ def write_runtime_io_profile_dot(
     csv_matches = build_kineto_csv_matches(prof, raw_events, trace_start_ns)
     execution_nodes = load_execution_trace_nodes(execution_trace_path)
     execution_nodes_by_rf_id = index_execution_trace_nodes_by_rf_id(execution_nodes)
-    matched_execution_node_by_event, ambiguous_rf_ids = match_execution_nodes_to_kineto_runtime(
+    matched_execution_node_by_event, ambiguous_rf_ids, _ = match_execution_nodes_to_kineto_runtime(
         raw_events,
         execution_nodes_by_rf_id,
     )
@@ -3588,8 +3644,10 @@ def write_llamasim_runtime_bundle(
         )
 
     execution_nodes_by_rf_id = index_execution_trace_nodes_by_rf_id(execution_nodes)
-    cpu_matched, _ambiguous = match_execution_nodes_to_kineto_runtime(
-        raw_events, execution_nodes_by_rf_id,
+    cpu_matched, cpu_ambiguous_rf_ids, cpu_match_stats = (
+        match_execution_nodes_to_kineto_runtime(
+            raw_events, execution_nodes_by_rf_id,
+        )
     )
     matched_execution_node_by_event.update(cpu_matched)
 
@@ -4373,6 +4431,17 @@ def write_llamasim_runtime_bundle(
         "propagation_no_linked_rf_id": propagation_stats["no_linked_rf_id"],
         "propagation_no_execution_node": propagation_stats["no_execution_node"],
         "propagation_ambiguous_rf_id": propagation_stats["ambiguous_rf_id"],
+        "cpu_match_ambiguous_rf_id_count": len(cpu_ambiguous_rf_ids),
+        "cpu_match_multiple_execution_nodes": cpu_match_stats[
+            "multiple_execution_nodes"
+        ],
+        "cpu_match_no_runtime_candidate": cpu_match_stats["no_runtime_candidate"],
+        "cpu_match_multiple_runtime_candidates": cpu_match_stats[
+            "multiple_runtime_candidates"
+        ],
+        "cpu_match_multiple_runtime_candidates_samples": cpu_match_stats[
+            "multiple_runtime_candidates_samples"
+        ],
         "ws_launch_resolved_count": sum(
             1 for e in selected_events if id(e) in ws_launch_index
         ),
@@ -4519,6 +4588,31 @@ def print_llamasim_runtime_summary(bundle_dir: Path) -> None:
                 "  ws_sync_empty_source_count: "
                 f"{manifest.get('ws_sync_empty_source_count', 0)}"
             )
+
+    cpu_ambiguous_total = int(manifest.get("cpu_match_ambiguous_rf_id_count", 0) or 0)
+    cpu_multi_exec = int(manifest.get("cpu_match_multiple_execution_nodes", 0) or 0)
+    cpu_no_runtime = int(manifest.get("cpu_match_no_runtime_candidate", 0) or 0)
+    cpu_multi_runtime = int(
+        manifest.get("cpu_match_multiple_runtime_candidates", 0) or 0
+    )
+    print(
+        "  cpu_match_ambiguous: "
+        f"total={cpu_ambiguous_total} "
+        f"multiple_execution_nodes={cpu_multi_exec} "
+        f"no_runtime_candidate={cpu_no_runtime} "
+        f"multiple_runtime_candidates={cpu_multi_runtime}"
+    )
+    if cpu_multi_runtime > 0:
+        samples = manifest.get("cpu_match_multiple_runtime_candidates_samples") or []
+        if samples:
+            print(
+                "  cpu_match_multiple_runtime_candidates_samples: "
+                f"{json.dumps(samples[:3], sort_keys=True)}"
+            )
+        print(
+            "  cpu_match_note: execution-trace nodes that silently lose tensor I/O "
+            "due to multiple runtime candidates with matching rf_id+name"
+        )
 
 
 def write_hybrid_profile_dot(prof: Any, dot_path: Path, graph_name: str) -> None:
@@ -4823,6 +4917,8 @@ def main(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_component: str = "sdxl_turbo_pipeline",
     default_fusion: str = "none",
     default_dot_level: str = "none",
     default_llamasim_output_dirname: str | None = None,
@@ -4834,6 +4930,8 @@ def main(
         default_device=default_device,
         default_dtype=default_dtype,
         default_output_prefix=default_output_prefix,
+        default_model=default_model,
+        default_component=default_component,
         default_fusion=default_fusion,
         default_dot_level=default_dot_level,
         default_profile_memory=default_profile_memory,

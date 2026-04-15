@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import torch
 from torch._inductor.weight_streaming.plan import IOSchedule, TensorEntry
+from torch.profiler import record_function
 
 log = logging.getLogger(__name__)
 
@@ -102,15 +103,16 @@ class WeightStreamRuntime:
 
     def ssd_prefetch(self, tensor_name: str) -> None:
         """Submit async SSD->pinned-DRAM read."""
-        if self._location.get(tensor_name) != "ssd":
-            return
-        if tensor_name in self._inflight_reads:
-            return
-        entry = self._schedule.tensors.get(tensor_name)
-        if entry is None or not entry.file:
-            return
-        future = self._ssd_pool.submit(self._read_from_file, entry)
-        self._inflight_reads[tensor_name] = future
+        with record_function("ws_rt::ssd_prefetch"):
+            if self._location.get(tensor_name) != "ssd":
+                return
+            if tensor_name in self._inflight_reads:
+                return
+            entry = self._schedule.tensors.get(tensor_name)
+            if entry is None or not entry.file:
+                return
+            future = self._ssd_pool.submit(self._read_from_file, entry)
+            self._inflight_reads[tensor_name] = future
 
     def cold_start_prefetch(self, tensor_name: str) -> None:
         """Load a tensor at startup (before any kernels run).
@@ -118,15 +120,16 @@ class WeightStreamRuntime:
         If the tensor is already in DRAM (pre-loaded by user), this is a no-op.
         Otherwise, initiates an SSD prefetch and waits for completion.
         """
-        loc = self._location.get(tensor_name, "ssd")
-        if loc in ("dram", "vram"):
-            return
-        self.ssd_prefetch(tensor_name)
-        # Wait for SSD read to complete so it's ready before first kernel
-        if tensor_name in self._inflight_reads:
-            cpu_tensor = self._inflight_reads.pop(tensor_name).result()
-            self._dram_buffers[tensor_name] = cpu_tensor
-            self._location[tensor_name] = "dram"
+        with record_function("ws_rt::cold_start_prefetch"):
+            loc = self._location.get(tensor_name, "ssd")
+            if loc in ("dram", "vram"):
+                return
+            self.ssd_prefetch(tensor_name)
+            # Wait for SSD read to complete so it's ready before first kernel
+            if tensor_name in self._inflight_reads:
+                cpu_tensor = self._inflight_reads.pop(tensor_name).result()
+                self._dram_buffers[tensor_name] = cpu_tensor
+                self._location[tensor_name] = "dram"
 
     def h2d_prefetch(self, tensor_name_or_tensor: str | torch.Tensor) -> torch.Tensor | None:
         """Restore a tensor's GPU storage from CPU backup, or do SSD->DRAM->VRAM.
@@ -136,12 +139,13 @@ class WeightStreamRuntime:
 
         When called with a string name (legacy path), does SSD->DRAM->VRAM copy.
         """
-        if isinstance(tensor_name_or_tensor, torch.Tensor):
-            return self._h2d_prefetch_tensor(tensor_name_or_tensor)
-        return self._h2d_prefetch_by_name(tensor_name_or_tensor)
+        with record_function("ws_rt::h2d_prefetch"):
+            if isinstance(tensor_name_or_tensor, torch.Tensor):
+                return self._h2d_prefetch_tensor(tensor_name_or_tensor)
+            return self._h2d_prefetch_by_name(tensor_name_or_tensor)
 
     def _h2d_prefetch_tensor(self, gpu_tensor: torch.Tensor) -> torch.Tensor:
-        """Restore a GPU tensor's storage from its CPU backup."""
+        """Restore a GPU tensor's storage from its CPU backup (synchronous)."""
         key = id(gpu_tensor)
         backup = self._weight_backups.get(key)
         if backup is None:
@@ -163,6 +167,82 @@ class WeightStreamRuntime:
             gpu_tensor.untyped_storage().resize_(nbytes)
             with torch.no_grad():
                 gpu_tensor.copy_(backup)
+        return gpu_tensor
+
+    def h2d_prefetch_async(
+        self, tensor_name_or_tensor: str | torch.Tensor
+    ) -> torch.Tensor | None:
+        """Start an async H2D copy on the dedicated stream."""
+        with record_function("ws_rt::h2d_prefetch_async"):
+            if isinstance(tensor_name_or_tensor, torch.Tensor):
+                return self._h2d_prefetch_tensor_async(tensor_name_or_tensor)
+            return self._h2d_prefetch_by_name(tensor_name_or_tensor)
+
+    def _h2d_prefetch_tensor_async(self, gpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Restore a GPU tensor's storage from its CPU backup (async).
+
+        Allocation is tied to the default stream so freeing (via resize_(0))
+        recycles cleanly into the same allocator pool. The H2D copy itself
+        runs on _h2d_stream for compute overlap. Cross-stream coordination:
+          - host-block on any pending eviction event (typically already fired
+            for cross-iter ops since the evict was many launches ago).
+          - record_stream so the allocator knows _h2d_stream is using storage
+            allocated on the default stream.
+        """
+        key = id(gpu_tensor)
+        backup = self._weight_backups.get(key)
+        if backup is None:
+            return gpu_tensor
+
+        if key in self._h2d_events:
+            return gpu_tensor
+
+        default_stream = torch.cuda.current_stream(self._device)
+
+        pending = self._pending_vram_evictions.get(key)
+        if pending is not None:
+            pending_tensor, evict_event = pending
+            evict_event.synchronize()
+            pending_tensor.untyped_storage().resize_(0)
+            self._pending_vram_evictions.pop(key)
+
+        if gpu_tensor.untyped_storage().nbytes() == 0:
+            nbytes = self._weight_storage_nbytes[key]
+            gpu_tensor.untyped_storage().resize_(nbytes)
+            gpu_tensor.record_stream(self._h2d_stream)
+            self._h2d_stream.wait_stream(default_stream)
+            with torch.cuda.stream(self._h2d_stream):
+                with torch.no_grad():
+                    gpu_tensor.copy_(backup, non_blocking=True)
+        # Always record an event so the cross-iter wait can pop one even when
+        # the storage was already resident (no copy needed). The event fires
+        # immediately if no work was queued on h2d_stream.
+        event = torch.cuda.Event()
+        self._h2d_stream.record_event(event)
+        self._h2d_events[key] = event
+        return gpu_tensor
+
+    def h2d_wait(self, tensor_name_or_tensor: str | torch.Tensor) -> torch.Tensor | None:
+        """Wait for an async H2D copy to complete before using the tensor."""
+        with record_function("ws_rt::h2d_wait"):
+            if isinstance(tensor_name_or_tensor, torch.Tensor):
+                return self._h2d_wait_tensor(tensor_name_or_tensor)
+            return self.wait_h2d(tensor_name_or_tensor)
+
+    def _h2d_wait_tensor(self, gpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Wait for the async H2D event recorded by _h2d_prefetch_tensor_async.
+
+        Also calls record_stream so the caching allocator knows the current
+        (default) stream is using storage that was allocated on _h2d_stream —
+        otherwise the allocator may recycle the memory before this stream's
+        kernels finish reading it.
+        """
+        key = id(gpu_tensor)
+        event = self._h2d_events.pop(key, None)
+        if event is not None:
+            current = torch.cuda.current_stream(self._device)
+            current.wait_event(event)
+            gpu_tensor.record_stream(current)
         return gpu_tensor
 
     def _h2d_prefetch_by_name(self, tensor_name: str) -> torch.Tensor | None:
@@ -234,20 +314,21 @@ class WeightStreamRuntime:
 
     def flush_ready_vram_evictions(self) -> None:
         """Free pending VRAM evictions whose CUDA completion events are ready."""
-        for key, (gpu_tensor, event) in list(self._pending_vram_evictions.items()):
-            if event.query():
-                self._free_tensor_storage(gpu_tensor)
-                del self._pending_vram_evictions[key]
+        with record_function("ws_rt::flush_ready_vram_evictions"):
+            for key, (gpu_tensor, event) in list(self._pending_vram_evictions.items()):
+                if event.query():
+                    self._free_tensor_storage(gpu_tensor)
+                    del self._pending_vram_evictions[key]
 
-        for tensor_name, (gpu_tensor, event) in list(
-            self._pending_vram_name_evictions.items()
-        ):
-            if event.query():
-                self._free_tensor_storage(gpu_tensor)
-                del self._pending_vram_name_evictions[tensor_name]
-                self._vram_tensors.pop(tensor_name, None)
-                if self._location.get(tensor_name) == "vram":
-                    self._location[tensor_name] = "dram"
+            for tensor_name, (gpu_tensor, event) in list(
+                self._pending_vram_name_evictions.items()
+            ):
+                if event.query():
+                    self._free_tensor_storage(gpu_tensor)
+                    del self._pending_vram_name_evictions[tensor_name]
+                    self._vram_tensors.pop(tensor_name, None)
+                    if self._location.get(tensor_name) == "vram":
+                        self._location[tensor_name] = "dram"
 
     def flush_all_vram_evictions(self) -> None:
         """Block until all pending VRAM evictions are safe, then free them."""
@@ -275,10 +356,11 @@ class WeightStreamRuntime:
         When called with a string name (legacy path), pops from _vram_tensors
         after the deferred eviction event completes.
         """
-        if isinstance(tensor_name_or_tensor, torch.Tensor):
-            self._evict_vram_tensor(tensor_name_or_tensor)
-        else:
-            self._evict_vram_by_name(tensor_name_or_tensor)
+        with record_function("ws_rt::evict_vram"):
+            if isinstance(tensor_name_or_tensor, torch.Tensor):
+                self._evict_vram_tensor(tensor_name_or_tensor)
+            else:
+                self._evict_vram_by_name(tensor_name_or_tensor)
 
     def _evict_vram_tensor(self, gpu_tensor: torch.Tensor) -> None:
         """Queue eviction of a registered GPU tensor after current-stream work."""

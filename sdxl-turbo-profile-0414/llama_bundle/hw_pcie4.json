@@ -1,0 +1,10 @@
+{
+  "_comment": "PCIe 4.0 x16 hardware profile for SDXL-Turbo weight streaming",
+  "ssd_bandwidth_Bps": 7000000000,
+  "ssd_read_latency_ns": 50000,
+  "ssd_write_latency_ns": 50000,
+  "pcie_h2d_bandwidth_Bps": 25000000000,
+  "pcie_d2h_bandwidth_Bps": 25000000000,
+  "pcie_h2d_latency_ns": 5000,
+  "pcie_d2h_latency_ns": 5000
+}

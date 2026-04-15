@@ -415,7 +415,7 @@ class TestVramOpResolution(TestCase):
             _vram_op_to_call(op, tid_map)
 
     def test_vram_ops_in_exact_launch_maps(self):
-        """VRAM ops with launch IDs appear in before_launch/after_launch."""
+        """VRAM ops with launch IDs appear in exact launch maps."""
         schedule = IOSchedule(
             h2d_prefetches=[
                 H2DPrefetchOp("w", before_node=1, before_launch_id=7,
@@ -437,6 +437,45 @@ class TestVramOpResolution(TestCase):
         self.assertTrue(any(isinstance(op, H2DPrefetchOp) for op in all_before))
         self.assertTrue(any(isinstance(op, EvictVramOp) for op in all_after))
         self.assertTrue(any(isinstance(op, EvictDramOp) for op in all_after))
+
+    def test_async_h2d_after_launch_not_before_launch(self):
+        schedule = IOSchedule(
+            h2d_prefetches=[
+                H2DPrefetchOp(
+                    "w",
+                    before_node=21,
+                    before_launch_id=21,
+                    after_launch_id=19,
+                    compiled_tensor_id=0,
+                ),
+            ],
+        )
+        adapter = ScheduleAdapter(schedule)
+        self.assertNotIn(19, adapter.before_launch)
+        self.assertIn(19, adapter.h2d_after_launch)
+        self.assertIsInstance(adapter.h2d_after_launch[19][0], H2DPrefetchOp)
+        self.assertIn(21, adapter.h2d_wait_launch)
+
+    def test_same_launch_h2d_falls_back_to_sync_prelaunch(self):
+        schedule = IOSchedule(
+            h2d_prefetches=[
+                H2DPrefetchOp(
+                    "w",
+                    before_node=47,
+                    before_launch_id=47,
+                    after_launch_id=47,
+                    compiled_tensor_id=0,
+                ),
+            ],
+        )
+        adapter = ScheduleAdapter(schedule)
+        self.assertIn(47, adapter.before_launch)
+        self.assertNotIn(47, adapter.h2d_after_launch)
+        self.assertNotIn(47, adapter.h2d_wait_launch)
+        self.assertEqual(
+            _vram_op_to_call(schedule.h2d_prefetches[0], {0: "arg0_1"}),
+            "_ws_rt.h2d_prefetch(arg0_1)",
+        )
 
 
 class TestLaunchIdFields(TestCase):
@@ -1228,6 +1267,161 @@ if HAS_GPU:
                 WeightStreamRuntime.reset()
                 inductor_config.weight_streaming_plan = ""
                 inductor_config.weight_streaming_output_code = ""
+                os.unlink(schedule_path)
+
+        def test_exact_vram_aliases_are_emitted_inside_wrapper_body(self):
+            import torch._inductor.config as inductor_config
+
+            torch._dynamo.reset()
+            model = torch.nn.Linear(10, 10).cuda()
+            x = torch.randn(2, 10, device="cuda")
+
+            out_dir = tempfile.mkdtemp(prefix="ws_exact_vram_indent_test_")
+            schedule_data = {
+                "nodes": [],
+                "io_operations": [
+                    {
+                        "type": "vram_prefetch_h2d",
+                        "tensor_name": "w",
+                        "before_node": 0,
+                        "before_launch_id": 0,
+                        "compiled_tensor_id": 0,
+                    },
+                    {
+                        "type": "vram_evict_d2h",
+                        "tensor_name": "w",
+                        "after_node": 0,
+                        "after_launch_id": 0,
+                        "compiled_tensor_id": 0,
+                    },
+                ],
+                "spill_decisions": [],
+                "cold_start_prefetches": [
+                    {"tensor_name": "cold", "attach_before_node": 0},
+                ],
+                "tensor_metadata": {
+                    "w": {
+                        "kind": "WEIGHT",
+                        "size_bytes": 400,
+                        "dtype": "float32",
+                        "shape": [10, 10],
+                    },
+                    "cold": {
+                        "kind": "WEIGHT",
+                        "size_bytes": 400,
+                        "dtype": "float32",
+                        "shape": [10, 10],
+                    },
+                },
+            }
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as f:
+                json.dump(schedule_data, f)
+                f.flush()
+                schedule_path = f.name
+
+            try:
+                schedule = load_io_schedule(schedule_path)
+                WeightStreamRuntime.initialize(schedule, torch.device("cuda"))
+
+                inductor_config.weight_streaming_plan = schedule_path
+                inductor_config.weight_streaming_output_code = out_dir
+                inductor_config.force_disable_caches = True
+
+                compiled = torch.compile(model)
+                out = compiled(x)
+                self.assertEqual(out.shape, torch.Size([2, 10]))
+
+                generated_path = os.path.join(
+                    out_dir, "weight_streaming_generated.py"
+                )
+                self.assertTrue(os.path.exists(generated_path))
+                with open(generated_path) as f:
+                    generated = f.read()
+
+                self.assertIn("_ws_ref_", generated)
+                self.assertFalse(
+                    any(
+                        line.startswith("_ws_ref_")
+                        for line in generated.splitlines()
+                    )
+                )
+                self.assertIn(
+                    "_ws_rt.cold_start_prefetch('cold')", generated
+                )
+            finally:
+                WeightStreamRuntime.reset()
+                inductor_config.weight_streaming_plan = ""
+                inductor_config.weight_streaming_output_code = ""
+                inductor_config.force_disable_caches = False
+                os.unlink(schedule_path)
+
+        def test_tail_vram_evict_adds_cycle_prefetch(self):
+            import torch._inductor.config as inductor_config
+
+            torch._dynamo.reset()
+            model = torch.nn.Linear(10, 10).cuda()
+            x = torch.randn(2, 10, device="cuda")
+
+            out_dir = tempfile.mkdtemp(prefix="ws_cycle_prefetch_test_")
+            schedule_data = {
+                "nodes": [],
+                "io_operations": [
+                    {
+                        "type": "vram_evict_d2h",
+                        "tensor_name": "w",
+                        "after_node": 0,
+                        "after_launch_id": 0,
+                        "compiled_tensor_id": 0,
+                    },
+                ],
+                "spill_decisions": [],
+                "cold_start_prefetches": [],
+                "tensor_metadata": {
+                    "w": {
+                        "kind": "WEIGHT",
+                        "size_bytes": 400,
+                        "dtype": "float32",
+                        "shape": [10, 10],
+                    },
+                },
+            }
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as f:
+                json.dump(schedule_data, f)
+                f.flush()
+                schedule_path = f.name
+
+            try:
+                schedule = load_io_schedule(schedule_path)
+                WeightStreamRuntime.initialize(schedule, torch.device("cuda"))
+
+                inductor_config.weight_streaming_plan = schedule_path
+                inductor_config.weight_streaming_output_code = out_dir
+                inductor_config.force_disable_caches = True
+
+                compiled = torch.compile(model)
+                out = compiled(x)
+                self.assertEqual(out.shape, torch.Size([2, 10]))
+
+                generated_path = os.path.join(
+                    out_dir, "weight_streaming_generated.py"
+                )
+                self.assertTrue(os.path.exists(generated_path))
+                with open(generated_path) as f:
+                    generated = f.read()
+
+                self.assertIn("_ws_rt.evict_vram(_ws_ref_", generated)
+                self.assertIn("_ws_rt.h2d_prefetch(_ws_ref_", generated)
+            finally:
+                WeightStreamRuntime.reset()
+                inductor_config.weight_streaming_plan = ""
+                inductor_config.weight_streaming_output_code = ""
+                inductor_config.force_disable_caches = False
                 os.unlink(schedule_path)
 
         def test_generated_code_contains_launch_and_sync_markers(self):

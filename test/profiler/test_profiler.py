@@ -5620,6 +5620,28 @@ class TestExperimentalUtils(TestCase):
                 Path(tmpdir) / "sdxl_turbo_gpu_run_steps4_output.png",
             )
 
+    def test_run_sdxl_base_entrypoint_uses_base_defaults(self):
+        scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+        if os.fspath(scripts_dir) not in sys.path:
+            sys.path.insert(0, os.fspath(scripts_dir))
+        import run_sdxl_turbo_gpu as sdxl_runner
+
+        with patch.object(sdxl_runner, "main", autospec=True) as main_mock:
+            runpy.run_path(
+                os.fspath(scripts_dir / "run_sdxl_base_gpu.py"),
+                run_name="__main__",
+            )
+
+        main_mock.assert_called_once()
+        self.assertEqual(
+            main_mock.call_args.kwargs["default_model"],
+            "/data/llamasim/models/sdxl-1.0-base",
+        )
+        self.assertEqual(
+            main_mock.call_args.kwargs["default_output_prefix"],
+            "sdxl_base_gpu_run",
+        )
+
     def test_run_qwen_resolve_image_path_includes_steps(self):
         runner = _load_run_qwen_image()
 
@@ -6264,6 +6286,35 @@ class TestExperimentalUtils(TestCase):
             )
 
         main_mock.assert_called_once()
+        self.assertEqual(main_mock.call_args.kwargs["default_fusion"], "inductor")
+
+    def test_profile_sdxl_base_gpu_entrypoint_uses_base_defaults(self):
+        scripts_dir = (
+            Path(__file__).resolve().parents[2] / "scripts"
+        )
+        if os.fspath(scripts_dir) not in sys.path:
+            sys.path.insert(0, os.fspath(scripts_dir))
+        import profile_sdxl_turbo_common as sdxl_common
+
+        with patch.object(sdxl_common, "main", autospec=True) as main_mock:
+            runpy.run_path(
+                os.fspath(scripts_dir / "profile_sdxl_base_gpu.py"),
+                run_name="__main__",
+            )
+
+        main_mock.assert_called_once()
+        self.assertEqual(
+            main_mock.call_args.kwargs["default_model"],
+            "/data/llamasim/models/sdxl-1.0-base",
+        )
+        self.assertEqual(
+            main_mock.call_args.kwargs["default_output_prefix"],
+            "sdxl_base_gpu",
+        )
+        self.assertEqual(
+            main_mock.call_args.kwargs["default_component"],
+            "sdxl_base_pipeline",
+        )
         self.assertEqual(main_mock.call_args.kwargs["default_fusion"], "inductor")
 
     def test_maybe_compile_sdxl_enables_ws_markers_for_llamasim_bundle(self):

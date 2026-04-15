@@ -2456,6 +2456,7 @@ class PythonWrapperCodegen(CodeGen):
         from torch._inductor.weight_streaming.codegen import (
             _op_to_call,
             _vram_op_to_call,
+            _vram_wait_to_call,
             ScheduleAdapter,
             WeightStreamingLine,
         )
@@ -2492,7 +2493,6 @@ class PythonWrapperCodegen(CodeGen):
         if tensor_id_to_input:
             for tid, name in tensor_id_to_input.items():
                 alias = f"_ws_ref_{name}"
-                self.prefix.writeline(f"{alias} = {name}")
                 stable_tensor_refs[tid] = alias
 
         # Emit runtime import in the header
@@ -2506,6 +2506,44 @@ class PythonWrapperCodegen(CodeGen):
         # SSD/DRAM ops use string names.
         before_launch = adapter.before_launch
         after_launch = adapter.after_launch
+        h2d_after_launch = adapter.h2d_after_launch
+        h2d_wait_launch = adapter.h2d_wait_launch
+
+        # The same compiled wrapper can be invoked repeatedly, as in SDXL
+        # denoising loops. A schedule that evicts a tensor after its last use
+        # in one invocation must reload it before its first use in the next
+        # invocation. Schedules built for a single linear pass may not contain
+        # that wrap-around H2D op, so add the conservative cyclic reload here.
+        input_usage = self._build_input_usage_map()
+        for tid, name in tensor_id_to_input.items():
+            used_launches = input_usage.get(name, [])
+            if not used_launches:
+                continue
+            first_use = used_launches[0]
+            last_use = used_launches[-1]
+            tail_evicts = [
+                op
+                for op in schedule.evict_vram
+                if op.compiled_tensor_id == tid
+                and op.after_launch_id >= last_use
+            ]
+            if not tail_evicts:
+                continue
+            has_cycle_prefetch = any(
+                op.compiled_tensor_id == tid
+                and 0 <= op.before_launch_id <= first_use
+                for op in schedule.h2d_prefetches
+            )
+            if has_cycle_prefetch:
+                continue
+            before_launch.setdefault(first_use, []).append(
+                H2DPrefetchOp(
+                    tensor_name=tail_evicts[-1].tensor_name,
+                    before_node=-1,
+                    before_launch_id=first_use,
+                    compiled_tensor_id=tid,
+                )
+            )
 
         # Collect compute lines (all four types including MultiOut)
         compute_lines: list[WrapperLine] = []
@@ -2531,6 +2569,17 @@ class PythonWrapperCodegen(CodeGen):
         kernel_only_idx = 0
         new_lines: list = []
 
+        if stable_tensor_refs:
+            new_lines.append(
+                WeightStreamingLine(
+                    wrapper=self,
+                    calls=[
+                        f"{alias} = {tensor_id_to_input[tid]}"
+                        for tid, alias in sorted(stable_tensor_refs.items())
+                    ],
+                )
+            )
+
         # Cold start prefetches go before any compute
         if adapter.startup_ops:
             new_lines.append(
@@ -2555,6 +2604,15 @@ class PythonWrapperCodegen(CodeGen):
 
             if is_compute:
                 pre_calls: list[str] = []
+
+                # H2D wait calls: async copies that must complete before
+                # this launch uses the tensor.
+                for op in h2d_wait_launch.get(line.launch_id, []):
+                    pre_calls.append(
+                        _vram_wait_to_call(
+                            op, stable_tensor_refs or tensor_id_to_input
+                        )
+                    )
 
                 # Exact pre-ops (launch-ID keyed)
                 for op in before_launch.get(line.launch_id, []):
@@ -2588,14 +2646,29 @@ class PythonWrapperCodegen(CodeGen):
                             post_ops.append((op, False))
 
                 post_calls: list[str] = []
-                has_vram_evict = any(
-                    isinstance(op, EvictVramOp) for op, _ in post_ops
-                )
-                for op, is_exact in post_ops:
-                    if is_exact:
-                        post_calls.append(_emit_op(op))
-                    else:
-                        post_calls.append(_op_to_call(op))
+                h2d_start_ops = h2d_after_launch.get(line.launch_id, [])
+                vram_evict_posts = [
+                    (op, is_exact)
+                    for op, is_exact in post_ops
+                    if isinstance(op, EvictVramOp)
+                ]
+                other_posts = [
+                    (op, is_exact)
+                    for op, is_exact in post_ops
+                    if not isinstance(op, EvictVramOp)
+                ]
+                has_vram_evict = bool(vram_evict_posts)
+
+                # If a schedule starts H2D at the same launch as the eviction
+                # that makes it necessary, queue the eviction first. The runtime
+                # can then cancel a not-yet-ready eviction rather than allowing a
+                # prefetch no-op to be followed by a later storage free.
+                for op, is_exact in vram_evict_posts:
+                    post_calls.append(_emit_op(op) if is_exact else _op_to_call(op))
+                for op in h2d_start_ops:
+                    post_calls.append(_emit_op(op))
+                for op, is_exact in other_posts:
+                    post_calls.append(_emit_op(op) if is_exact else _op_to_call(op))
                 if has_vram_evict:
                     post_calls.append("_ws_rt.flush_ready_vram_evictions()")
 
