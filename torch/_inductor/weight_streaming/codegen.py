@@ -305,6 +305,75 @@ def _vram_wait_to_call(
     return f"_ws_rt.h2d_wait({var})"
 
 
+def _py_tuple(items: list[str], quote: bool = False) -> str:
+    """Build a Python tuple-literal string from a list of items.
+
+    If quote=True, items are wrapped in repr() (for string names).
+    Otherwise items are passed through verbatim (for variable references).
+    Single-item tuples get a trailing comma.
+    """
+    if quote:
+        rendered = [repr(x) for x in items]
+    else:
+        rendered = list(items)
+    body = ", ".join(rendered)
+    if len(rendered) == 1:
+        body = body + ","
+    return f"({body})"
+
+
+def build_ws_ops_call(
+    *,
+    waits: list[str] = (),
+    sync_h2d: list[str] = (),
+    ssd: list[str] = (),
+    cold_start: list[str] = (),
+    cold_start_tensors: list[str] = (),
+    cross_graph_evict: bool = False,
+    evict_vram: list[str] = (),
+    evict_vram_names: list[str] = (),
+    async_h2d: list[str] = (),
+    evict_dram: list[str] = (),
+    flush: bool = False,
+) -> str | None:
+    """Build one `_ws_rt.ws_ops(...)` call string for all ops at a boundary.
+
+    Returns None if every category is empty and flush=False. Tuples are used
+    (not lists) because they're cheaper to construct at call sites.
+
+    Tensor-reference kwargs (waits, sync_h2d, cold_start_tensors, evict_vram,
+    async_h2d) contain variable names that the runtime receives as
+    torch.Tensor objects. Name kwargs (ssd, cold_start, evict_vram_names,
+    evict_dram) contain strings.
+    """
+    parts: list[str] = []
+    if waits:
+        parts.append(f"waits={_py_tuple(waits)}")
+    if sync_h2d:
+        parts.append(f"sync_h2d={_py_tuple(sync_h2d)}")
+    if ssd:
+        parts.append(f"ssd={_py_tuple(ssd, quote=True)}")
+    if cold_start:
+        parts.append(f"cold_start={_py_tuple(cold_start, quote=True)}")
+    if cold_start_tensors:
+        parts.append(f"cold_start_tensors={_py_tuple(cold_start_tensors)}")
+    if cross_graph_evict:
+        parts.append("cross_graph_evict=True")
+    if evict_vram:
+        parts.append(f"evict_vram={_py_tuple(evict_vram)}")
+    if evict_vram_names:
+        parts.append(f"evict_vram_names={_py_tuple(evict_vram_names, quote=True)}")
+    if async_h2d:
+        parts.append(f"async_h2d={_py_tuple(async_h2d)}")
+    if evict_dram:
+        parts.append(f"evict_dram={_py_tuple(evict_dram, quote=True)}")
+    if flush:
+        parts.append("flush=True")
+    if not parts:
+        return None
+    return f"_ws_rt.ws_ops({', '.join(parts)})"
+
+
 @dataclasses.dataclass
 class WeightStreamingLine(WrapperLine):
     """WrapperLine that emits weight streaming IO calls in generated code."""

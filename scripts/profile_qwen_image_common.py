@@ -6,6 +6,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import torch
@@ -733,11 +734,20 @@ def main(
         sdxl_common.synchronize_device(device)
         del warmup_output
 
+    # Calibration pass: one unprofiled run matching the profiled section.
+    sdxl_common.synchronize_device(device)
+    _unprof_t0 = time.perf_counter_ns()
+    _unprof_out = run_pipeline(pipe, args, generator)
+    sdxl_common.synchronize_device(device)
+    unprofiled_wall_ns = time.perf_counter_ns() - _unprof_t0
+    del _unprof_out
+
     scope_args = metadata_for_scope(args)
     execution_trace_observer = None
     if output_paths.execution_trace_path is not None:
         execution_trace_observer = torch.profiler.ExecutionTraceObserver()
         execution_trace_observer.register_callback(str(output_paths.execution_trace_path))
+    profiled_wall_ns = 0
     with torch.profiler.profile(
         activities=sdxl_common.profile_activities(device),
         record_shapes=args.record_shapes,
@@ -745,11 +755,13 @@ def main(
         with_stack=args.with_stack,
         execution_trace_observer=execution_trace_observer,
     ) as prof:
+        _prof_t0 = time.perf_counter_ns()
         with torch.autograd.profiler.record_function(
             RUN_RECORD_FUNCTION_NAME, scope_args
         ):
             output = run_pipeline(pipe, args, generator)
         sdxl_common.profiler_synchronize_device(device)
+        profiled_wall_ns = time.perf_counter_ns() - _prof_t0
 
     if capture_handle is not None:
         capture_handle.remove()
@@ -834,6 +846,7 @@ def main(
             output_paths.runtime_io_dot_path,
             output_paths.runtime_io_dot_path.stem,
         )
+    calibrated_bundle_dir: Path | None = None
     if output_paths.llamasim_output_dir is not None:
         if output_paths.execution_trace_path is None:
             raise RuntimeError(
@@ -844,6 +857,12 @@ def main(
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
+        )
+        calibrated_bundle_dir = sdxl_common.write_calibrated_bundle(
+            bundle_dir=output_paths.llamasim_output_dir,
+            trace_json_path=output_paths.trace_path,
+            unprofiled_wall_ns=unprofiled_wall_ns,
+            profiled_wall_ns=profiled_wall_ns,
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
@@ -878,6 +897,23 @@ def main(
     if output_paths.llamasim_output_dir is not None:
         print("llamasim_output_dir:", output_paths.llamasim_output_dir)
         sdxl_common.print_llamasim_runtime_summary(output_paths.llamasim_output_dir)
+    if calibrated_bundle_dir is not None:
+        calib_json_path = calibrated_bundle_dir / "calibration.json"
+        try:
+            with calib_json_path.open() as _f:
+                _calib = json.load(_f)
+        except (OSError, json.JSONDecodeError):
+            _calib = {}
+        print("calibrated_bundle_dir:", calibrated_bundle_dir)
+        print(
+            "calibration:",
+            "unprofiled_wall_ms=%.3f" % (unprofiled_wall_ns / 1e6),
+            "profiled_wall_ms=%.3f" % (profiled_wall_ns / 1e6),
+            "n_cpu_events=%d" % int(_calib.get("n_cpu_events", 0)),
+            "profiler_overhead_per_event_ns=%d" % int(
+                _calib.get("profiler_overhead_per_event_ns", 0)
+            ),
+        )
     print("latent_shape:", tuple(output.images.shape))
     print("metadata_json:", metadata_json)
     if metadata_json:

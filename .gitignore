@@ -7,7 +7,14 @@
 # refactoring this file!
 
 ## PyTorch
+# Ignore everything with "profile" in the name
+*profile*
 
+# Except these extensions
+!*profile*.sh
+!*profile*.py
+!*profile*.c
+.claude*
 .coverage
 coverage.xml
 .dmypy.json

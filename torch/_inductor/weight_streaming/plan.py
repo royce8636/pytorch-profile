@@ -40,13 +40,33 @@ class H2DPrefetchOp:
     after_launch_id feed iter N+1's pre-ops at before_launch_id. For these,
     after_launch_id may equal or exceed before_launch_id; codegen treats them
     as always async.
+
+    graph_input_name, when set, is the authoritative identifier for this
+    tensor: it survives compilation_hash shifts (tid assignment can change
+    across compiles, but the arg name is stable positional).
+
+    compiled_graph_id, when set to a non-negative value, restricts this op
+    to a specific compiled graph (for multi-graph pipelines: UNet, text
+    encoders, VAE, etc.). The wrapper injector filters by
+    ``V.graph.graph_id`` so each wrapper only emits its own ops. -1 =
+    legacy single-graph schedule (applies everywhere).
     """
     tensor_name: str
     before_node: int
     before_launch_id: int = -1
     after_launch_id: int = -1  # early-start anchor from scheduler
     compiled_tensor_id: int = -1  # graph-local, from tensor_map sidecar
+    graph_input_name: str = ""  # stable identifier across compiles
+    compiled_graph_id: int = -1  # -1 = any graph; >= 0 = only this graph
+    compilation_hash: str = ""  # hash of the graph this op belongs to
     cross_iter: bool = False
+    # Scheduler-attested residency: when True, the safety-net treats this
+    # async reload as providing residency at before_launch_id (instead of
+    # re-injecting a sync H2D). Only set by schedulers that have proven the
+    # FIFO-ordering correctness (e.g., ct_milp_oracle's prefix-sum
+    # formulation). Defaults to False → safety-net stays conservative for
+    # schedulers that emit async reloads without proving order vs evicts.
+    trusted_async: bool = False
 
 
 @dataclass
@@ -56,6 +76,9 @@ class EvictVramOp:
     after_node: int
     after_launch_id: int = -1
     compiled_tensor_id: int = -1  # graph-local, from tensor_map sidecar
+    graph_input_name: str = ""  # stable identifier across compiles
+    compiled_graph_id: int = -1  # -1 = any graph; >= 0 = only this graph
+    compilation_hash: str = ""  # hash of the graph this op belongs to
 
 
 @dataclass
@@ -71,6 +94,10 @@ class ColdStartOp:
     tensor_name: str
     attach_before_node: int
     before_launch_id: int = -1
+    compiled_graph_id: int = -1
+    compilation_hash: str = ""
+    compiled_tensor_id: int = -1
+    graph_input_name: str = ""
 
 
 @dataclass
@@ -167,7 +194,11 @@ def load_io_schedule(
                 before_launch_id=op.get("before_launch_id", -1),
                 after_launch_id=op.get("after_launch_id", -1),
                 compiled_tensor_id=op.get("compiled_tensor_id", -1),
+                graph_input_name=op.get("compiled_graph_input_name", ""),
+                compiled_graph_id=op.get("compiled_graph_id", -1),
+                compilation_hash=op.get("compilation_hash", ""),
                 cross_iter=op.get("reason") == "h2d_cross_iter_reload",
+                trusted_async=bool(op.get("trusted_async", False)),
             ))
         elif op_type == "vram_evict_d2h":
             evict_vram_ops.append(EvictVramOp(
@@ -175,6 +206,9 @@ def load_io_schedule(
                 after_node=op["after_node"],
                 after_launch_id=op.get("after_launch_id", -1),
                 compiled_tensor_id=op.get("compiled_tensor_id", -1),
+                graph_input_name=op.get("compiled_graph_input_name", ""),
+                compiled_graph_id=op.get("compiled_graph_id", -1),
+                compilation_hash=op.get("compilation_hash", ""),
             ))
 
     evict_dram_ops: list[EvictDramOp] = []
@@ -191,6 +225,10 @@ def load_io_schedule(
             tensor_name=c["tensor_name"],
             attach_before_node=c.get("attach_before_node", 0),
             before_launch_id=c.get("before_launch_id", -1),
+            compiled_graph_id=c.get("compiled_graph_id", -1),
+            compilation_hash=c.get("compilation_hash", ""),
+            compiled_tensor_id=c.get("compiled_tensor_id", -1),
+            graph_input_name=c.get("compiled_graph_input_name", ""),
         ))
 
     # Load tensor metadata from CSV (preferred) or JSON fallback

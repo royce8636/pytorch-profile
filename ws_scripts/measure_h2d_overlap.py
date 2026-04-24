@@ -54,7 +54,7 @@ def load_gpu_events(trace_path):
 
 def is_annotation(name: str) -> bool:
     return name.startswith("## ") or name.startswith("ws_rt::") or \
-        name.startswith("ws_launch:")
+        name.startswith("ws_launch:") or name.startswith("ws_ops")
 
 
 def merge(intervals):

@@ -394,7 +394,13 @@ def main() -> None:
         "weight_streaming_output_code": inductor_config.weight_streaming_output_code,
         "force_disable_caches": inductor_config.force_disable_caches,
     }
-    inductor_config.force_disable_caches = True
+    # Disabling caches was the historical default, but it forces a fresh
+    # compile that may produce launch-ID/tensor-ID layouts different from the
+    # profile's compile — breaking the schedule's structural assumptions.
+    # Keep caches enabled so the profile's compile is reused when structurally
+    # compatible. Override via --force-recompile if needed.
+    if getattr(args, "force_recompile", False):
+        inductor_config.force_disable_caches = True
     marker_output_dir = args.export_code or str(schedule_path.parent)
     # Diagnostic launch/sync markers add ~5 µs per record_function call under
     # profiler. This script is for production-like inference runs, so keep
@@ -450,6 +456,9 @@ def main() -> None:
     # Reset peak memory counter so we measure steady-state, not compilation peak
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    # Drop any stall stats accumulated during warmup so the final report
+    # reflects only the timed run.
+    rt.drain_h2d_stall_stats()
     print("\nTimed run...")
     synchronize_device(device)
     inference_start = time.perf_counter()
@@ -507,6 +516,15 @@ def main() -> None:
     print(f"decode_seconds: {decode_seconds:.6f}")
     print(f"save_seconds: {save_seconds:.6f}")
     print(f"e2e_seconds: {e2e_seconds:.6f}")
+
+    stall_stats = rt.drain_h2d_stall_stats()
+    if stall_stats.get("enabled"):
+        print(
+            f"unhidden_h2d_ms: {stall_stats['total_stall_ms']:.3f} "
+            f"waits={stall_stats['wait_count']} "
+            f"hits={stall_stats['hit_count']} "
+            f"misses={stall_stats['miss_count']}"
+        )
 
     # ── Cleanup ──
     inductor_config.weight_streaming_plan = ""

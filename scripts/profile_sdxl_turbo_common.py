@@ -10,7 +10,9 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 import sys
+import time
 from typing import Any
 
 import torch
@@ -693,6 +695,27 @@ def maybe_compile(
         mode=args.compile_mode,
         fullgraph=args.fullgraph,
     )
+    if getattr(pipe, "text_encoder", None) is not None:
+        pipe.text_encoder = torch.compile(
+            pipe.text_encoder,
+            backend="inductor",
+            mode=args.compile_mode,
+            fullgraph=False,
+        )
+    if getattr(pipe, "text_encoder_2", None) is not None:
+        pipe.text_encoder_2 = torch.compile(
+            pipe.text_encoder_2,
+            backend="inductor",
+            mode=args.compile_mode,
+            fullgraph=False,
+        )
+    if getattr(pipe, "vae", None) is not None:
+        pipe.vae.decode = torch.compile(
+            pipe.vae.decode,
+            backend="inductor",
+            mode=args.compile_mode,
+            fullgraph=False,
+        )
 
 
 def snapshot_example_value(value: Any) -> Any:
@@ -4912,6 +4935,148 @@ def validate_device(args: argparse.Namespace) -> torch.device:
     return device
 
 
+def time_unprofiled_inference(pipe, args, device: torch.device) -> int:
+    """Run one inference pass WITHOUT the profiler and return wall-clock ns.
+
+    Mirrors exactly what the profiled path does (run_pipeline + decode +
+    sync). Used as ground truth for the "profiler_overhead_per_event_ns"
+    calibration: subtracting this from the profiled wall clock, divided
+    by the cpu-event count, gives the per-event hook cost.
+    """
+    synchronize_device(device)
+    t0 = time.perf_counter_ns()
+    output = run_pipeline(pipe, args)
+    with torch.no_grad():
+        _images = decode_latents_to_pil(pipe, output.images)
+    synchronize_device(device)
+    wall_ns = time.perf_counter_ns() - t0
+    del output, _images
+    return wall_ns
+
+
+def _count_cpu_events_from_chrome_trace(trace_path: Path) -> int:
+    """Count Kineto CPU op events in a chrome-trace JSON.
+
+    Only counts events with ``cat == 'cpu_op'`` — these are the ones
+    that fired a ``record_function`` hook. Skips GPU kernel events,
+    profiler step markers, memory events, user-annotation wrappers.
+    """
+    try:
+        with trace_path.open() as f:
+            doc = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    events = doc.get("traceEvents", [])
+    return sum(
+        1 for e in events
+        if e.get("ph") == "X" and e.get("cat") == "cpu_op"
+    )
+
+
+def write_calibration_json(
+    *,
+    dir_path: Path,
+    unprofiled_wall_ns: int,
+    profiled_wall_ns: int,
+    n_cpu_events: int,
+    per_event_ns: int,
+    applied: bool,
+) -> None:
+    data = {
+        "unprofiled_wall_ns": int(unprofiled_wall_ns),
+        "profiled_wall_ns": int(profiled_wall_ns),
+        "profiled_minus_unprofiled_ns": int(profiled_wall_ns - unprofiled_wall_ns),
+        "n_cpu_events": int(n_cpu_events),
+        "profiler_overhead_per_event_ns": int(per_event_ns),
+        "applied_to_bundle_csv": bool(applied),
+    }
+    with (dir_path / "calibration.json").open("w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _rewrite_timing_csv_with_calibration(
+    src_csv: Path, dst_csv: Path, per_event_ns: int,
+) -> None:
+    """Copy ``ggml_profile_node_records.csv`` subtracting per-event profiler
+    overhead from every CPU-device node's ``node_compute_time_ns``.
+
+    GPU kernel rows are untouched (CUPTI timings are not profiler-inflated).
+    Clamps to 0 to avoid negative durations on ops shorter than the average
+    hook cost.
+    """
+    with src_csv.open() as fin, dst_csv.open("w", newline="") as fout:
+        reader = csv.DictReader(fin)
+        fieldnames = reader.fieldnames
+        writer = csv.DictWriter(fout, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in reader:
+            if (
+                row.get("device_type") == "CPU"
+                or row.get("resource_kind") == "cpu_thread"
+            ):
+                try:
+                    orig = int(row.get("node_compute_time_ns", 0) or 0)
+                except ValueError:
+                    orig = 0
+                row["node_compute_time_ns"] = max(0, orig - per_event_ns)
+            writer.writerow(row)
+
+
+def write_calibrated_bundle(
+    *,
+    bundle_dir: Path,
+    trace_json_path: Path,
+    unprofiled_wall_ns: int,
+    profiled_wall_ns: int,
+) -> Path | None:
+    """Compute profiler overhead per event and write a ``<name>_calibrated``
+    sibling bundle with CPU-node durations reduced by that amount.
+
+    Both the original ``bundle_dir`` and the calibrated sibling receive a
+    ``calibration.json`` with the measured numbers (``applied_to_bundle_csv``
+    True only for the calibrated dir). Returns the calibrated dir path, or
+    ``None`` if the bundle or trace could not be read.
+    """
+    if not bundle_dir.is_dir():
+        return None
+    n_cpu = _count_cpu_events_from_chrome_trace(trace_json_path)
+    wall_diff = max(0, int(profiled_wall_ns) - int(unprofiled_wall_ns))
+    per_event_ns = wall_diff // max(n_cpu, 1) if n_cpu > 0 else 0
+
+    calibrated_dir = bundle_dir.parent / f"{bundle_dir.name}_calibrated"
+    if calibrated_dir.exists():
+        shutil.rmtree(calibrated_dir)
+    calibrated_dir.mkdir(parents=True, exist_ok=True)
+
+    for entry in sorted(bundle_dir.iterdir()):
+        target = calibrated_dir / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target)
+            continue
+        if entry.name == "ggml_profile_node_records.csv":
+            _rewrite_timing_csv_with_calibration(entry, target, per_event_ns)
+        else:
+            shutil.copy2(entry, target)
+
+    write_calibration_json(
+        dir_path=bundle_dir,
+        unprofiled_wall_ns=unprofiled_wall_ns,
+        profiled_wall_ns=profiled_wall_ns,
+        n_cpu_events=n_cpu,
+        per_event_ns=per_event_ns,
+        applied=False,
+    )
+    write_calibration_json(
+        dir_path=calibrated_dir,
+        unprofiled_wall_ns=unprofiled_wall_ns,
+        profiled_wall_ns=profiled_wall_ns,
+        n_cpu_events=n_cpu,
+        per_event_ns=per_event_ns,
+        applied=True,
+    )
+    return calibrated_dir
+
+
 def main(
     *,
     default_device: str,
@@ -4963,14 +5128,22 @@ def main(
 
     for _ in range(warmup_runs):
         warmup_output = run_pipeline(pipe, args)
+        with torch.no_grad():
+            _ = decode_latents_to_pil(pipe, warmup_output.images)
         synchronize_device(device)
         del warmup_output
+
+    # Calibration pass: one unprofiled run with identical work to the
+    # upcoming profiled section. Wall-clock difference between this and
+    # the profiled run below gives profiler_overhead_per_event_ns.
+    unprofiled_wall_ns = time_unprofiled_inference(pipe, args, device)
 
     scope_args = metadata_for_scope(args)
     execution_trace_observer = None
     if output_paths.execution_trace_path is not None:
         execution_trace_observer = torch.profiler.ExecutionTraceObserver()
         execution_trace_observer.register_callback(str(output_paths.execution_trace_path))
+    profiled_wall_ns = 0
     with torch.profiler.profile(
         activities=profile_activities(device),
         record_shapes=args.record_shapes,
@@ -4978,9 +5151,13 @@ def main(
         with_stack=args.with_stack,
         execution_trace_observer=execution_trace_observer,
     ) as prof:
+        _profiled_t0 = time.perf_counter_ns()
         with torch.autograd.profiler.record_function("sdxl_turbo_run", scope_args):
             output = run_pipeline(pipe, args)
+            with torch.no_grad():
+                images = decode_latents_to_pil(pipe, output.images)
         profiler_synchronize_device(device)
+        profiled_wall_ns = time.perf_counter_ns() - _profiled_t0
 
     if capture_handle is not None:
         capture_handle.remove()
@@ -4997,8 +5174,6 @@ def main(
     if hasattr(prof, "export_csv"):
         prof.export_csv(str(output_paths.csv_path))
 
-    with torch.no_grad():
-        images = decode_latents_to_pil(pipe, output.images)
     images[0].save(output_paths.image_path)
 
     if output_paths.fx_dot_path is not None:
@@ -5047,6 +5222,7 @@ def main(
             output_paths.runtime_io_dot_path,
             output_paths.runtime_io_dot_path.stem,
         )
+    calibrated_bundle_dir: Path | None = None
     if output_paths.llamasim_output_dir is not None:
         if output_paths.execution_trace_path is None:
             raise RuntimeError(
@@ -5058,8 +5234,21 @@ def main(
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
         )
+        # Produce a sibling <name>_calibrated bundle with CPU-node
+        # compute_time_ns reduced by the measured profiler hook overhead
+        # per event. Original bundle is left untouched.
+        calibrated_bundle_dir = write_calibrated_bundle(
+            bundle_dir=output_paths.llamasim_output_dir,
+            trace_json_path=output_paths.trace_path,
+            unprofiled_wall_ns=unprofiled_wall_ns,
+            profiled_wall_ns=profiled_wall_ns,
+        )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
+    if args.fusion != "none":
+        from torch._dynamo.utils import counters as _dynamo_counters
+        unique_graphs = _dynamo_counters.get("stats", {}).get("unique_graphs", 0)
+        print(f"inductor_unique_graphs: {unique_graphs}")
     print("device:", device)
     print("dtype:", args.dtype)
     print("fusion:", args.fusion)
@@ -5091,6 +5280,23 @@ def main(
     if output_paths.llamasim_output_dir is not None:
         print("llamasim_output_dir:", output_paths.llamasim_output_dir)
         print_llamasim_runtime_summary(output_paths.llamasim_output_dir)
+    if calibrated_bundle_dir is not None:
+        calib_json_path = calibrated_bundle_dir / "calibration.json"
+        try:
+            with calib_json_path.open() as _f:
+                _calib = json.load(_f)
+        except (OSError, json.JSONDecodeError):
+            _calib = {}
+        print("calibrated_bundle_dir:", calibrated_bundle_dir)
+        print(
+            "calibration:",
+            "unprofiled_wall_ms=%.3f" % (unprofiled_wall_ns / 1e6),
+            "profiled_wall_ms=%.3f" % (profiled_wall_ns / 1e6),
+            "n_cpu_events=%d" % int(_calib.get("n_cpu_events", 0)),
+            "profiler_overhead_per_event_ns=%d" % int(
+                _calib.get("profiler_overhead_per_event_ns", 0)
+            ),
+        )
     print("latent_shape:", tuple(output.images.shape))
     print("metadata_json:", metadata_json)
     if metadata_json:

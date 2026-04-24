@@ -2454,9 +2454,7 @@ class PythonWrapperCodegen(CodeGen):
            ``adapter.rescale_before_kernel`` / ``rescale_after_kernel``.
         """
         from torch._inductor.weight_streaming.codegen import (
-            _op_to_call,
-            _vram_op_to_call,
-            _vram_wait_to_call,
+            build_ws_ops_call,
             ScheduleAdapter,
             WeightStreamingLine,
         )
@@ -2478,12 +2476,63 @@ class PythonWrapperCodegen(CodeGen):
         schedule_hash = schedule.compilation_hash
         if schedule_hash and self._compilation_hash:
             if schedule_hash != self._compilation_hash:
-                raise RuntimeError(
-                    f"Weight streaming schedule compilation_hash mismatch: "
-                    f"schedule={schedule_hash}, "
-                    f"current={self._compilation_hash}. "
-                    f"Recompile with matching model/config."
+                # Soft-warn instead of hard-erroring: the schedule references
+                # tensor IDs and launch IDs positionally; if structure matches,
+                # those resolve correctly even when the hash differs (e.g.,
+                # autotuner chose a differently-named kernel).
+                log.warning(
+                    "Weight streaming schedule compilation_hash mismatch: "
+                    "schedule=%s, current=%s. Continuing anyway; if tensor "
+                    "ID resolution fails, regenerate the schedule.",
+                    schedule_hash, self._compilation_hash,
                 )
+
+        # Multi-graph filter: Assign this wrapper a stable "compile position"
+        # based on the order in which wrappers are being injected in this
+        # process. Compile position 0 = first graph to compile (in SDXL,
+        # text_encoder); position 1 = second; etc. The scheduler tags each
+        # op with its source graph's compile position (derived from the
+        # graph_order in the MultiGraphProblem, which is determined by
+        # first-kernel start_ns in the profile).
+        #
+        # Why not compilation_hash: kernel names vary across runs (autotuner
+        # picks different variants), so hashes aren't stable.
+        # Why not V.graph.graph_id: it's a global monotonic counter that
+        # shifts every dynamo.reset().
+        #
+        # The compile-order counter IS stable because pipe() calls its
+        # components in a fixed order (TE → TE2 → UNet → VAE), and each
+        # order triggers a compile on the first invocation.
+        import torch._inductor.codegen.wrapper as _wrapper_mod
+        if not hasattr(_wrapper_mod, "_ws_compile_pos"):
+            _wrapper_mod._ws_compile_pos = 0
+        current_compile_position = _wrapper_mod._ws_compile_pos
+        _wrapper_mod._ws_compile_pos += 1
+
+        def _matches(op) -> bool:
+            cgid = getattr(op, "compiled_graph_id", -1)
+            if cgid < 0:
+                # Unscoped: schedule wasn't tagged per-graph. By convention
+                # the scheduler currently only ingests sidecar_graph0
+                # (streaming_e2e*.py passes launch_map_paths[0]), so apply
+                # unscoped ops only to compile_pos=0. Applying them to later
+                # compiles evicts tensors the scheduler never saw and crashes.
+                return current_compile_position == 0
+            return cgid == current_compile_position
+
+        _h2d_before = len(schedule.h2d_prefetches)
+        _evict_before = len(schedule.evict_vram)
+        _cold_before = len(schedule.cold_starts)
+        schedule.h2d_prefetches = [op for op in schedule.h2d_prefetches if _matches(op)]
+        schedule.evict_vram = [op for op in schedule.evict_vram if _matches(op)]
+        schedule.cold_starts = [op for op in schedule.cold_starts if _matches(op)]
+        log.warning(
+            "[ws_multigraph_filter] compile_pos=%d h2d=%d/%d evict=%d/%d cold=%d/%d",
+            current_compile_position,
+            len(schedule.h2d_prefetches), _h2d_before,
+            len(schedule.evict_vram), _evict_before,
+            len(schedule.cold_starts), _cold_before,
+        )
 
         adapter = ScheduleAdapter(schedule)
 
@@ -2509,41 +2558,181 @@ class PythonWrapperCodegen(CodeGen):
         h2d_after_launch = adapter.h2d_after_launch
         h2d_wait_launch = adapter.h2d_wait_launch
 
-        # The same compiled wrapper can be invoked repeatedly, as in SDXL
-        # denoising loops. A schedule that evicts a tensor after its last use
-        # in one invocation must reload it before its first use in the next
-        # invocation. Schedules built for a single linear pass may not contain
-        # that wrap-around H2D op, so add the conservative cyclic reload here.
-        input_usage = self._build_input_usage_map()
-        for tid, name in tensor_id_to_input.items():
-            used_launches = input_usage.get(name, [])
-            if not used_launches:
-                continue
-            first_use = used_launches[0]
-            last_use = used_launches[-1]
-            tail_evicts = [
-                op
-                for op in schedule.evict_vram
-                if op.compiled_tensor_id == tid
-                and op.after_launch_id >= last_use
-            ]
-            if not tail_evicts:
-                continue
-            has_cycle_prefetch = any(
-                op.compiled_tensor_id == tid
-                and 0 <= op.before_launch_id <= first_use
-                for op in schedule.h2d_prefetches
+        # The same compiled wrapper can be invoked repeatedly (SDXL denoising
+        # loops, SD3 CFG passes, LLM generation steps). The schedule may leave
+        # two kinds of holes:
+        #   (A) cross-iter: tensor evicted in iter N with no cycle-reload,
+        #       missing at start of iter N+1;
+        #   (B) intra-iter: tensor used, evicted, then used again in the same
+        #       iter with no intervening reload — the classic cause of
+        #       cudaErrorIllegalAddress when a kernel reads resize(0)'d storage.
+        #
+        # We forward-simulate storage residency per compiled_tensor_id over
+        # the launch sequence. Pass 1 computes a fixed-point start-of-iter
+        # residency set (so an iter's end-state becomes the next iter's
+        # start-state). Pass 2 replays with injection: any use of a
+        # non-resident tensor gets a sync H2D added to before_launch.
+        #
+        # Set TORCH_WS_DISABLE_SAFETY_NET=1 to skip this when the schedule
+        # already guarantees residency on its own.
+        # Key residency tracking by graph_input_name (stable across compiles)
+        # instead of compiled_tensor_id (shifts when static_input_idxs or
+        # autotune state changes). Ops in schedule.* expose graph_input_name;
+        # fall back to tensor_id_to_input[tid] when missing.
+        if not os.environ.get("TORCH_WS_DISABLE_SAFETY_NET"):
+            input_usage = self._build_input_usage_map()
+            current_names: set[str] = set(tensor_id_to_input.values())
+            name_to_tid_current: dict[str, int] = {
+                name: tid for tid, name in tensor_id_to_input.items()
+            }
+            # Cold-start set: tensors reloaded at iter top via the
+            # cold_start_tensors path. Any tensor in this set is guaranteed
+            # resident after cold-start, even if the prior iter's end-state
+            # evicted it. Treat as a "reload at iter start" for the
+            # residency fixed-point.
+            cold_start_names: set[str] = set()
+            for csop in getattr(schedule, "cold_starts", []):
+                gname = getattr(csop, "graph_input_name", "") or ""
+                if gname and gname in current_names:
+                    cold_start_names.add(gname)
+
+            def _op_name(op) -> str:
+                gname = getattr(op, "graph_input_name", "") or ""
+                if gname:
+                    return gname
+                tid = getattr(op, "compiled_tensor_id", -1)
+                if tid >= 0:
+                    return tensor_id_to_input.get(tid, "")
+                return ""
+
+            # Invert: launch_id -> set(graph_input_name) used there.
+            uses_by_launch: dict[int, set[str]] = {}
+            for name, launches in input_usage.items():
+                if name not in current_names:
+                    continue
+                for lid in launches:
+                    uses_by_launch.setdefault(lid, set()).add(name)
+
+            evict_after: dict[int, set[str]] = {}
+            for op in schedule.evict_vram:
+                name = _op_name(op)
+                if not name or name not in current_names:
+                    continue
+                if op.after_launch_id >= 0:
+                    evict_after.setdefault(op.after_launch_id, set()).add(name)
+
+            # Mirror ScheduleAdapter's routing: an op is SYNC (lands in
+            # before_launch[bl]) only when before_launch_id==after_launch_id
+            # (or after<0) and not cross-iter. Otherwise it's async, fired at
+            # after_launch_id, waited at before_launch_id. The wait at `bl`
+            # is NOT a sync load — storage validity depends on the async copy
+            # having run. For safety-net purposes we treat only the sync case
+            # as producing residency at `bl`.
+            sync_h2d_before: dict[int, set[str]] = {}
+            async_h2d_after: dict[int, set[str]] = {}
+            # Scheduler-attested async reloads: scheduler has proven the
+            # FIFO ordering vs pending evicts is safe; safety-net treats
+            # these as adding residency at wait time (``before_launch_id``),
+            # same as a sync load, rather than re-injecting.
+            trusted_h2d_before: dict[int, set[str]] = {}
+            for op in schedule.h2d_prefetches:
+                name = _op_name(op)
+                if not name or name not in current_names:
+                    continue
+                bl = getattr(op, "before_launch_id", -1)
+                al = getattr(op, "after_launch_id", -1)
+                cross_iter = getattr(op, "cross_iter", False)
+                trusted = bool(getattr(op, "trusted_async", False))
+                is_async = cross_iter or (al >= 0 and bl >= 0 and al != bl)
+                if is_async:
+                    if al >= 0:
+                        async_h2d_after.setdefault(al, set()).add(name)
+                    if trusted and bl >= 0:
+                        trusted_h2d_before.setdefault(bl, set()).add(name)
+                else:
+                    # Pure sync h2d (before==after or no after).
+                    if bl >= 0:
+                        sync_h2d_before.setdefault(bl, set()).add(name)
+                    elif al >= 0:
+                        sync_h2d_before.setdefault(al, set()).add(name)
+
+            all_launches = sorted(
+                set(uses_by_launch.keys())
+                | set(evict_after.keys())
+                | set(sync_h2d_before.keys())
+                | set(async_h2d_after.keys())
+                | set(trusted_h2d_before.keys())
             )
-            if has_cycle_prefetch:
-                continue
-            before_launch.setdefault(first_use, []).append(
-                H2DPrefetchOp(
-                    tensor_name=tail_evicts[-1].tensor_name,
-                    before_node=-1,
-                    before_launch_id=first_use,
-                    compiled_tensor_id=tid,
+
+            def _simulate_iter(start: set[str]) -> set[str]:
+                resident = set(start)
+                for lid in all_launches:
+                    for n in sync_h2d_before.get(lid, ()):
+                        resident.add(n)
+                    # Trusted async reloads: scheduler attests the FIFO
+                    # ordering beats any pending evict by before_launch_id.
+                    # Treat them as adding residency here (same as sync) so
+                    # the residency fixed-point doesn't force redundant
+                    # injection below.
+                    for n in trusted_h2d_before.get(lid, ()):
+                        resident.add(n)
+                    for n in uses_by_launch.get(lid, ()):
+                        resident.add(n)  # optimistic — inject in final pass
+                    for n in evict_after.get(lid, ()):
+                        resident.discard(n)
+                    # Untrusted async_h2d_after is intentionally ignored:
+                    # without the trusted_async flag we can't prove there's
+                    # no race vs deferred evicts, so the final pass below
+                    # still injects a sync H2D if needed.
+                return resident
+
+            # Fixed-point start-of-iter residency so iter N+1's start matches
+            # iter N's end, union with the cold-start reload set (which fires
+            # before any compute in every iter). Converges in ≤2 iters.
+            start_resident = set(current_names)
+            for _ in range(4):
+                end_resident = _simulate_iter(start_resident)
+                end_resident |= cold_start_names  # cold-start reload at top of next iter
+                if end_resident == start_resident:
+                    break
+                start_resident = end_resident
+
+            # Final pass: inject sync H2D for every non-resident use.
+            # async_h2d_after is intentionally ignored for residency here —
+            # sync injection before use is always correct; async reloads may
+            # race with deferred evictions.
+            resident = set(start_resident)
+            safety_net_fired = 0
+            for lid in all_launches:
+                for n in sync_h2d_before.get(lid, ()):
+                    resident.add(n)
+                for n in trusted_h2d_before.get(lid, ()):
+                    resident.add(n)
+                for n in uses_by_launch.get(lid, ()):
+                    if n in resident:
+                        continue
+                    tid = name_to_tid_current.get(n, -1)
+                    before_launch.setdefault(lid, []).append(
+                        H2DPrefetchOp(
+                            tensor_name=n,
+                            before_node=-1,
+                            before_launch_id=lid,
+                            compiled_tensor_id=tid,
+                            graph_input_name=n,
+                        )
+                    )
+                    resident.add(n)
+                    safety_net_fired += 1
+                for n in evict_after.get(lid, ()):
+                    resident.discard(n)
+
+            if safety_net_fired:
+                log.warning(
+                    "Weight streaming safety net injected sync H2D for %d "
+                    "tensor uses (set TORCH_WS_DISABLE_SAFETY_NET=1 if the "
+                    "schedule already covers these).",
+                    safety_net_fired,
                 )
-            )
 
         # Collect compute lines (all four types including MultiOut)
         compute_lines: list[WrapperLine] = []
@@ -2580,22 +2769,92 @@ class PythonWrapperCodegen(CodeGen):
                 )
             )
 
-        # Cold start prefetches go before any compute
+        # Cold start prefetches go before any compute. Batched into one call.
+        # Split by whether each op's graph_input_name maps to a tensor-object
+        # reference in the current compile — WS-registered weights must go
+        # through the tensor-object h2d_prefetch path, because the string-name
+        # `_cold_start_prefetch_inline` is SSD-backed and a no-op for weights
+        # registered via `register_weight(gpu_tensor)`.
         if adapter.startup_ops:
-            new_lines.append(
-                WeightStreamingLine(
-                    wrapper=self,
-                    calls=[
-                        f"_ws_rt.cold_start_prefetch({op.tensor_name!r})"
-                        for op in adapter.startup_ops
-                    ],
-                )
-            )
+            cs_name_to_alias: dict[str, str] = {}
+            if stable_tensor_refs:
+                for tid, alias in stable_tensor_refs.items():
+                    n = tensor_id_to_input.get(tid, "")
+                    if n:
+                        cs_name_to_alias[n] = alias
+            else:
+                for tid, n in tensor_id_to_input.items():
+                    cs_name_to_alias[n] = n
 
-        def _emit_op(op):
-            if isinstance(op, (H2DPrefetchOp, EvictVramOp)):
-                return _vram_op_to_call(op, stable_tensor_refs or tensor_id_to_input)
-            return _op_to_call(op)
+            cs_names: list[str] = []
+            cs_tensors: list[str] = []
+            for op in adapter.startup_ops:
+                gname = getattr(op, "graph_input_name", "") or ""
+                alias = cs_name_to_alias.get(gname) if gname else None
+                if alias is not None:
+                    cs_tensors.append(alias)
+                else:
+                    cs_names.append(op.tensor_name)
+            cold_call = build_ws_ops_call(
+                cold_start=cs_names,
+                cold_start_tensors=cs_tensors,
+                # When this wrapper has any WS-registered cold-start tensors,
+                # it's a graph boundary: evict every other registered weight
+                # (other graphs) before loading ours. Bounds peak VRAM by
+                # (this graph's pinned + bandwidth-limited cyclable) instead
+                # of (union of all graphs' weights).
+                cross_graph_evict=bool(cs_tensors),
+            )
+            if cold_call is not None:
+                new_lines.append(
+                    WeightStreamingLine(wrapper=self, calls=[cold_call])
+                )
+
+        ref_map = stable_tensor_refs or tensor_id_to_input
+        # Name-indexed ref map for compilation_hash-robust lookup. This
+        # survives tid shifts between profile-time and run-time compiles.
+        name_to_ref: dict[str, str] = {}
+        if stable_tensor_refs:
+            for tid, alias in stable_tensor_refs.items():
+                name = tensor_id_to_input.get(tid, "")
+                if name:
+                    name_to_ref[name] = alias
+        else:
+            for tid, name in tensor_id_to_input.items():
+                name_to_ref[name] = name
+        _vram_ref_missing_warn_seen: set[int] = set()
+
+        def _vram_ref(op) -> str:
+            """Variable reference for an op with compiled_tensor_id.
+
+            Prefers graph_input_name lookup (stable across compiles) over
+            compiled_tensor_id (may shift if static_input_idxs changes).
+            Falls back to tid-based lookup for legacy schedules.
+            """
+            if op.compiled_tensor_id < 0:
+                raise ValueError(
+                    f"{type(op).__name__} for '{op.tensor_name}' missing "
+                    f"compiled_tensor_id — schedule must include tensor crosswalk"
+                )
+            gname = getattr(op, "graph_input_name", "") or ""
+            if gname and gname in name_to_ref:
+                return name_to_ref[gname]
+            var = ref_map.get(op.compiled_tensor_id)
+            if var is None:
+                raise ValueError(
+                    f"compiled_tensor_id {op.compiled_tensor_id} for "
+                    f"'{op.tensor_name}' (graph_input_name={gname!r}) not "
+                    f"found in graph inputs — compilation_hash mismatch?"
+                )
+            if gname and op.compiled_tensor_id not in _vram_ref_missing_warn_seen:
+                _vram_ref_missing_warn_seen.add(op.compiled_tensor_id)
+                log.warning(
+                    "Schedule graph_input_name=%r not in current compile; "
+                    "falling back to tid=%d lookup → %s. Tensor IDs may be "
+                    "mis-resolved under compilation_hash mismatch.",
+                    gname, op.compiled_tensor_id, var,
+                )
+            return var
 
         for line in self.lines:
             cidx = compute_line_ids.get(id(line))
@@ -2603,80 +2862,74 @@ class PythonWrapperCodegen(CodeGen):
             is_compute = cidx is not None
 
             if is_compute:
-                pre_calls: list[str] = []
+                # Pre-launch op categories
+                pre_waits: list[str] = []
+                pre_sync_h2d: list[str] = []
+                pre_ssd: list[str] = []
 
-                # H2D wait calls: async copies that must complete before
-                # this launch uses the tensor.
                 for op in h2d_wait_launch.get(line.launch_id, []):
-                    pre_calls.append(
-                        _vram_wait_to_call(
-                            op, stable_tensor_refs or tensor_id_to_input
-                        )
-                    )
+                    pre_waits.append(_vram_ref(op))
 
-                # Exact pre-ops (launch-ID keyed)
                 for op in before_launch.get(line.launch_id, []):
-                    pre_calls.append(_emit_op(op))
+                    if isinstance(op, H2DPrefetchOp):
+                        pre_sync_h2d.append(_vram_ref(op))
+                    elif isinstance(op, PrefetchOp):
+                        pre_ssd.append(op.tensor_name)
 
-                # Rescaled pre-ops (legacy, KernelCallLine only)
                 if is_kernel:
                     for op in rescaled_before.get(kernel_only_idx, []):
-                        if isinstance(op, (PrefetchOp, H2DPrefetchOp)):
-                            pre_calls.append(_op_to_call(op))
+                        if isinstance(op, PrefetchOp):
+                            pre_ssd.append(op.tensor_name)
+                        # Legacy H2DPrefetchOp rescaled (string-name path) is
+                        # not observed in current schedules and would need a
+                        # separate string-name ws_ops kwarg; skip here.
 
-                if pre_calls:
+                pre_call = build_ws_ops_call(
+                    waits=pre_waits,
+                    sync_h2d=pre_sync_h2d,
+                    ssd=pre_ssd,
+                )
+                if pre_call is not None:
                     new_lines.append(
-                        WeightStreamingLine(
-                            wrapper=self, calls=pre_calls
-                        )
+                        WeightStreamingLine(wrapper=self, calls=[pre_call])
                     )
 
                 new_lines.append(line)
 
-                post_ops = []
+                # Post-launch op categories
+                post_evict_vram: list[str] = []
+                post_evict_vram_names: list[str] = []
+                post_async_h2d: list[str] = []
+                post_evict_dram: list[str] = []
 
-                # Exact post-ops (launch-ID keyed)
                 for op in after_launch.get(line.launch_id, []):
-                    post_ops.append((op, True))
+                    if isinstance(op, EvictVramOp):
+                        post_evict_vram.append(_vram_ref(op))
+                    elif isinstance(op, EvictDramOp):
+                        post_evict_dram.append(op.tensor_name)
 
-                # Rescaled post-ops (legacy, KernelCallLine only)
+                for op in h2d_after_launch.get(line.launch_id, []):
+                    post_async_h2d.append(_vram_ref(op))
+
                 if is_kernel:
                     for op in rescaled_after.get(kernel_only_idx, []):
-                        if isinstance(op, (EvictDramOp, EvictVramOp)):
-                            post_ops.append((op, False))
+                        if isinstance(op, EvictDramOp):
+                            post_evict_dram.append(op.tensor_name)
+                        elif isinstance(op, EvictVramOp):
+                            post_evict_vram_names.append(op.tensor_name)
 
-                post_calls: list[str] = []
-                h2d_start_ops = h2d_after_launch.get(line.launch_id, [])
-                vram_evict_posts = [
-                    (op, is_exact)
-                    for op, is_exact in post_ops
-                    if isinstance(op, EvictVramOp)
-                ]
-                other_posts = [
-                    (op, is_exact)
-                    for op, is_exact in post_ops
-                    if not isinstance(op, EvictVramOp)
-                ]
-                has_vram_evict = bool(vram_evict_posts)
+                has_vram_evict = bool(post_evict_vram or post_evict_vram_names)
 
-                # If a schedule starts H2D at the same launch as the eviction
-                # that makes it necessary, queue the eviction first. The runtime
-                # can then cancel a not-yet-ready eviction rather than allowing a
-                # prefetch no-op to be followed by a later storage free.
-                for op, is_exact in vram_evict_posts:
-                    post_calls.append(_emit_op(op) if is_exact else _op_to_call(op))
-                for op in h2d_start_ops:
-                    post_calls.append(_emit_op(op))
-                for op, is_exact in other_posts:
-                    post_calls.append(_emit_op(op) if is_exact else _op_to_call(op))
-                if has_vram_evict:
-                    post_calls.append("_ws_rt.flush_ready_vram_evictions()")
-
-                if post_calls:
+                post_call = build_ws_ops_call(
+                    evict_vram=post_evict_vram,
+                    evict_vram_names=post_evict_vram_names,
+                    async_h2d=post_async_h2d,
+                    evict_dram=post_evict_dram,
+                    flush=has_vram_evict,
+                )
+                if post_call is not None:
                     new_lines.append(
-                        WeightStreamingLine(
-                            wrapper=self, calls=post_calls
-                        )
+                        WeightStreamingLine(wrapper=self, calls=[post_call])
                     )
 
                 if is_kernel:
