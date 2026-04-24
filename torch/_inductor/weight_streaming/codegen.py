@@ -353,6 +353,12 @@ def _py_tuple(items: list[str], quote: bool = False) -> str:
     return f"({body})"
 
 
+def _py_list(items: list[str]) -> str:
+    """Build a Python list-literal. Used by the native-fast-path emission;
+    ``torch.ops.ws_rt.ws_ops`` takes positional Tensor[] args."""
+    return "[" + ", ".join(items) + "]"
+
+
 def build_ws_ops_call(
     *,
     waits: list[str] = (),
@@ -369,13 +375,14 @@ def build_ws_ops_call(
 ) -> str | None:
     """Build one `_ws_rt.ws_ops(...)` call string for all ops at a boundary.
 
-    Returns None if every category is empty and flush=False. Tuples are used
-    (not lists) because they're cheaper to construct at call sites.
+    The runtime facade ``WeightStreamRuntime.ws_ops`` inspects its own
+    kwargs and dispatches to ``torch.ops.ws_rt.ws_ops`` in C++ when the
+    boundary only uses tensor-arg categories (see ``can_native`` in
+    ``runtime.py``). Going through the facade adds one Python frame per
+    call (~10 µs) but avoids the tensor-identity / schedule-timing
+    differences that direct codegen exposed.
 
-    Tensor-reference kwargs (waits, sync_h2d, cold_start_tensors, evict_vram,
-    async_h2d) contain variable names that the runtime receives as
-    torch.Tensor objects. Name kwargs (ssd, cold_start, evict_vram_names,
-    evict_dram) contain strings.
+    Returns None if every category is empty and flush=False.
     """
     parts: list[str] = []
     if waits:

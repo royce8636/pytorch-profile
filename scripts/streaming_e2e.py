@@ -27,6 +27,7 @@ import argparse
 import importlib
 import json
 import shutil
+import os
 import sys
 import time
 from pathlib import Path
@@ -530,6 +531,11 @@ def main():
     print(f"allocated_mb   : {results['allocated_mb']:.1f}")
     print(f"peak_mb        : {results['peak_mb']:.1f}")
     print(f"inference_s    : {results['inference_s']:.4f}")
+    if os.environ.get("TORCH_WS_LOG_DISPATCH"):
+        import torch._inductor.weight_streaming.runtime as _rt
+        cpp = getattr(_rt, "_ws_cpp_hits", 0)
+        py = getattr(_rt, "_ws_py_hits", 0)
+        print(f"ws_dispatch    : cpp={cpp} python={py}")
     WeightStreamRuntime.reset()
 
 

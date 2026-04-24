@@ -12,6 +12,27 @@ from torch.profiler import record_function
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Native (C++) ws_ops integration
+# ---------------------------------------------------------------------------
+#
+# When the C++ ``ws_rt`` library (built from
+# ``torch/csrc/inductor/weight_streaming_ops.cpp``) is present AND the
+# env var ``TORCH_WS_USE_PYTHON`` is not set, the hot-path ``ws_ops``
+# delegates to ``torch.ops.ws_rt.ws_ops``, which maintains its own C++
+# state keyed by ``TensorImpl*``. The Python ``WeightStreamRuntime``
+# continues to hold the reference state (for debugging / parity tests)
+# but is no longer on the critical path.
+
+
+def _ws_native_available() -> bool:
+    """True if the C++ weight-streaming runtime is built and reachable."""
+    if os.environ.get("TORCH_WS_USE_PYTHON") == "1":
+        return False
+    return hasattr(torch.ops, "ws_rt") and hasattr(torch.ops.ws_rt, "ws_ops")
+
+
 _DTYPE_MAP = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
@@ -129,6 +150,11 @@ class WeightStreamRuntime:
         if cls._instance is not None:
             cls._instance._ssd_pool.shutdown(wait=False)
             cls._instance = None
+        # Clear the C++ mirror as well so stale TensorImpl* keys from
+        # a prior iteration don't leak into the next run. The native
+        # side owns pinned CPU backups; failing to reset leaks them.
+        if _ws_native_available():
+            torch.ops.ws_rt.reset()
 
     def register_dram_tensor(self, tensor_name: str, tensor: torch.Tensor) -> None:
         """Register a pre-loaded DRAM tensor (for when tensors are already in CPU memory)."""
@@ -146,6 +172,12 @@ class WeightStreamRuntime:
         self._weight_storage_nbytes[key] = gpu_tensor.untyped_storage().nbytes()
         self._registered_weights[key] = gpu_tensor
         self._pending_vram_evictions.pop(key, None)
+        # Mirror the registration into the C++ weight-streaming runtime
+        # (``torch.ops.ws_rt.register_weight``) so the native ``ws_ops``
+        # path has the pinned CPU backup and storage nbytes ready. The
+        # C++ side maintains its own state keyed by TensorImpl*.
+        if _ws_native_available():
+            torch.ops.ws_rt.register_weight(gpu_tensor)
 
     def evict_cross_graph(self, cold_start_tensors: tuple) -> None:
         """Evict every registered weight not in cold_start_tensors.
@@ -603,6 +635,32 @@ class WeightStreamRuntime:
           evict_vram -> async_h2d -> evict_dram -> flush (post-launch)
         The caller (codegen) supplies only the kwargs it needs for this site.
         """
+        # Fast path: delegate the hot tensor-op loops to the C++ ``ws_rt``
+        # library, which holds its own state keyed by TensorImpl*. We
+        # can only delegate when the call site uses ONLY the
+        # tensor-arg categories the native op understands (waits,
+        # sync_h2d, evict_vram, async_h2d, flush). SSD / DRAM / cold-
+        # start name-based ops and the SDXL cross-graph evict helper
+        # stay in Python.
+        can_native = (
+            _ws_native_available()
+            and not ssd and not cold_start and not cold_start_tensors
+            and not evict_vram_names and not evict_dram
+            and not cross_graph_evict
+            and not self._measure_h2d_stall
+        )
+        if can_native:
+            import torch._inductor.weight_streaming.runtime as _self_mod
+            _self_mod._ws_cpp_hits = getattr(_self_mod, "_ws_cpp_hits", 0) + 1
+            with record_function("ws_rt::ws_ops_cpp"):
+                torch.ops.ws_rt.ws_ops(
+                    list(waits), list(sync_h2d), list(evict_vram),
+                    list(async_h2d), bool(flush),
+                )
+            return
+        import torch._inductor.weight_streaming.runtime as _self_mod
+        _self_mod._ws_py_hits = getattr(_self_mod, "_ws_py_hits", 0) + 1
+
         with record_function("ws_rt::ws_ops"):
             for t in waits:
                 self._h2d_wait_tensor(t)

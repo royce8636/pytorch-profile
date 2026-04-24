@@ -742,6 +742,7 @@ libtorch_cuda_core_sources = [
     "torch/csrc/cuda/shim_common.cpp",
     "torch/csrc/inductor/aoti_runner/model_container_runner_cuda.cpp",
     "torch/csrc/inductor/aoti_torch/shim_cuda.cpp",
+    "torch/csrc/inductor/weight_streaming_ops.cpp",
     "torch/csrc/jit/codegen/fuser/cuda/fused_kernel.cpp",
     "torch/csrc/profiler/stubs/cuda.cpp",
     "torch/csrc/autograd/functions/comm.cpp",
