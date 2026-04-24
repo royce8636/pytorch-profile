@@ -444,6 +444,22 @@ def main():
     # (compiled_launch_map, compiled_tensor_map). A cache hit would skip
     # codegen entirely and leave the bundle dir without sidecars.
     iconfig.force_disable_caches = True
+
+    # Phase 1 reconciliation fix: freeze kernel selection so the profile
+    # compile and the post-dynamo.reset run compile produce byte-identical
+    # generated code + sidecars. Without this, autotune / coordinate-
+    # descent tuning picks different kernels across compiles, drifting
+    # `used_by_launch_ids` per tensor — which makes the schedule unsafe
+    # for aggressive evictions (the run compile may reference a tensor
+    # past the schedule's last_use claim → CUDA illegal access).
+    iconfig.max_autotune = False
+    iconfig.coordinate_descent_tuning = False
+    iconfig.freezing = False           # constant folding varies across compiles
+    import torch._dynamo.config as _dcfg
+    _dcfg.automatic_dynamic_shapes = False
+    _dcfg.assume_static_by_default = True
+    torch.manual_seed(0)
+
     configure_llamasim_inductor_markers(bundle_dir, include_diagnostic_markers=True)
 
     # Load + compile ALL major components so the profile captures every

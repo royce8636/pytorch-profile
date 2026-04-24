@@ -2246,8 +2246,14 @@ class PythonWrapperCodegen(CodeGen):
         log.info("Weight streaming generated code written to %s", out_path)
 
     def _compute_compilation_hash(self) -> None:
+        # Hash only the kernel sequence (launch_id + line-class + kernel_name)
+        # so that two compiles of the same graph produce the same hash iff
+        # they generated the same kernel sequence. Previously this hashed
+        # ``V.graph.graph_id`` too — a global monotonic counter that bumps
+        # every compile — which made the hash drift every ``dynamo.reset``
+        # even when the generated code was byte-identical, turning the
+        # schedule-vs-runtime mismatch warning into pure noise.
         h = hashlib.sha256()
-        h.update(f"graph_id:{V.graph.graph_id}".encode())
         for line in self.lines:
             if not isinstance(line, _COMPUTE_LINE_TYPES):
                 continue
@@ -2472,14 +2478,36 @@ class PythonWrapperCodegen(CodeGen):
             tensor_csv=config.weight_streaming_tensor_csv,
         )
 
-        # Validate compilation hash if present in schedule
-        schedule_hash = schedule.compilation_hash
+        # Validate compilation hash — per-graph lookup rather than using the
+        # schedule's top-level ``compilation_hash`` (which is just graph 0's
+        # hash and therefore can't be directly compared against graphs 1+).
+        # Each per-graph schedule op already carries its own
+        # ``compilation_hash``; we pick any op tagged for THIS compile
+        # position and compare its hash with the current wrapper's hash.
+        schedule_hash = ""
+        import torch._inductor.codegen.wrapper as _wrapper_mod
+        _pos_peek = getattr(_wrapper_mod, "_ws_compile_pos", 0)
+        for _op_list in (
+            schedule.h2d_prefetches, schedule.evict_vram, schedule.cold_starts,
+        ):
+            for _op in _op_list:
+                if getattr(_op, "compilation_hash", "") and int(
+                    getattr(_op, "compiled_graph_id", -1)
+                ) == _pos_peek:
+                    schedule_hash = _op.compilation_hash
+                    break
+            if schedule_hash:
+                break
+        if not schedule_hash:
+            # Legacy single-graph schedule: fall back to top-level hash.
+            schedule_hash = schedule.compilation_hash
         if schedule_hash and self._compilation_hash:
             if schedule_hash != self._compilation_hash:
-                # Soft-warn instead of hard-erroring: the schedule references
-                # tensor IDs and launch IDs positionally; if structure matches,
-                # those resolve correctly even when the hash differs (e.g.,
-                # autotuner chose a differently-named kernel).
+                # Soft-warn: the schedule references tensor IDs and launch
+                # IDs positionally; if structure matches, those resolve
+                # correctly even when the hash differs. This usually
+                # indicates autotune variance in the run compile that
+                # didn't affect launch ordering.
                 log.warning(
                     "Weight streaming schedule compilation_hash mismatch: "
                     "schedule=%s, current=%s. Continuing anyway; if tensor "
@@ -2509,7 +2537,7 @@ class PythonWrapperCodegen(CodeGen):
         current_compile_position = _wrapper_mod._ws_compile_pos
         _wrapper_mod._ws_compile_pos += 1
 
-        def _matches(op) -> bool:
+        def _matches_consumer(op) -> bool:
             cgid = getattr(op, "compiled_graph_id", -1)
             if cgid < 0:
                 # Unscoped: schedule wasn't tagged per-graph. By convention
@@ -2520,12 +2548,27 @@ class PythonWrapperCodegen(CodeGen):
                 return current_compile_position == 0
             return cgid == current_compile_position
 
+        def _matches_h2d(op) -> bool:
+            """Keep the op if this wrapper is either the H2D consumer OR
+            the (optional, cross-graph) H2D issuer. The ``ScheduleAdapter``
+            splits the op into ``h2d_after_launch`` (issuer) vs.
+            ``h2d_wait_launch`` / ``before_launch`` (consumer) using
+            ``current_compile_position``."""
+            cgid = getattr(op, "compiled_graph_id", -1)
+            issue_gid = getattr(op, "issue_compiled_graph_id", -1)
+            if issue_gid < 0:
+                issue_gid = cgid
+            if cgid < 0:
+                return current_compile_position == 0
+            return (cgid == current_compile_position
+                    or issue_gid == current_compile_position)
+
         _h2d_before = len(schedule.h2d_prefetches)
         _evict_before = len(schedule.evict_vram)
         _cold_before = len(schedule.cold_starts)
-        schedule.h2d_prefetches = [op for op in schedule.h2d_prefetches if _matches(op)]
-        schedule.evict_vram = [op for op in schedule.evict_vram if _matches(op)]
-        schedule.cold_starts = [op for op in schedule.cold_starts if _matches(op)]
+        schedule.h2d_prefetches = [op for op in schedule.h2d_prefetches if _matches_h2d(op)]
+        schedule.evict_vram = [op for op in schedule.evict_vram if _matches_consumer(op)]
+        schedule.cold_starts = [op for op in schedule.cold_starts if _matches_consumer(op)]
         log.warning(
             "[ws_multigraph_filter] compile_pos=%d h2d=%d/%d evict=%d/%d cold=%d/%d",
             current_compile_position,
@@ -2534,7 +2577,7 @@ class PythonWrapperCodegen(CodeGen):
             len(schedule.cold_starts), _cold_before,
         )
 
-        adapter = ScheduleAdapter(schedule)
+        adapter = ScheduleAdapter(schedule, current_graph_id=current_compile_position)
 
         # Build compiled_tensor_id → graph_input_name (shared with sidecar)
         tensor_id_to_input, _ = self._build_tensor_id_map()

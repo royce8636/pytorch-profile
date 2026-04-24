@@ -67,6 +67,14 @@ class H2DPrefetchOp:
     # formulation). Defaults to False → safety-net stays conservative for
     # schedulers that emit async reloads without proving order vs evicts.
     trusted_async: bool = False
+    # Cross-graph async: the graph in which the async H2D is ISSUED (emit
+    # ``_ws_rt.h2d_prefetch_async`` at ``after_launch_id`` in this graph's
+    # wrapper). ``compiled_graph_id`` remains the CONSUMER graph (emit the
+    # wait at ``before_launch_id`` there). -1 = same-graph (issue_graph ==
+    # compiled_graph_id), backward compatible. Oracle schedules set this
+    # when ``required_start`` from the backward-ALAP pass falls before
+    # the tensor's own graph's earliest launch.
+    issue_compiled_graph_id: int = -1
 
 
 @dataclass
@@ -199,6 +207,7 @@ def load_io_schedule(
                 compilation_hash=op.get("compilation_hash", ""),
                 cross_iter=op.get("reason") == "h2d_cross_iter_reload",
                 trusted_async=bool(op.get("trusted_async", False)),
+                issue_compiled_graph_id=int(op.get("issue_compiled_graph_id", -1)),
             ))
         elif op_type == "vram_evict_d2h":
             evict_vram_ops.append(EvictVramOp(

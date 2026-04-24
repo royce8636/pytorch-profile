@@ -63,8 +63,11 @@ class ScheduleAdapter:
     previous GPU kernel (later eviction = conservative).
     """
 
-    def __init__(self, schedule: IOSchedule) -> None:
+    def __init__(
+        self, schedule: IOSchedule, current_graph_id: int = -1,
+    ) -> None:
         self._schedule = schedule
+        self._current_graph_id = current_graph_id
         self._gpu_trace_indices: list[int] = []
         self._trace_to_wrapper: dict[int, int] = {}
         self._all_indices: set[int] = set()
@@ -182,20 +185,42 @@ class ScheduleAdapter:
         """Ops to execute before any kernel (cold start prefetches)."""
         return self._startup_ops
 
+    def _is_consumer_here(self, op) -> bool:
+        """Current wrapper is the op's CONSUMER graph (emits wait or sync)."""
+        cgid = getattr(op, "compiled_graph_id", -1)
+        if self._current_graph_id < 0 or cgid < 0:
+            return True
+        return cgid == self._current_graph_id
+
+    def _is_issuer_here(self, op) -> bool:
+        """Current wrapper is the op's ISSUE graph (emits async start).
+
+        Falls back to ``compiled_graph_id`` when ``issue_compiled_graph_id``
+        is unset so same-graph async ops (legacy schedules) keep working.
+        """
+        cgid = getattr(op, "compiled_graph_id", -1)
+        issue_gid = getattr(op, "issue_compiled_graph_id", -1)
+        if issue_gid < 0:
+            issue_gid = cgid
+        if self._current_graph_id < 0 or issue_gid < 0:
+            return True
+        return issue_gid == self._current_graph_id
+
     @property
     def before_launch(self) -> dict[int, list[PreKernelOp]]:
         """compiled_launch_id -> ops to execute before that launch.
 
-        Sync H2D prefetches go here (ops without an async start anchor).
-        Cross-iter ops are always async; they're routed through
-        h2d_after_launch / h2d_wait_launch instead.
+        Sync H2D prefetches (no separate async start anchor) are emitted in
+        the CONSUMER graph only. SSD prefetches follow the same rule.
         """
         result: dict[int, list[PreKernelOp]] = defaultdict(list)
         for op in self._schedule.prefetches:
-            if op.before_launch_id >= 0:
+            if op.before_launch_id >= 0 and self._is_consumer_here(op):
                 result[op.before_launch_id].append(op)
         for op in self._schedule.h2d_prefetches:
             if op.cross_iter:
+                continue
+            if not self._is_consumer_here(op):
                 continue
             if (
                 op.before_launch_id >= 0
@@ -206,14 +231,19 @@ class ScheduleAdapter:
 
     @property
     def h2d_after_launch(self) -> dict[int, list[H2DPrefetchOp]]:
-        """compiled_launch_id -> async H2D starts after that launch."""
+        """compiled_launch_id -> async H2D starts after that launch.
+
+        Only emit in the op's ISSUE graph. For cross-graph async the issue
+        graph differs from the consumer graph; same-graph async uses
+        ``issue_compiled_graph_id = compiled_graph_id`` (default).
+        """
         result: dict[int, list[H2DPrefetchOp]] = defaultdict(list)
         for op in self._schedule.h2d_prefetches:
             if op.after_launch_id < 0:
                 continue
-            # Cross-iter ops are always async, regardless of the ordering
-            # between after_launch_id and before_launch_id.
             if op.cross_iter or op.after_launch_id != op.before_launch_id:
+                if not self._is_issuer_here(op):
+                    continue
                 result[op.after_launch_id].append(op)
         return dict(result)
 
@@ -221,14 +251,15 @@ class ScheduleAdapter:
     def h2d_wait_launch(self) -> dict[int, list[H2DPrefetchOp]]:
         """compiled_launch_id -> H2D ops whose async copy must complete.
 
-        Populated for all async ops (ops with after_launch_id set and either
-        cross-iter or after != before).
+        Only emit in the op's CONSUMER graph.
         """
         result: dict[int, list[H2DPrefetchOp]] = defaultdict(list)
         for op in self._schedule.h2d_prefetches:
             if op.after_launch_id < 0 or op.before_launch_id < 0:
                 continue
             if op.cross_iter or op.after_launch_id != op.before_launch_id:
+                if not self._is_consumer_here(op):
+                    continue
                 result[op.before_launch_id].append(op)
         return dict(result)
 
