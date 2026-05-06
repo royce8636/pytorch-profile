@@ -1,0 +1,12 @@
+{
+  "graph_id": 72,
+  "launches": [
+    {
+      "compiled_launch_id": 0,
+      "graph_id": 72,
+      "launch_kind": "ExternKernelAllocLine",
+      "kernel_name": "torch.ops.aten._scaled_dot_product_efficient_attention.default"
+    }
+  ],
+  "compilation_hash": "1f34f19cdb4051ca"
+}

@@ -92,6 +92,11 @@ class WeightStreamRuntime:
         self._weight_storage_nbytes: dict[int, int] = {}
         self._registered_weights: dict[int, torch.Tensor] = {}
 
+        # By-(gid, name) mapping for cross-graph async. Populated by
+        # ``register_weight_named`` calls emitted at wrapper entry. Mirror
+        # of the C++ ``named_to_key`` map.
+        self._named_weights: dict[tuple[int, str], torch.Tensor] = {}
+
         # VRAM evictions are deferred until the CUDA stream reaches the point
         # where eviction was requested. This prevents host-side storage resize
         # from racing outstanding kernels that still read the tensor.
@@ -149,6 +154,7 @@ class WeightStreamRuntime:
     def reset(cls) -> None:
         if cls._instance is not None:
             cls._instance._ssd_pool.shutdown(wait=False)
+            cls._instance._named_weights.clear()
             cls._instance = None
         # Clear the C++ mirror as well so stale TensorImpl* keys from
         # a prior iteration don't leak into the next run. The native
@@ -164,40 +170,113 @@ class WeightStreamRuntime:
     def register_weight(self, gpu_tensor: torch.Tensor) -> None:
         """Register a GPU weight tensor for VRAM eviction/restore.
 
-        Creates a pinned CPU backup copy. The generated code will pass this
-        tensor object directly to evict_vram/h2d_prefetch (not a string name).
+        When the native ws_rt is available, delegate the pinned CPU
+        backup to C++ (saves ~2x pinned RAM; SD3-med has ~16 GB of
+        weights so a duplicate backup would OOM a 32 GB host). The
+        Python mirror keeps storage_nbytes and a reference to the GPU
+        tensor, but NOT a second pinned backup; the identity check for
+        ``register_weight_named`` is backup-presence-agnostic.
         """
         key = id(gpu_tensor)
-        self._weight_backups[key] = gpu_tensor.data.cpu().pin_memory()
+        if _ws_native_available():
+            # C++ holds the pinned backup; mark as registered with a
+            # None sentinel so identity checks still pass. Python
+            # fallback paths (_h2d_prefetch_tensor etc.) won't find a
+            # backup and will bail — acceptable since those paths
+            # only run when native is unavailable.
+            self._weight_backups[key] = None  # type: ignore[assignment]
+            torch.ops.ws_rt.register_weight(gpu_tensor)
+        else:
+            self._weight_backups[key] = gpu_tensor.data.cpu().pin_memory()
         self._weight_storage_nbytes[key] = gpu_tensor.untyped_storage().nbytes()
         self._registered_weights[key] = gpu_tensor
         self._pending_vram_evictions.pop(key, None)
-        # Mirror the registration into the C++ weight-streaming runtime
-        # (``torch.ops.ws_rt.register_weight``) so the native ``ws_ops``
-        # path has the pinned CPU backup and storage nbytes ready. The
-        # C++ side maintains its own state keyed by TensorImpl*.
+
+    def mark_reloadable(self, tensors) -> None:
+        """Tell the runtime which tensors the scheduler will reload.
+
+        ``evict_cross_graph`` only zeroes storage for tensors in this
+        set. Without this contract the runtime conservatively skips
+        cross-graph eviction (to avoid orphaning a tensor the scheduler
+        silently dropped from its output).
+        """
+        if not tensors:
+            return
         if _ws_native_available():
-            torch.ops.ws_rt.register_weight(gpu_tensor)
+            torch.ops.ws_rt.mark_reloadable(list(tensors))
 
-    def evict_cross_graph(self, cold_start_tensors: tuple) -> None:
-        """Evict every registered weight not in cold_start_tensors.
+    def begin_graph_iter(self, gid: int) -> None:
+        """Advance the per-graph iter counter (called once per wrapper
+        invocation). The runtime uses this counter to filter masked ops
+        for partial schedules.
+        """
+        if _ws_native_available():
+            torch.ops.ws_rt.begin_graph_iter(int(gid))
 
-        Called at the top of each wrapper invocation. The cold_start list for
-        graph N contains graph N's pinned tensors; anything else registered
-        (other graphs' weights) isn't used by graph N's compute and can be
-        freed while N runs. This is what delivers cross-graph peak savings —
-        each graph's peak is bounded by (its pinned + bandwidth-limited
-        cyclable in flight), not by the union of all graphs' weights.
+    def set_iter_mask(
+        self,
+        gid: int,
+        name: str,
+        h2d_iters: list[int],
+        evict_iters: list[int],
+        total_iters: int,
+    ) -> None:
+        """Register a per-iter mask for a tensor in a partial schedule.
+        The tensor must already be registered via
+        ``register_weight_named``. Empty iter lists fire on every iter
+        within ``total_iters`` (legacy semantic).
+        """
+        if _ws_native_available():
+            torch.ops.ws_rt.set_iter_mask(
+                int(gid), str(name),
+                list(int(x) for x in h2d_iters),
+                list(int(x) for x in evict_iters),
+                int(total_iters),
+            )
 
-        Eviction is synchronous (direct storage.resize_(0)): at wrapper entry
-        no kernels are running on the default stream that could be reading
-        these tensors, so it's safe to free immediately without an event
-        wait. `_pending_vram_evictions` entries are drained first in case a
-        prior eviction hadn't flushed yet.
+    def register_weight_named(
+        self, gid: int, name: str, gpu_tensor: torch.Tensor
+    ) -> None:
+        """Record a (gid, name) → tensor mapping for cross-graph async.
+
+        The issuer graph has no local Python reference to a consumer
+        graph's inputs; by-key lookup lets an ``xg_async_*`` entry in
+        ``ws_ops`` resolve the target. No-op if the tensor is not a
+        registered WS weight — the wrapper emits this for every graph
+        input, but only actual weights should enter the named map.
+
+        Second- and subsequent-call early-out: the wrapper emits this
+        on every invocation, but once a (gid, name) is known we skip
+        the C++ dispatch.
+        """
+        nkey = (int(gid), str(name))
+        if nkey in self._named_weights:
+            return
+        if id(gpu_tensor) not in self._weight_backups:
+            return
+        self._named_weights[nkey] = gpu_tensor
+        if _ws_native_available():
+            torch.ops.ws_rt.register_weight_named(nkey[0], nkey[1], gpu_tensor)
+
+    def evict_cross_graph(self, keep_tensors: tuple) -> None:
+        """Evict every registered weight not in keep_tensors AND not with
+        an in-flight async H2D (C++ side checks h2d_events).
+
+        Called at the top of each wrapper invocation. keep_tensors is
+        typically all of this graph's WS weights. Anything else that's
+        registered AND not the target of an in-flight cross-graph async
+        can be freed while this graph runs. Skipping in-flight targets
+        is required: an earlier graph may have issued H2D for a LATER
+        graph's tensor; resizing that storage would orphan the copy and
+        the consumer would wait on an event pointing into freed memory.
         """
         if not self._registered_weights:
             return
-        keep_ids: set[int] = {id(t) for t in cold_start_tensors}
+        if _ws_native_available():
+            with record_function("ws_rt::evict_cross_graph_cpp"):
+                torch.ops.ws_rt.evict_cross_graph(list(keep_tensors))
+            return
+        keep_ids: set[int] = {id(t) for t in keep_tensors}
         with record_function("ws_rt::evict_cross_graph"):
             for key, tensor in self._registered_weights.items():
                 if key in keep_ids:
@@ -297,10 +376,21 @@ class WeightStreamRuntime:
             return self._h2d_prefetch_by_name(tensor_name_or_tensor)
 
     def _h2d_prefetch_tensor(self, gpu_tensor: torch.Tensor) -> torch.Tensor:
-        """Restore a GPU tensor's storage from its CPU backup (synchronous)."""
+        """Restore a GPU tensor's storage from its CPU backup (synchronous).
+
+        When native is available the Python backup is a None sentinel
+        (C++ holds the real backup). Route to C++ ws_ops sync_h2d in
+        that case — same semantics, no extra pinned RAM.
+        """
         key = id(gpu_tensor)
-        backup = self._weight_backups.get(key)
+        if key not in self._weight_backups:
+            return gpu_tensor
+        backup = self._weight_backups[key]
         if backup is None:
+            if _ws_native_available():
+                torch.ops.ws_rt.ws_ops(
+                    [], [gpu_tensor], [], [], [], [], False,
+                )
             return gpu_tensor
 
         pending = self._pending_vram_evictions.get(key)
@@ -343,8 +433,14 @@ class WeightStreamRuntime:
             allocated on the default stream.
         """
         key = id(gpu_tensor)
-        backup = self._weight_backups.get(key)
+        if key not in self._weight_backups:
+            return gpu_tensor
+        backup = self._weight_backups[key]
         if backup is None:
+            if _ws_native_available():
+                torch.ops.ws_rt.ws_ops(
+                    [], [], [], [gpu_tensor], [], [], False,
+                )
             return gpu_tensor
 
         if key in self._h2d_events:
@@ -397,29 +493,39 @@ class WeightStreamRuntime:
         (default) stream is using storage that was allocated on _h2d_stream —
         otherwise the allocator may recycle the memory before this stream's
         kernels finish reading it.
+
+        Bootstrap fallback: if no event is pending and storage is empty
+        (e.g., iter 0 cross-graph async where issuer couldn't fire), do a
+        sync copy here rather than let the consumer read empty storage.
         """
         key = id(gpu_tensor)
         event = self._h2d_events.pop(key, None)
-        if event is not None:
-            current = torch.cuda.current_stream(self._device)
-            if self._measure_h2d_stall:
-                if event.query():
-                    self._h2d_wait_hit_count += 1
-                else:
-                    self._h2d_wait_miss_count += 1
-                pre = torch.cuda.Event(enable_timing=True)
-                pre.record(current)
-                current.wait_event(event)
-                post = torch.cuda.Event(enable_timing=True)
-                post.record(current)
-                self._h2d_stall_events.append((pre, post))
+        if event is None:
+            if (
+                key in self._weight_backups
+                and gpu_tensor.untyped_storage().nbytes() == 0
+            ):
+                self._h2d_prefetch_tensor(gpu_tensor)
+            return gpu_tensor
+        current = torch.cuda.current_stream(self._device)
+        if self._measure_h2d_stall:
+            if event.query():
+                self._h2d_wait_hit_count += 1
             else:
-                current.wait_event(event)
-            gpu_tensor.record_stream(current)
-            # Don't recycle the event here: stream.wait_event() is GPU-side
-            # and doesn't observe the event. Re-recording on it before the
-            # GPU processes the wait corrupts the wait's captured fence
-            # (cuda illegal memory access).
+                self._h2d_wait_miss_count += 1
+            pre = torch.cuda.Event(enable_timing=True)
+            pre.record(current)
+            current.wait_event(event)
+            post = torch.cuda.Event(enable_timing=True)
+            post.record(current)
+            self._h2d_stall_events.append((pre, post))
+        else:
+            current.wait_event(event)
+        gpu_tensor.record_stream(current)
+        # Don't recycle the event here: stream.wait_event() is GPU-side
+        # and doesn't observe the event. Re-recording on it before the
+        # GPU processes the wait corrupts the wait's captured fence
+        # (cuda illegal memory access).
         return gpu_tensor
 
     def drain_h2d_stall_stats(self) -> dict:
@@ -618,10 +724,13 @@ class WeightStreamRuntime:
         ssd: tuple = (),
         cold_start: tuple = (),
         cold_start_tensors: tuple = (),
+        keep_tensors: tuple = (),
         cross_graph_evict: bool = False,
         evict_vram: tuple = (),
         evict_vram_names: tuple = (),
         async_h2d: tuple = (),
+        xg_async_gids: tuple = (),
+        xg_async_names: tuple = (),
         evict_dram: tuple = (),
         flush: bool = False,
     ) -> None:
@@ -636,26 +745,45 @@ class WeightStreamRuntime:
         The caller (codegen) supplies only the kwargs it needs for this site.
         """
         # Fast path: delegate the hot tensor-op loops to the C++ ``ws_rt``
-        # library, which holds its own state keyed by TensorImpl*. We
-        # can only delegate when the call site uses ONLY the
-        # tensor-arg categories the native op understands (waits,
-        # sync_h2d, evict_vram, async_h2d, flush). SSD / DRAM / cold-
-        # start name-based ops and the SDXL cross-graph evict helper
-        # stay in Python.
+        # library, which holds its own state keyed by TensorImpl*.
+        #
+        # ``cold_start_tensors`` routes to sync_h2d natively (same
+        # semantics: resize+copy if empty, no-op if resident). The
+        # cross_graph_evict side is handled via a separate native op
+        # before the ws_ops call. SSD / DRAM name-based ops stay in
+        # Python (no native equivalent).
         can_native = (
             _ws_native_available()
-            and not ssd and not cold_start and not cold_start_tensors
+            and not ssd and not cold_start
             and not evict_vram_names and not evict_dram
-            and not cross_graph_evict
             and not self._measure_h2d_stall
         )
         if can_native:
             import torch._inductor.weight_streaming.runtime as _self_mod
             _self_mod._ws_cpp_hits = getattr(_self_mod, "_ws_cpp_hits", 0) + 1
             with record_function("ws_rt::ws_ops_cpp"):
+                if cross_graph_evict and cold_start_tensors:
+                    # Run cross-graph eviction before cold-start load.
+                    keep_set = keep_tensors if keep_tensors else cold_start_tensors
+                    torch.ops.ws_rt.evict_cross_graph(list(keep_set))
+                # When cold_start is present, drain ready pending
+                # evictions BEFORE the batch of loads — Python's legacy
+                # _h2d_prefetch_tensor called flush per-tensor, freeing
+                # other tensors' storage as we went. Doing it as a
+                # one-shot pre-flush here matches that peak behavior
+                # (we free, then allocate, instead of allocate + free).
+                if cold_start_tensors:
+                    torch.ops.ws_rt.flush_ready_vram_evictions()
+                # Fold cold_start_tensors into sync_h2d for the native
+                # call. Same semantics: resize-if-empty + copy.
+                native_sync = list(sync_h2d)
+                if cold_start_tensors:
+                    native_sync.extend(cold_start_tensors)
                 torch.ops.ws_rt.ws_ops(
-                    list(waits), list(sync_h2d), list(evict_vram),
-                    list(async_h2d), bool(flush),
+                    list(waits), native_sync, list(evict_vram),
+                    list(async_h2d),
+                    list(xg_async_gids), list(xg_async_names),
+                    bool(flush),
                 )
             return
         import torch._inductor.weight_streaming.runtime as _self_mod
@@ -684,9 +812,14 @@ class WeightStreamRuntime:
             if cross_graph_evict and cold_start_tensors:
                 # Run cross-graph eviction BEFORE loading this graph's cold
                 # start — otherwise the new loads double-count against the
-                # momentary peak. The cross-graph evict keeps cold_start_tensors
-                # as the resident set survivors.
-                self.evict_cross_graph(cold_start_tensors)
+                # momentary peak. Prefer the full keep_tensors set (all of
+                # this graph's WS weights, including async-cycled ones)
+                # because a cycled weight whose async fired from an earlier
+                # graph would be resized to 0 between fire and wait.
+                keep_set: tuple = (
+                    tuple(keep_tensors) if keep_tensors else cold_start_tensors
+                )
+                self.evict_cross_graph(keep_set)
             for t in cold_start_tensors:
                 self._h2d_prefetch_tensor(t)
             for t in evict_vram:
@@ -695,6 +828,10 @@ class WeightStreamRuntime:
                 self._evict_vram_by_name(n)
             for t in async_h2d:
                 self._h2d_prefetch_tensor_async(t)
+            for gid, n in zip(xg_async_gids, xg_async_names):
+                t = self._named_weights.get((int(gid), str(n)))
+                if t is not None:
+                    self._h2d_prefetch_tensor_async(t)
             for n in evict_dram:
                 self._evict_dram_inline(n)
             if flush:

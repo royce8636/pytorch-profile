@@ -1,0 +1,8 @@
+{
+  "unprofiled_wall_ns": 1207580439,
+  "profiled_wall_ns": 21387961790,
+  "profiled_minus_unprofiled_ns": 20180381351,
+  "n_cpu_events": 43869,
+  "profiler_overhead_per_event_ns": 460014,
+  "applied_to_bundle_csv": false
+}

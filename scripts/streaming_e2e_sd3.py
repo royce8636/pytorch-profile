@@ -329,6 +329,15 @@ def _stage_schedule_cgsim(args, bundle_dir: Path) -> Path:
             kwargs["alpha"] = args.alpha
         if args.variant in ("cgsim_milp_aggregate_duplex", "cgsim_milp_oracle_duplex"):
             kwargs["duplex"] = True
+        # Per-graph multiplicity for SD3-med pipeline (compile order
+        # observed: text encoders + transformer + VAE = 4 graphs).
+        # The transformer (gid=2) runs 2*steps times due to CFG; others
+        # once each. Lets ct_milp_oracle's mult-gated cross-graph
+        # check filter out unsafe issuer placements.
+        if args.variant in ("cgsim_milp_oracle", "cgsim_milp_oracle_duplex"):
+            kwargs["graph_multiplicity"] = {
+                0: 1, 1: 1, 2: 2 * args.steps, 3: 1
+            }
         result = mod.solve(
             trace, sidecars=sidecars, hw=hw,
             locked_graph_input_names={"pos_embed.proj.weight", "context_embedder.weight"},
@@ -439,6 +448,8 @@ def stage_run(pipe, device, args, schedule_path: Path, bundle_dir: Path):
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+        if hasattr(torch.ops.ws_rt, "get_wait_stats"):
+            torch.ops.ws_rt.get_wait_stats()
     print("→ timed inference run ...")
     t0 = time.perf_counter()
     _ = run_pipeline(pipe, args)
@@ -447,7 +458,11 @@ def stage_run(pipe, device, args, schedule_path: Path, bundle_dir: Path):
 
     alloc_mb = torch.cuda.memory_allocated(device) / 1e6 if device.type == "cuda" else 0
     peak_mb = torch.cuda.max_memory_allocated(device) / 1e6 if device.type == "cuda" else 0
-    return {"allocated_mb": alloc_mb, "peak_mb": peak_mb, "inference_s": elapsed}
+    wait_stats = None
+    if device.type == "cuda" and hasattr(torch.ops.ws_rt, "get_wait_stats"):
+        wait_stats = list(torch.ops.ws_rt.get_wait_stats())
+    return {"allocated_mb": alloc_mb, "peak_mb": peak_mb, "inference_s": elapsed,
+            "wait_stats": wait_stats}
 
 
 def main():
@@ -518,6 +533,16 @@ def main():
     print(f"allocated_mb   : {results['allocated_mb']:.1f}")
     print(f"peak_mb        : {results['peak_mb']:.1f}")
     print(f"inference_s    : {results['inference_s']:.4f}")
+    import os as _os
+    if _os.environ.get("TORCH_WS_LOG_DISPATCH"):
+        s = results.get("wait_stats")
+        if s is not None:
+            print(
+                f"ws_wait_stats  : hit={s[0]} miss_synced={s[1]} miss_resident={s[2]} "
+                f"fire_async={s[3]} fire_skip_inflight={s[4]} fire_skip_resident={s[5]}"
+            )
+            if len(s) >= 9:
+                print(f"ws_xg_stats    : dispatched={s[6]} named_miss={s[7]} rw_miss={s[8]}")
     WeightStreamRuntime.reset()
 
 

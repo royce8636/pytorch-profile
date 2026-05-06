@@ -436,11 +436,14 @@ def main() -> None:
     load_seconds = elapsed_seconds(load_start)
 
     # ── Warmup ──
+    # Mirror profile_sdxl_turbo_gpu.py: each warmup pass runs the pipe
+    # AND VAE decode so the timed window measures steady-state rather
+    # than first-call VAE compile/autotune.
     warmup_start = time.perf_counter()
     for i in range(args.warmup_runs):
         print(f"Warmup run {i + 1}/{args.warmup_runs}...")
         t0 = time.perf_counter()
-        _ = pipe(
+        warmup_output = pipe(
             prompt=args.prompt,
             num_inference_steps=args.steps,
             guidance_scale=0.0,
@@ -448,8 +451,11 @@ def main() -> None:
             width=args.width,
             output_type="latent",
         )
+        with torch.no_grad():
+            _ = decode_latents_to_pil(pipe, warmup_output.images)
         synchronize_device(device)
         print(f"  {elapsed_seconds(t0):.2f}s")
+        del warmup_output
     warmup_seconds = elapsed_seconds(warmup_start)
 
     # ── Timed run ──
@@ -460,6 +466,36 @@ def main() -> None:
     # reflects only the timed run.
     rt.drain_h2d_stall_stats()
     print("\nTimed run...")
+
+    # Per-stage VRAM probe: wraps each diffusers sub-module so we can see
+    # which phase (TE / UNet step / VAE) holds the peak.  Each probe
+    # samples currently-allocated bytes BEFORE and AFTER its callee and
+    # the running max-allocated immediately after, which is what
+    # max_memory_allocated() will eventually report.
+    vram_log: list[tuple[str, float, float, float]] = []
+
+    def _probe(name, fn):
+        def _wrapped(*a, **kw):
+            torch.cuda.synchronize(device)
+            pre = torch.cuda.memory_allocated(device) / (1024 * 1024)
+            out = fn(*a, **kw)
+            torch.cuda.synchronize(device)
+            post = torch.cuda.memory_allocated(device) / (1024 * 1024)
+            peak = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+            vram_log.append((name, pre, post, peak))
+            return out
+        return _wrapped
+
+    if device.type == "cuda":
+        if getattr(pipe, "text_encoder", None) is not None:
+            pipe.text_encoder.forward = _probe("TE1", pipe.text_encoder.forward)
+        if getattr(pipe, "text_encoder_2", None) is not None:
+            pipe.text_encoder_2.forward = _probe("TE2", pipe.text_encoder_2.forward)
+        # UNet: wrap forward; one entry per call (= one entry per step).
+        pipe.unet.forward = _probe("UNet", pipe.unet.forward)
+        if getattr(pipe, "vae", None) is not None:
+            pipe.vae.decode = _probe("VAE.decode", pipe.vae.decode)
+
     synchronize_device(device)
     inference_start = time.perf_counter()
     output = pipe(
@@ -470,15 +506,10 @@ def main() -> None:
         width=args.width,
         output_type="latent",
     )
-    synchronize_device(device)
-    inference_seconds = elapsed_seconds(inference_start)
-
-    # ── Decode and save image ──
-    decode_start = time.perf_counter()
     with torch.no_grad():
         images = decode_latents_to_pil(pipe, output.images)
     synchronize_device(device)
-    decode_seconds = elapsed_seconds(decode_start)
+    inference_seconds = elapsed_seconds(inference_start)
 
     save_start = time.perf_counter()
     images[0].save(image_path)
@@ -513,7 +544,6 @@ def main() -> None:
     print(f"load_seconds: {load_seconds:.6f}")
     print(f"warmup_seconds: {warmup_seconds:.6f}")
     print(f"inference_seconds: {inference_seconds:.6f}")
-    print(f"decode_seconds: {decode_seconds:.6f}")
     print(f"save_seconds: {save_seconds:.6f}")
     print(f"e2e_seconds: {e2e_seconds:.6f}")
 
@@ -525,6 +555,17 @@ def main() -> None:
             f"hits={stall_stats['hit_count']} "
             f"misses={stall_stats['miss_count']}"
         )
+    else:
+        print("unhidden_h2d_ms: <disabled — set WS_MEASURE_H2D_STALL=1 to enable>")
+
+    # Per-stage VRAM probe results — locates the moment of peak so we
+    # can tell which phase (TE / UNet step / VAE / activation upcast)
+    # actually holds the high-water mark.
+    if vram_log:
+        print("\nper-stage VRAM (MB):")
+        print(f"  {'stage':<14} {'pre':>9} {'post':>9} {'peak_so_far':>12}")
+        for name, pre, post, peak in vram_log:
+            print(f"  {name:<14} {pre:>9.1f} {post:>9.1f} {peak:>12.1f}")
 
     # ── Cleanup ──
     inductor_config.weight_streaming_plan = ""

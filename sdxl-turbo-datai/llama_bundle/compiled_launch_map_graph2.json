@@ -1,0 +1,12 @@
+{
+  "graph_id": 2,
+  "launches": [
+    {
+      "compiled_launch_id": 0,
+      "graph_id": 2,
+      "launch_kind": "ExternKernelOutLine",
+      "kernel_name": "extern_kernels.mm"
+    }
+  ],
+  "compilation_hash": "cf193d2cdf923fcd"
+}

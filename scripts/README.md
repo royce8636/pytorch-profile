@@ -14,10 +14,14 @@ Use `run_qwen_image.py` when you want the same Qwen runtime path without
 profiler instrumentation.
 
 Use `run_accelerate_cpu_offload.py` when you want the same local SDXL Turbo or
-Qwen-Image models to run with Diffusers Accelerate CPU offload, so the pipeline
-can exceed available GPU VRAM at the cost of extra transfer overhead. Both
-offload entrypoints also accept `--fusion inductor` to compile the hot model
-path with `torch.compile` before offload hooks are installed.
+Qwen-Image models to run with HF Accelerate CPU offload, so the pipeline can
+exceed available GPU VRAM at the cost of extra transfer overhead. Both offload
+entrypoints also accept `--fusion inductor` to compile the hot model path with
+`torch.compile` before offload hooks are installed.
+The offload mode can be `model`, `sequential`, `module`, or `module-hook`:
+`model` and `sequential` go through Diffusers' pipeline helpers, while
+`module` and `module-hook` apply HF Accelerate's `cpu_offload` and
+`cpu_offload_with_hook` APIs directly to the pipeline modules.
 
 Use `profile_accelerate_cpu_offload.py` when you want a steady-state profiler
 trace for the offloaded run. It starts profiling only after model load and
@@ -220,7 +224,8 @@ PYTHONNOUSERSITE=1 /tmp/ptvenv/bin/python scripts/run_accelerate_cpu_offload.py 
 ```bash
 PYTHONNOUSERSITE=1 /tmp/ptvenv/bin/python scripts/profile_accelerate_cpu_offload.py \
   qwen-image \
-  --offload-mode sequential \
+  --offload-mode module \
+  --fusion inductor \
   --output-dir /tmp/qwen_image_offload_profile \
   --disable-progress-bar
 ```

@@ -78,7 +78,7 @@ def parse_args(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
-    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_model: str | None = "/data/llamasim/models/sdxl-turbo",
     default_component: str = "sdxl_turbo_pipeline",
     default_fusion: str = "none",
     default_dot_level: str,
@@ -91,6 +91,7 @@ def parse_args(
     )
     parser.add_argument(
         "--model",
+        required=default_model is None,
         default=default_model,
         help="Path to the SDXL model directory.",
     )
@@ -165,8 +166,13 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--output-prefix",
+        default=default_output_prefix,
+        help="Prefix used for trace, image, and optional DOT output filenames.",
+    )
+    parser.add_argument(
         "--trace",
-        default=f"/tmp/{default_output_prefix}_trace.json",
+        default=None,
         help="Path for the exported Chrome trace JSON.",
     )
     parser.add_argument(
@@ -275,8 +281,7 @@ def parse_args(
         default=None,
         help=(
             "Directory for a llamasim runtime bundle containing step_0_compute_graph.dot, "
-            "ggml_profile_node_records.csv, runtime node/edge metadata, tensor metadata, "
-            "and a manifest. "
+            "runtime node/edge metadata, tensor metadata, and a manifest. "
             "Requires --dot-level llamasim-runtime or all."
         ),
     )
@@ -426,7 +431,8 @@ def resolve_output_paths(
     default_output_prefix: str,
     default_llamasim_output_dirname: str | None = None,
 ) -> OutputPaths:
-    stem = output_stem(default_output_prefix, args.fusion)
+    output_prefix = getattr(args, "output_prefix", default_output_prefix)
+    stem = output_stem(output_prefix, args.fusion)
     if args.output_dir is not None:
         output_dir = Path(args.output_dir)
         trace_path = output_dir / f"{stem}_trace.json"
@@ -482,7 +488,12 @@ def resolve_output_paths(
             )
         )
     else:
-        trace_path = Path(args.trace)
+        if args.trace is not None:
+            trace_path = Path(args.trace)
+        elif output_prefix == default_output_prefix:
+            trace_path = Path("/tmp") / f"{default_output_prefix}_trace.json"
+        else:
+            trace_path = Path("/tmp") / f"{stem}_trace.json"
         csv_path = (
             Path(args.trace_csv)
             if args.trace_csv is not None
@@ -3976,7 +3987,6 @@ def write_llamasim_runtime_bundle(
             )
 
     dot_path = output_dir / "step_0_compute_graph.dot"
-    timing_csv_path = output_dir / "ggml_profile_node_records.csv"
     tensor_csv_path = output_dir / "pytorch_runtime_tensors.csv"
     runtime_nodes_csv_path = output_dir / "runtime_nodes.csv"
     runtime_edges_csv_path = output_dir / "runtime_edges.csv"
@@ -4084,92 +4094,6 @@ def write_llamasim_runtime_bundle(
                         f'  "{src}" -> "{dst}" [ style = {style}; color = {color}; label = "{edge_kind}"; ];\n'
                     )
         f.write("}\n")
-
-    with timing_csv_path.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "step",
-            "node_n",
-            "node_name",
-            "tensor_addr",
-            "node_compute_time_ns",
-            "node_tensor_size_bytes",
-            "start_ns",
-            "end_ns",
-            "node_id",
-            "device_type",
-            "device_index",
-            "thread_id",
-            "stream_id",
-            "correlation_id",
-            "linked_correlation_id",
-            "rf_id",
-            "kernel_file",
-            "node_kind",
-            "resource_kind",
-            "resource_id",
-            "runtime_role",
-            "compiled_graph_id",
-            "compiled_launch_id",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for event in selected_events:
-            execution_node = matched_execution_node_by_event.get(id(event))
-            rf_id = execution_rf_id(execution_node) if execution_node is not None else None
-            node_kind = (
-                "cpu_leaf" if event.device_type() == DeviceType.CPU else "gpu_runtime"
-            )
-            resource_kind = (
-                "cpu_thread"
-                if event.device_type() == DeviceType.CPU
-                else "gpu_stream"
-            )
-            resource_id = (
-                event.start_thread_id()
-                if event.device_type() == DeviceType.CPU
-                else event.device_resource_id()
-            )
-            ws = ws_launch_index.get(id(event))
-            writer.writerow(
-                {
-                    "step": 0,
-                    "node_n": node_indexes[id(event)],
-                    "node_name": _rewrite_name(
-                        name=event.name(), with_wildcard=False
-                    ),
-                    "tensor_addr": "",
-                    "node_compute_time_ns": event.duration_ns(),
-                    "node_tensor_size_bytes": 0,
-                    "start_ns": event.start_ns() - trace_start_ns,
-                    "end_ns": event.end_ns() - trace_start_ns,
-                    "node_id": node_ids[id(event)],
-                    "device_type": getattr(
-                        event.device_type(), "name", str(event.device_type())
-                    ),
-                    "device_index": event.device_index(),
-                    "thread_id": event.start_thread_id(),
-                    "stream_id": event.device_resource_id(),
-                    "correlation_id": event.correlation_id(),
-                    "linked_correlation_id": event.linked_correlation_id(),
-                    "rf_id": "" if rf_id is None else rf_id,
-                    "kernel_file": (
-                        execution_trace_attr(execution_node, "kernel_file") or ""
-                        if execution_node is not None
-                        else ""
-                    ),
-                    "node_kind": node_kind,
-                    "resource_kind": resource_kind,
-                    "resource_id": resource_id,
-                    "runtime_role": runtime_role_by_event_id.get(
-                        id(event),
-                        "cpu_leaf"
-                        if event.device_type() == DeviceType.CPU
-                        else "gpu_runtime",
-                    ),
-                    "compiled_graph_id": ws[0] if ws is not None else "",
-                    "compiled_launch_id": ws[1] if ws is not None else -1,
-                }
-            )
 
     with runtime_nodes_csv_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = [
@@ -4391,7 +4315,6 @@ def write_llamasim_runtime_bundle(
         "compute_node_scope": "cpu_leaf_plus_exact_submit_plus_all_gpu_runtime",
         "tensor_io_scope": "cpu_and_gpu",
         "step_dot_files": ["step_0_compute_graph.dot"],
-        "timing_csv": timing_csv_path.name,
         "node_csv": runtime_nodes_csv_path.name,
         "edge_csv": runtime_edges_csv_path.name,
         "tensor_csv": tensor_csv_path.name,
@@ -4935,146 +4858,6 @@ def validate_device(args: argparse.Namespace) -> torch.device:
     return device
 
 
-def time_unprofiled_inference(pipe, args, device: torch.device) -> int:
-    """Run one inference pass WITHOUT the profiler and return wall-clock ns.
-
-    Mirrors exactly what the profiled path does (run_pipeline + decode +
-    sync). Used as ground truth for the "profiler_overhead_per_event_ns"
-    calibration: subtracting this from the profiled wall clock, divided
-    by the cpu-event count, gives the per-event hook cost.
-    """
-    synchronize_device(device)
-    t0 = time.perf_counter_ns()
-    output = run_pipeline(pipe, args)
-    with torch.no_grad():
-        _images = decode_latents_to_pil(pipe, output.images)
-    synchronize_device(device)
-    wall_ns = time.perf_counter_ns() - t0
-    del output, _images
-    return wall_ns
-
-
-def _count_cpu_events_from_chrome_trace(trace_path: Path) -> int:
-    """Count Kineto CPU op events in a chrome-trace JSON.
-
-    Only counts events with ``cat == 'cpu_op'`` — these are the ones
-    that fired a ``record_function`` hook. Skips GPU kernel events,
-    profiler step markers, memory events, user-annotation wrappers.
-    """
-    try:
-        with trace_path.open() as f:
-            doc = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return 0
-    events = doc.get("traceEvents", [])
-    return sum(
-        1 for e in events
-        if e.get("ph") == "X" and e.get("cat") == "cpu_op"
-    )
-
-
-def write_calibration_json(
-    *,
-    dir_path: Path,
-    unprofiled_wall_ns: int,
-    profiled_wall_ns: int,
-    n_cpu_events: int,
-    per_event_ns: int,
-    applied: bool,
-) -> None:
-    data = {
-        "unprofiled_wall_ns": int(unprofiled_wall_ns),
-        "profiled_wall_ns": int(profiled_wall_ns),
-        "profiled_minus_unprofiled_ns": int(profiled_wall_ns - unprofiled_wall_ns),
-        "n_cpu_events": int(n_cpu_events),
-        "profiler_overhead_per_event_ns": int(per_event_ns),
-        "applied_to_bundle_csv": bool(applied),
-    }
-    with (dir_path / "calibration.json").open("w") as f:
-        json.dump(data, f, indent=2)
-
-
-def _rewrite_timing_csv_with_calibration(
-    src_csv: Path, dst_csv: Path, per_event_ns: int,
-) -> None:
-    """Copy ``ggml_profile_node_records.csv`` subtracting per-event profiler
-    overhead from every CPU-device node's ``node_compute_time_ns``.
-
-    GPU kernel rows are untouched (CUPTI timings are not profiler-inflated).
-    Clamps to 0 to avoid negative durations on ops shorter than the average
-    hook cost.
-    """
-    with src_csv.open() as fin, dst_csv.open("w", newline="") as fout:
-        reader = csv.DictReader(fin)
-        fieldnames = reader.fieldnames
-        writer = csv.DictWriter(fout, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in reader:
-            if (
-                row.get("device_type") == "CPU"
-                or row.get("resource_kind") == "cpu_thread"
-            ):
-                try:
-                    orig = int(row.get("node_compute_time_ns", 0) or 0)
-                except ValueError:
-                    orig = 0
-                row["node_compute_time_ns"] = max(0, orig - per_event_ns)
-            writer.writerow(row)
-
-
-def write_calibrated_bundle(
-    *,
-    bundle_dir: Path,
-    trace_json_path: Path,
-    unprofiled_wall_ns: int,
-    profiled_wall_ns: int,
-) -> Path | None:
-    """Compute profiler overhead per event and write a ``<name>_calibrated``
-    sibling bundle with CPU-node durations reduced by that amount.
-
-    Both the original ``bundle_dir`` and the calibrated sibling receive a
-    ``calibration.json`` with the measured numbers (``applied_to_bundle_csv``
-    True only for the calibrated dir). Returns the calibrated dir path, or
-    ``None`` if the bundle or trace could not be read.
-    """
-    if not bundle_dir.is_dir():
-        return None
-    n_cpu = _count_cpu_events_from_chrome_trace(trace_json_path)
-    wall_diff = max(0, int(profiled_wall_ns) - int(unprofiled_wall_ns))
-    per_event_ns = wall_diff // max(n_cpu, 1) if n_cpu > 0 else 0
-
-    calibrated_dir = bundle_dir.parent / f"{bundle_dir.name}_calibrated"
-    if calibrated_dir.exists():
-        shutil.rmtree(calibrated_dir)
-    calibrated_dir.mkdir(parents=True, exist_ok=True)
-
-    for entry in sorted(bundle_dir.iterdir()):
-        target = calibrated_dir / entry.name
-        if entry.is_dir():
-            shutil.copytree(entry, target)
-            continue
-        if entry.name == "ggml_profile_node_records.csv":
-            _rewrite_timing_csv_with_calibration(entry, target, per_event_ns)
-        else:
-            shutil.copy2(entry, target)
-
-    write_calibration_json(
-        dir_path=bundle_dir,
-        unprofiled_wall_ns=unprofiled_wall_ns,
-        profiled_wall_ns=profiled_wall_ns,
-        n_cpu_events=n_cpu,
-        per_event_ns=per_event_ns,
-        applied=False,
-    )
-    write_calibration_json(
-        dir_path=calibrated_dir,
-        unprofiled_wall_ns=unprofiled_wall_ns,
-        profiled_wall_ns=profiled_wall_ns,
-        n_cpu_events=n_cpu,
-        per_event_ns=per_event_ns,
-        applied=True,
-    )
-    return calibrated_dir
 
 
 def main(
@@ -5082,7 +4865,7 @@ def main(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
-    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_model: str | None = "/data/llamasim/models/sdxl-turbo",
     default_component: str = "sdxl_turbo_pipeline",
     default_fusion: str = "none",
     default_dot_level: str = "none",
@@ -5133,17 +4916,11 @@ def main(
         synchronize_device(device)
         del warmup_output
 
-    # Calibration pass: one unprofiled run with identical work to the
-    # upcoming profiled section. Wall-clock difference between this and
-    # the profiled run below gives profiler_overhead_per_event_ns.
-    unprofiled_wall_ns = time_unprofiled_inference(pipe, args, device)
-
     scope_args = metadata_for_scope(args)
     execution_trace_observer = None
     if output_paths.execution_trace_path is not None:
         execution_trace_observer = torch.profiler.ExecutionTraceObserver()
         execution_trace_observer.register_callback(str(output_paths.execution_trace_path))
-    profiled_wall_ns = 0
     with torch.profiler.profile(
         activities=profile_activities(device),
         record_shapes=args.record_shapes,
@@ -5151,13 +4928,11 @@ def main(
         with_stack=args.with_stack,
         execution_trace_observer=execution_trace_observer,
     ) as prof:
-        _profiled_t0 = time.perf_counter_ns()
         with torch.autograd.profiler.record_function("sdxl_turbo_run", scope_args):
             output = run_pipeline(pipe, args)
             with torch.no_grad():
                 images = decode_latents_to_pil(pipe, output.images)
         profiler_synchronize_device(device)
-        profiled_wall_ns = time.perf_counter_ns() - _profiled_t0
 
     if capture_handle is not None:
         capture_handle.remove()
@@ -5222,7 +4997,6 @@ def main(
             output_paths.runtime_io_dot_path,
             output_paths.runtime_io_dot_path.stem,
         )
-    calibrated_bundle_dir: Path | None = None
     if output_paths.llamasim_output_dir is not None:
         if output_paths.execution_trace_path is None:
             raise RuntimeError(
@@ -5233,15 +5007,6 @@ def main(
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
-        )
-        # Produce a sibling <name>_calibrated bundle with CPU-node
-        # compute_time_ns reduced by the measured profiler hook overhead
-        # per event. Original bundle is left untouched.
-        calibrated_bundle_dir = write_calibrated_bundle(
-            bundle_dir=output_paths.llamasim_output_dir,
-            trace_json_path=output_paths.trace_path,
-            unprofiled_wall_ns=unprofiled_wall_ns,
-            profiled_wall_ns=profiled_wall_ns,
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
@@ -5280,23 +5045,6 @@ def main(
     if output_paths.llamasim_output_dir is not None:
         print("llamasim_output_dir:", output_paths.llamasim_output_dir)
         print_llamasim_runtime_summary(output_paths.llamasim_output_dir)
-    if calibrated_bundle_dir is not None:
-        calib_json_path = calibrated_bundle_dir / "calibration.json"
-        try:
-            with calib_json_path.open() as _f:
-                _calib = json.load(_f)
-        except (OSError, json.JSONDecodeError):
-            _calib = {}
-        print("calibrated_bundle_dir:", calibrated_bundle_dir)
-        print(
-            "calibration:",
-            "unprofiled_wall_ms=%.3f" % (unprofiled_wall_ns / 1e6),
-            "profiled_wall_ms=%.3f" % (profiled_wall_ns / 1e6),
-            "n_cpu_events=%d" % int(_calib.get("n_cpu_events", 0)),
-            "profiler_overhead_per_event_ns=%d" % int(
-                _calib.get("profiler_overhead_per_event_ns", 0)
-            ),
-        )
     print("latent_shape:", tuple(output.images.shape))
     print("metadata_json:", metadata_json)
     if metadata_json:

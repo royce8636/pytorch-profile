@@ -1,0 +1,13 @@
+{
+  "graph_id": 12,
+  "launches": [
+    {
+      "compiled_launch_id": 0,
+      "graph_id": 12,
+      "launch_kind": "KernelCallLine",
+      "kernel_name": "triton_poi_fused_mul_sigmoid_0",
+      "original_fxnode_name": ""
+    }
+  ],
+  "compilation_hash": "db89d80ea63bbcab"
+}

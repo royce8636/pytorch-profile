@@ -370,6 +370,9 @@ def build_ws_ops_call(
     evict_vram: list[str] = (),
     evict_vram_names: list[str] = (),
     async_h2d: list[str] = (),
+    xg_async_gids: list[int] = (),
+    xg_async_names: list[str] = (),
+    keep_tensors: list[str] = (),
     evict_dram: list[str] = (),
     flush: bool = False,
 ) -> str | None:
@@ -384,6 +387,34 @@ def build_ws_ops_call(
 
     Returns None if every category is empty and flush=False.
     """
+    # Hot-path bypass: when the call site only uses the C++-native
+    # tensor categories, emit ``torch.ops.ws_rt.ws_ops(...)`` directly
+    # instead of going through the Python facade
+    # ``_ws_rt.ws_ops(...)``. The facade adds ~10 µs of Python frame +
+    # record_function context per call; with ~13k ws_ops calls per
+    # SDXL pipeline (1680 launches × 2 boundaries × 4 steps) that's
+    # ~130 ms of pure dispatch overhead. Direct emission keeps the C++
+    # state behavior identical (same op).
+    can_direct = (
+        not ssd and not cold_start and not cold_start_tensors
+        and not keep_tensors and not cross_graph_evict
+        and not evict_vram_names and not evict_dram
+    )
+    if can_direct and (
+        waits or sync_h2d or evict_vram or async_h2d
+        or xg_async_gids or flush
+    ):
+        waits_lit = "[" + ", ".join(waits) + "]"
+        sync_lit = "[" + ", ".join(sync_h2d) + "]"
+        evict_lit = "[" + ", ".join(evict_vram) + "]"
+        async_lit = "[" + ", ".join(async_h2d) + "]"
+        xg_g_lit = "[" + ", ".join(str(int(g)) for g in xg_async_gids) + "]"
+        xg_n_lit = "[" + ", ".join(repr(n) for n in xg_async_names) + "]"
+        return (
+            f"torch.ops.ws_rt.ws_ops("
+            f"{waits_lit}, {sync_lit}, {evict_lit}, {async_lit}, "
+            f"{xg_g_lit}, {xg_n_lit}, {bool(flush)})"
+        )
     parts: list[str] = []
     if waits:
         parts.append(f"waits={_py_tuple(waits)}")
@@ -395,6 +426,8 @@ def build_ws_ops_call(
         parts.append(f"cold_start={_py_tuple(cold_start, quote=True)}")
     if cold_start_tensors:
         parts.append(f"cold_start_tensors={_py_tuple(cold_start_tensors)}")
+    if keep_tensors:
+        parts.append(f"keep_tensors={_py_tuple(keep_tensors)}")
     if cross_graph_evict:
         parts.append("cross_graph_evict=True")
     if evict_vram:
@@ -403,6 +436,13 @@ def build_ws_ops_call(
         parts.append(f"evict_vram_names={_py_tuple(evict_vram_names, quote=True)}")
     if async_h2d:
         parts.append(f"async_h2d={_py_tuple(async_h2d)}")
+    if xg_async_gids:
+        parts.append(
+            f"xg_async_gids={_py_tuple([str(int(g)) for g in xg_async_gids])}"
+        )
+        parts.append(
+            f"xg_async_names={_py_tuple(list(xg_async_names), quote=True)}"
+        )
     if evict_dram:
         parts.append(f"evict_dram={_py_tuple(evict_dram, quote=True)}")
     if flush:

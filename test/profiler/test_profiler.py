@@ -3105,6 +3105,25 @@ def _load_split_trace_csv_leaf_events():
     return module
 
 
+def _load_parse_profile_results():
+    module_name = "_test_parse_profile_results"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    module_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        "scripts",
+        "parse_profile_results.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_verify_llamasim_bundle():
     module_name = "_test_verify_llamasim_bundle"
     module = sys.modules.get(module_name)
@@ -5571,6 +5590,125 @@ class TestExperimentalUtils(TestCase):
             )
         )
 
+    def test_parse_profile_results_prefers_manifest_and_unprofiled_calibration(self):
+        parser = _load_parse_profile_results()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "profile"
+            bundle_dir = profile_dir / "llama_bundle"
+            bundle_dir.mkdir(parents=True)
+
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "vram_peak_reserved_bytes": 10565812224,
+                        "vram_peak_allocated_bytes": 10485760000,
+                        "node_csv": "runtime_nodes.csv",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._write_csv_rows(
+                bundle_dir / "runtime_nodes.csv",
+                [
+                    "node_id",
+                    "device_type",
+                    "resource_kind",
+                    "node_kind",
+                    "duration_ns",
+                ],
+                [
+                    {
+                        "node_id": "k0",
+                        "device_type": "CPU",
+                        "resource_kind": "cpu_thread",
+                        "node_kind": "cpu_leaf",
+                        "duration_ns": "1000",
+                    },
+                    {
+                        "node_id": "k1",
+                        "device_type": "CPU",
+                        "resource_kind": "cpu_thread",
+                        "node_kind": "cpu_leaf",
+                        "duration_ns": "2000",
+                    },
+                    {
+                        "node_id": "k2",
+                        "device_type": "CUDA",
+                        "resource_kind": "gpu_stream",
+                        "node_kind": "gpu_runtime",
+                        "duration_ns": "5000",
+                    },
+                ],
+            )
+            (bundle_dir / "calibration.json").write_text(
+                json.dumps(
+                    {
+                        "unprofiled_wall_ns": 345367974,
+                        "profiled_wall_ns": 456789123,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (profile_dir / "sdxl_turbo_gpu_inductor_trace.csv").write_text(
+                "\n".join(
+                    [
+                        "event_index,id,name,duration_us",
+                        "0,0,sdxl_turbo_run,999999.0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = parser.summarize_profile(
+                profile_dir,
+                vram_kind="reserved",
+                time_source="auto",
+            )
+
+        self.assertEqual(summary.peak_vram_kb, 10318176)
+        self.assertAlmostEqual(summary.peak_vram_mb, 10076.34, places=2)
+        self.assertAlmostEqual(summary.peak_vram_gb, 9.8402, places=4)
+        self.assertAlmostEqual(summary.e2e_time_us, 345367.974, places=3)
+        self.assertAlmostEqual(summary.e2e_time_ms, 345.368, places=3)
+        self.assertAlmostEqual(summary.e2e_time_s, 0.345368, places=6)
+        self.assertAlmostEqual(summary.cpu_busy_time_us, 3.0, places=4)
+        self.assertAlmostEqual(summary.cpu_busy_time_ms, 0.003, places=6)
+        self.assertAlmostEqual(summary.gpu_busy_time_us, 5.0, places=4)
+        self.assertAlmostEqual(summary.gpu_busy_time_ms, 0.005, places=6)
+
+    def test_parse_profile_results_falls_back_to_trace_csv(self):
+        parser = _load_parse_profile_results()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = Path(tmpdir) / "llama_bundle"
+            bundle_dir.mkdir(parents=True)
+
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps({"vram_peak_reserved_bytes": 2048}),
+                encoding="utf-8",
+            )
+            trace_csv_path = Path(tmpdir) / "sdxl_turbo_gpu_inductor_trace.csv"
+            trace_csv_path.write_text(
+                "\n".join(
+                    [
+                        "event_index,id,name,duration_us",
+                        "0,0,other_event,1.0",
+                        "1,1,sdxl_turbo_run,1234.5",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = parser.summarize_profile(
+                trace_csv_path,
+                vram_kind="reserved",
+                time_source="trace",
+            )
+
+        self.assertEqual(summary.peak_vram_kb, 2)
+        self.assertAlmostEqual(summary.e2e_time_us, 1234.5, places=4)
+        self.assertIsNone(summary.cpu_busy_time_us)
+        self.assertIsNone(summary.gpu_busy_time_us)
+
     def test_qwen_parse_args_defaults(self):
         qwen_profiler = _load_profile_qwen_image_common()
 
@@ -6106,6 +6244,54 @@ class TestExperimentalUtils(TestCase):
 
         self.assertEqual(args.offload_mode, "none")
 
+    def test_accelerate_cpu_offload_accepts_direct_hf_modes(self):
+        runner = _load_run_accelerate_cpu_offload()
+        profiler = _load_profile_accelerate_cpu_offload()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run_accelerate_cpu_offload.py",
+                "sdxl-turbo",
+                "--offload-mode",
+                "module-hook",
+            ],
+        ):
+            run_args = runner.parse_args()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "profile_accelerate_cpu_offload.py",
+                "qwen-image",
+                "--offload-mode",
+                "module",
+                "--fusion",
+                "inductor",
+            ],
+        ):
+            profile_args = profiler.parse_args()
+
+        self.assertEqual(run_args.offload_mode, "module-hook")
+        self.assertEqual(profile_args.offload_mode, "module")
+        self.assertEqual(profile_args.fusion, "inductor")
+
+    def test_output_stem_base_sanitizes_direct_hf_offload_mode(self):
+        runner = _load_run_accelerate_cpu_offload()
+        args = argparse.Namespace(
+            pipeline="sdxl-turbo",
+            offload_mode="module-hook",
+            fusion="inductor",
+            steps=3,
+        )
+
+        self.assertEqual(
+            runner.output_stem_base(args),
+            "sdxl_turbo_module_hook_cpu_offload_inductor_steps3",
+        )
+
     def test_apply_cpu_offload_none_moves_pipeline_to_device_without_hooks(self):
         runner = _load_run_accelerate_cpu_offload()
 
@@ -6134,6 +6320,118 @@ class TestExperimentalUtils(TestCase):
         self.assertEqual(pipe.to_calls, [torch.device("cuda:0")])
         self.assertEqual(pipe.model_calls, 0)
         self.assertEqual(pipe.sequential_calls, 0)
+
+    def test_apply_cpu_offload_module_uses_hf_accelerate_cpu_offload(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        class FakePipe:
+            def __init__(self) -> None:
+                self.unet = torch.nn.Linear(2, 2)
+                self.components = {
+                    "unet": self.unet,
+                    "tokenizer": object(),
+                }
+                self.to_calls = []
+                self.remove_all_hooks_calls = 0
+
+            def to(self, device, **kwargs):
+                self.to_calls.append((device, kwargs))
+                return self
+
+            def remove_all_hooks(self):
+                self.remove_all_hooks_calls += 1
+
+        accelerate_module = type(sys)("accelerate")
+        accelerate_module.cpu_offload = unittest.mock.Mock()
+        pipe = FakePipe()
+        args = argparse.Namespace(offload_mode="module")
+
+        with patch.dict(sys.modules, {"accelerate": accelerate_module}):
+            runner.apply_cpu_offload(pipe, args, torch.device("cuda:0"))
+
+        accelerate_module.cpu_offload.assert_called_once_with(
+            pipe.unet,
+            execution_device=torch.device("cuda:0"),
+            offload_buffers=True,
+        )
+        self.assertEqual(
+            pipe.to_calls,
+            [("cpu", {"silence_dtype_warnings": True})],
+        )
+        self.assertEqual(pipe.remove_all_hooks_calls, 1)
+        self.assertEqual(pipe._offload_device, torch.device("cuda:0"))
+        self.assertEqual(pipe._offload_gpu_id, 0)
+
+    def test_apply_cpu_offload_module_hook_orders_and_frees_hooks(self):
+        runner = _load_run_accelerate_cpu_offload()
+
+        class NamedModule(torch.nn.Module):
+            def __init__(self, name) -> None:
+                super().__init__()
+                self.name = name
+
+        class FakeHook:
+            def __init__(self, name) -> None:
+                self.name = name
+
+            def offload(self) -> None:
+                offload_order.append(self.name)
+
+        class FakePipe:
+            model_cpu_offload_seq = "text_encoder->unet->vae"
+
+            def __init__(self) -> None:
+                self.text_encoder = NamedModule("text_encoder")
+                self.unet = NamedModule("unet")
+                self.vae = NamedModule("vae")
+                self.components = {
+                    "vae": self.vae,
+                    "unet": self.unet,
+                    "text_encoder": self.text_encoder,
+                }
+                self.to_calls = []
+
+            def to(self, device, **kwargs):
+                self.to_calls.append((device, kwargs))
+                return self
+
+            def remove_all_hooks(self):
+                return None
+
+        calls = []
+        offload_order = []
+
+        def cpu_offload_with_hook(module, *, execution_device, prev_module_hook):
+            calls.append(
+                (
+                    module.name,
+                    execution_device,
+                    None if prev_module_hook is None else prev_module_hook.name,
+                )
+            )
+            hook = FakeHook(module.name)
+            return module, hook
+
+        accelerate_module = type(sys)("accelerate")
+        accelerate_module.cpu_offload_with_hook = cpu_offload_with_hook
+        pipe = FakePipe()
+        args = argparse.Namespace(offload_mode="module-hook")
+
+        with patch.dict(sys.modules, {"accelerate": accelerate_module}):
+            runner.apply_cpu_offload(pipe, args, torch.device("cuda:0"))
+
+        self.assertEqual(
+            calls,
+            [
+                ("text_encoder", torch.device("cuda:0"), None),
+                ("unet", torch.device("cuda:0"), "text_encoder"),
+                ("vae", torch.device("cuda:0"), "unet"),
+            ],
+        )
+
+        runner.free_cpu_offload_hooks(pipe)
+
+        self.assertEqual(offload_order, ["vae", "unet", "text_encoder"])
 
     def test_maybe_compile_sdxl_offload_compiles_unet(self):
         runner = _load_run_accelerate_cpu_offload()
@@ -6215,25 +6513,26 @@ class TestExperimentalUtils(TestCase):
             execution_trace=None,
             llamasim_output_dir=None,
             image=None,
+            steps=1,
         )
 
         output_paths = profiler.resolve_output_paths(args)
 
         self.assertEqual(
             os.fspath(output_paths.trace_path),
-            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_trace.json",
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_steps1_profile_trace.json",
         )
         self.assertEqual(
             os.fspath(output_paths.csv_path),
-            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_trace.csv",
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_steps1_profile_trace.csv",
         )
         self.assertEqual(
             os.fspath(output_paths.image_path),
-            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_output.png",
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_steps1_profile_output.png",
         )
         self.assertEqual(
             os.fspath(output_paths.execution_trace_path),
-            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_profile_execution_trace.json",
+            "/tmp/offload_profile/qwen_image_sequential_cpu_offload_steps1_profile_execution_trace.json",
         )
         self.assertEqual(
             os.fspath(output_paths.llamasim_output_dir),
@@ -6287,6 +6586,137 @@ class TestExperimentalUtils(TestCase):
 
         main_mock.assert_called_once()
         self.assertEqual(main_mock.call_args.kwargs["default_fusion"], "inductor")
+
+    def test_profile_sdxl_gpu_proportional_entrypoint_defaults_to_proportional(self):
+        scripts_dir = (
+            Path(__file__).resolve().parents[2] / "scripts"
+        )
+        if os.fspath(scripts_dir) not in sys.path:
+            sys.path.insert(0, os.fspath(scripts_dir))
+        import profile_sdxl_turbo_common as sdxl_common
+
+        with patch.object(sdxl_common, "main", autospec=True) as main_mock:
+            runpy.run_path(
+                os.fspath(scripts_dir / "profile_sdxl_turbo_gpu_proportional.py"),
+                run_name="__main__",
+            )
+
+        main_mock.assert_called_once()
+        self.assertEqual(
+            main_mock.call_args.kwargs["default_calibration_strategy"],
+            "proportional",
+        )
+        self.assertEqual(
+            main_mock.call_args.kwargs["default_output_prefix"],
+            "sdxl_turbo_gpu_proportional",
+        )
+
+    def test_write_calibrated_bundle_proportional_scales_cpu_durations(self):
+        profiler = _load_profile_sdxl_turbo_common()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_dir = root / "llama_bundle"
+            bundle_dir.mkdir()
+            self._write_csv_rows(
+                bundle_dir / "ggml_profile_node_records.csv",
+                [
+                    "node_id",
+                    "device_type",
+                    "resource_kind",
+                    "node_compute_time_ns",
+                ],
+                [
+                    {
+                        "node_id": "0",
+                        "device_type": "CPU",
+                        "resource_kind": "cpu_thread",
+                        "node_compute_time_ns": "90",
+                    },
+                    {
+                        "node_id": "1",
+                        "device_type": "CPU",
+                        "resource_kind": "cpu_thread",
+                        "node_compute_time_ns": "10",
+                    },
+                    {
+                        "node_id": "2",
+                        "device_type": "CUDA",
+                        "resource_kind": "gpu",
+                        "node_compute_time_ns": "60",
+                    },
+                ],
+            )
+            self._write_csv_rows(
+                bundle_dir / "runtime_nodes.csv",
+                [
+                    "node_id",
+                    "device_type",
+                    "resource_kind",
+                    "duration_ns",
+                ],
+                [
+                    {
+                        "node_id": "0",
+                        "device_type": "CPU",
+                        "resource_kind": "cpu_thread",
+                        "duration_ns": "90",
+                    },
+                    {
+                        "node_id": "1",
+                        "device_type": "CPU",
+                        "resource_kind": "cpu_thread",
+                        "duration_ns": "10",
+                    },
+                    {
+                        "node_id": "2",
+                        "device_type": "CUDA",
+                        "resource_kind": "gpu",
+                        "duration_ns": "60",
+                    },
+                ],
+            )
+            trace_path = root / "trace.json"
+            trace_path.write_text(
+                json.dumps(
+                    {
+                        "traceEvents": [
+                            {"ph": "X", "cat": "cpu_op"},
+                            {"ph": "X", "cat": "cpu_op"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            calibrated_dir = profiler.write_calibrated_bundle(
+                bundle_dir=bundle_dir,
+                trace_json_path=trace_path,
+                unprofiled_wall_ns=100,
+                profiled_wall_ns=160,
+                calibration_strategy="proportional",
+            )
+
+            self.assertIsNotNone(calibrated_dir)
+            assert calibrated_dir is not None
+            with (calibrated_dir / "ggml_profile_node_records.csv").open() as f:
+                rows = list(csv.DictReader(f))
+            durations = [int(row["node_compute_time_ns"]) for row in rows]
+            self.assertEqual(durations, [36, 4, 60])
+            self.assertEqual(sum(durations), 100)
+            with (calibrated_dir / "runtime_nodes.csv").open() as f:
+                runtime_rows = list(csv.DictReader(f))
+            runtime_durations = [
+                int(row["duration_ns"]) for row in runtime_rows
+            ]
+            self.assertEqual(runtime_durations, [36, 4, 60])
+            with (calibrated_dir / "calibration.json").open() as f:
+                calibration = json.load(f)
+            self.assertEqual(calibration["calibration_strategy"], "proportional")
+            self.assertAlmostEqual(calibration["duration_scale"], 0.4)
+            self.assertEqual(calibration["profiled_duration_sum_ns"], 160)
+            self.assertEqual(calibration["calibrated_duration_sum_ns"], 100)
+            self.assertEqual(calibration["profiled_cpu_duration_sum_ns"], 100)
+            self.assertEqual(calibration["calibrated_cpu_duration_sum_ns"], 40)
 
     def test_profile_sdxl_base_gpu_entrypoint_uses_base_defaults(self):
         scripts_dir = (

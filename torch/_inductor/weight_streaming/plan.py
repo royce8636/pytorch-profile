@@ -75,6 +75,10 @@ class H2DPrefetchOp:
     # when ``required_start`` from the backward-ALAP pass falls before
     # the tensor's own graph's earliest launch.
     issue_compiled_graph_id: int = -1
+    # Per-iter mask for partial schedules. Empty list = fire on every iter
+    # (legacy / full-evict semantic). Non-empty = fire only on iter indices
+    # in this list (0-indexed within the consumer graph's iter counter).
+    iter_mask: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +91,9 @@ class EvictVramOp:
     graph_input_name: str = ""  # stable identifier across compiles
     compiled_graph_id: int = -1  # -1 = any graph; >= 0 = only this graph
     compilation_hash: str = ""  # hash of the graph this op belongs to
+    # Per-iter mask for partial schedules (same semantics as
+    # H2DPrefetchOp.iter_mask). Empty = fire every iter.
+    iter_mask: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -118,6 +125,10 @@ class IOSchedule:
     cold_starts: list[ColdStartOp] = field(default_factory=list)
     tensors: dict[str, TensorEntry] = field(default_factory=dict)
     compilation_hash: str = ""
+    # Per-graph multiplicity (number of times each graph runs per pipeline
+    # call). Indexed by compile_position. Default 1 for absent entries.
+    # Used by the wrapper to size per-iter masks for partial schedules.
+    graph_multiplicity: dict[int, int] = field(default_factory=dict)
 
 
 def _load_tensors_csv(path: str) -> dict[str, TensorEntry]:
@@ -205,9 +216,11 @@ def load_io_schedule(
                 graph_input_name=op.get("compiled_graph_input_name", ""),
                 compiled_graph_id=op.get("compiled_graph_id", -1),
                 compilation_hash=op.get("compilation_hash", ""),
-                cross_iter=op.get("reason") == "h2d_cross_iter_reload",
+                cross_iter=bool(op.get("cross_iter", False))
+                or op.get("reason") == "h2d_cross_iter_reload",
                 trusted_async=bool(op.get("trusted_async", False)),
                 issue_compiled_graph_id=int(op.get("issue_compiled_graph_id", -1)),
+                iter_mask=[int(x) for x in op.get("iter_mask", [])],
             ))
         elif op_type == "vram_evict_d2h":
             evict_vram_ops.append(EvictVramOp(
@@ -218,6 +231,7 @@ def load_io_schedule(
                 graph_input_name=op.get("compiled_graph_input_name", ""),
                 compiled_graph_id=op.get("compiled_graph_id", -1),
                 compilation_hash=op.get("compilation_hash", ""),
+                iter_mask=[int(x) for x in op.get("iter_mask", [])],
             ))
 
     evict_dram_ops: list[EvictDramOp] = []
@@ -270,6 +284,9 @@ def load_io_schedule(
         h2d_prefetches = [op for op in h2d_prefetches if _is_weight(op.tensor_name)]
         evict_vram_ops = [op for op in evict_vram_ops if _is_weight(op.tensor_name)]
 
+    summary = data.get("summary", {}) or {}
+    raw_mult = summary.get("graph_multiplicity", {}) or {}
+    graph_multiplicity = {int(k): int(v) for k, v in raw_mult.items()}
     return IOSchedule(
         nodes=nodes,
         prefetches=prefetches,
@@ -279,4 +296,5 @@ def load_io_schedule(
         cold_starts=cold_starts,
         tensors=tensors,
         compilation_hash=data.get("compilation_hash", ""),
+        graph_multiplicity=graph_multiplicity,
     )

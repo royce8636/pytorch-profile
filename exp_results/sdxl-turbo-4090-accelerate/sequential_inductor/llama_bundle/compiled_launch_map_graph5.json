@@ -1,0 +1,13 @@
+{
+  "graph_id": 5,
+  "launches": [
+    {
+      "compiled_launch_id": 0,
+      "graph_id": 5,
+      "launch_kind": "KernelCallLine",
+      "kernel_name": "triton_poi_fused__to_copy_add_arange_full_lt_masked_fill_view_0",
+      "original_fxnode_name": ""
+    }
+  ],
+  "compilation_hash": "a7e7c289857e745c"
+}

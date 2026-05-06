@@ -1,0 +1,20 @@
+{
+  "graph_id": 3,
+  "tensors": [
+    {
+      "compiled_tensor_id": 0,
+      "graph_input_name": "arg0_1",
+      "graph_input_idx": 0,
+      "dtype": "torch.float16",
+      "shape": [
+        "77",
+        "768"
+      ],
+      "storage_group_id": 136958650182272,
+      "used_by_launch_ids": [
+        0
+      ]
+    }
+  ],
+  "compilation_hash": "59dade01615456b8"
+}

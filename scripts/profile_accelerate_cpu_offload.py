@@ -101,7 +101,7 @@ def add_profile_args(parser: argparse.ArgumentParser) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Profile SDXL-Turbo or Qwen-Image with Diffusers Accelerate CPU offload. "
+            "Profile SDXL-Turbo or Qwen-Image with HF Accelerate CPU offload. "
             "Profiling starts only after load and unprofiled warmup, so checkpoint "
             "I/O is excluded from the trace."
         )
@@ -267,6 +267,11 @@ def main() -> None:
     args = parse_args()
     device = offload_common.validate_run_device(args.device)
     sdxl_common.validate_fusion_runtime(args, device)
+    accelerate_version = (
+        offload_common.ensure_accelerate_available()
+        if args.offload_mode != "none"
+        else "not_used"
+    )
     torch_dtype = sdxl_common.DTYPE_BY_NAME[args.dtype]
     output_paths = resolve_output_paths(args)
 
@@ -323,7 +328,7 @@ def main() -> None:
         output_paths.llamasim_output_dir,
         trace_json_path=output_paths.trace_path,
     )
-    pipe.maybe_free_model_hooks()
+    offload_common.free_cpu_offload_hooks(pipe)
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
     print("pipeline:", args.pipeline)
@@ -331,6 +336,7 @@ def main() -> None:
     print("dtype:", args.dtype)
     print("offload_mode:", args.offload_mode)
     print("fusion:", args.fusion)
+    print("accelerate_version:", accelerate_version)
     print("warmup_runs:", args.warmup_runs)
     print("trace_path:", output_paths.trace_path)
     if hasattr(prof, "export_csv"):

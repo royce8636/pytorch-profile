@@ -1,0 +1,13 @@
+{
+  "graph_id": 73,
+  "launches": [
+    {
+      "compiled_launch_id": 0,
+      "graph_id": 73,
+      "launch_kind": "KernelCallLine",
+      "kernel_name": "triton_poi_fused_add_div_transpose_view_0",
+      "original_fxnode_name": ""
+    }
+  ],
+  "compilation_hash": "7b268ed0231006fe"
+}

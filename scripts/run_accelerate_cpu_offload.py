@@ -18,6 +18,10 @@ import profile_qwen_image_common as qwen_common  # noqa: E402
 import profile_sdxl_turbo_common as sdxl_common  # noqa: E402
 
 
+OFFLOAD_MODES = ("none", "model", "sequential", "module", "module-hook")
+_DIRECT_HF_ACCELERATE_HOOKS_ATTR = "_direct_hf_accelerate_cpu_offload_hooks"
+
+
 def add_common_args(
     parser: argparse.ArgumentParser,
     *,
@@ -86,12 +90,15 @@ def add_common_args(
     )
     parser.add_argument(
         "--offload-mode",
-        choices=("none", "model", "sequential"),
+        choices=OFFLOAD_MODES,
         default=default_offload_mode,
         help=(
             "Execution mode. 'none' keeps the full pipeline on the accelerator without "
-            "Accelerate offload hooks, 'model' keeps one whole model on the accelerator at a "
-            "time, and 'sequential' minimizes memory further at the cost of more transfers."
+            "Accelerate offload hooks, 'model' uses Diffusers enable_model_cpu_offload, "
+            "'sequential' uses Diffusers enable_sequential_cpu_offload, 'module' applies "
+            "HF Accelerate cpu_offload directly to each pipeline module, and "
+            "'module-hook' applies HF Accelerate cpu_offload_with_hook directly to the "
+            "pipeline module sequence."
         ),
     )
     parser.add_argument(
@@ -120,7 +127,7 @@ def add_common_args(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run SDXL-Turbo or Qwen-Image with Diffusers Accelerate CPU offload so the "
+            "Run SDXL-Turbo or Qwen-Image with HF Accelerate CPU offload so the "
             "pipeline can exceed GPU VRAM."
         )
     )
@@ -188,7 +195,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def output_stem_base(args: argparse.Namespace) -> str:
-    stem = f"{args.pipeline.replace('-', '_')}_{args.offload_mode}_cpu_offload"
+    pipeline = args.pipeline.replace("-", "_")
+    offload_mode = args.offload_mode.replace("-", "_")
+    stem = f"{pipeline}_{offload_mode}_cpu_offload"
     if args.fusion != "none":
         stem = f"{stem}_{args.fusion}"
     return f"{stem}_steps{args.steps}"
@@ -227,7 +236,8 @@ def ensure_accelerate_available() -> str:
         import accelerate
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "This runner requires `accelerate` because it uses Diffusers CPU offload hooks."
+            "This runner requires `accelerate` because it uses HF Accelerate CPU "
+            "offload hooks."
         ) from exc
     version = getattr(accelerate, "__version__", None)
     return version if isinstance(version, str) else "unknown"
@@ -242,6 +252,125 @@ def maybe_compile(pipe: Any, args: argparse.Namespace) -> None:
     qwen_common.maybe_compile(pipe, args)
 
 
+def pipeline_module_components(pipe: Any) -> dict[str, torch.nn.Module]:
+    components = getattr(pipe, "components", None)
+    if isinstance(components, dict):
+        modules = {
+            name: module
+            for name, module in components.items()
+            if isinstance(module, torch.nn.Module)
+        }
+        if modules:
+            return modules
+
+    modules = {}
+    for name in ("text_encoder", "text_encoder_2", "unet", "transformer", "vae"):
+        module = getattr(pipe, name, None)
+        if isinstance(module, torch.nn.Module):
+            modules[name] = module
+    return modules
+
+
+def _pipeline_to(pipe: Any, device: str | torch.device) -> None:
+    if not hasattr(pipe, "to"):
+        return
+    try:
+        pipe.to(device, silence_dtype_warnings=True)
+    except TypeError:
+        pipe.to(device)
+
+
+def _prepare_direct_hf_accelerate_offload(pipe: Any, device: torch.device) -> None:
+    if hasattr(pipe, "remove_all_hooks"):
+        pipe.remove_all_hooks()
+    setattr(pipe, _DIRECT_HF_ACCELERATE_HOOKS_ATTR, [])
+    _pipeline_to(pipe, "cpu")
+    setattr(pipe, "_offload_device", device)
+    if device.index is not None:
+        setattr(pipe, "_offload_gpu_id", device.index)
+
+
+def _excluded_cpu_offload_components(pipe: Any) -> set[str]:
+    excluded = getattr(pipe, "_exclude_from_cpu_offload", ())
+    return set(excluded or ())
+
+
+def _offload_buffers_for_module(module: torch.nn.Module) -> bool:
+    return len(getattr(module, "_parameters", {})) > 0
+
+
+def apply_accelerate_module_cpu_offload(
+    pipe: Any,
+    device: torch.device,
+) -> None:
+    from accelerate import cpu_offload
+
+    _prepare_direct_hf_accelerate_offload(pipe, device)
+    components = pipeline_module_components(pipe)
+    if not components:
+        raise RuntimeError(
+            "Could not find any torch.nn.Module pipeline components for "
+            "--offload-mode module."
+        )
+
+    excluded = _excluded_cpu_offload_components(pipe)
+    for name, module in components.items():
+        if name in excluded:
+            module.to(device)
+            continue
+        cpu_offload(
+            module,
+            execution_device=device,
+            offload_buffers=_offload_buffers_for_module(module),
+        )
+
+
+def _ordered_hook_offload_components(
+    pipe: Any,
+    components: dict[str, torch.nn.Module],
+) -> list[tuple[str, torch.nn.Module]]:
+    remaining = dict(components)
+    ordered: list[tuple[str, torch.nn.Module]] = []
+    sequence = getattr(pipe, "model_cpu_offload_seq", None)
+    if isinstance(sequence, str):
+        for name in sequence.split("->"):
+            module = remaining.pop(name, None)
+            if module is not None:
+                ordered.append((name, module))
+    ordered.extend(remaining.items())
+    return ordered
+
+
+def apply_accelerate_module_hook_cpu_offload(
+    pipe: Any,
+    device: torch.device,
+) -> None:
+    from accelerate import cpu_offload_with_hook
+
+    _prepare_direct_hf_accelerate_offload(pipe, device)
+    components = pipeline_module_components(pipe)
+    if not components:
+        raise RuntimeError(
+            "Could not find any torch.nn.Module pipeline components for "
+            "--offload-mode module-hook."
+        )
+
+    excluded = _excluded_cpu_offload_components(pipe)
+    hooks = []
+    prev_hook = None
+    for name, module in _ordered_hook_offload_components(pipe, components):
+        if name in excluded:
+            module.to(device)
+            continue
+        _, prev_hook = cpu_offload_with_hook(
+            module,
+            execution_device=device,
+            prev_module_hook=prev_hook,
+        )
+        hooks.append(prev_hook)
+    setattr(pipe, _DIRECT_HF_ACCELERATE_HOOKS_ATTR, hooks)
+
+
 def apply_cpu_offload(pipe: Any, args: argparse.Namespace, device: torch.device) -> None:
     if args.offload_mode == "none":
         pipe.to(device)
@@ -249,7 +378,24 @@ def apply_cpu_offload(pipe: Any, args: argparse.Namespace, device: torch.device)
     if args.offload_mode == "model":
         pipe.enable_model_cpu_offload(device=device)
         return
-    pipe.enable_sequential_cpu_offload(device=device)
+    if args.offload_mode == "sequential":
+        pipe.enable_sequential_cpu_offload(device=device)
+        return
+    if args.offload_mode == "module":
+        apply_accelerate_module_cpu_offload(pipe, device)
+        return
+    apply_accelerate_module_hook_cpu_offload(pipe, device)
+
+
+def free_cpu_offload_hooks(pipe: Any) -> None:
+    hooks = getattr(pipe, _DIRECT_HF_ACCELERATE_HOOKS_ATTR, ())
+    for hook in reversed(hooks or ()):
+        offload = getattr(hook, "offload", None)
+        if offload is not None:
+            offload()
+    setattr(pipe, _DIRECT_HF_ACCELERATE_HOOKS_ATTR, [])
+    if hasattr(pipe, "maybe_free_model_hooks"):
+        pipe.maybe_free_model_hooks()
 
 
 def format_qwen_model_offload_oom_error(
@@ -496,7 +642,7 @@ def main() -> None:
     output, inference_seconds = run_inference(pipe, args, device, generator)
     images, decode_seconds = decode_images(pipe, args, output, device)
 
-    pipe.maybe_free_model_hooks()
+    free_cpu_offload_hooks(pipe)
 
     save_start = time.perf_counter()
     images[0].save(image_path)

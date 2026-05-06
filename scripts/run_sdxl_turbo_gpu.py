@@ -27,7 +27,7 @@ from profile_sdxl_turbo_common import (  # noqa: E402
 
 def parse_args(
     *,
-    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_model: str | None = "/data/llamasim/models/sdxl-turbo",
     default_output_prefix: str = "sdxl_turbo_gpu_run",
     description: str = "Run SDXL Turbo on GPU without profiler instrumentation.",
 ) -> argparse.Namespace:
@@ -36,6 +36,7 @@ def parse_args(
     )
     parser.add_argument(
         "--model",
+        required=default_model is None,
         default=default_model,
         help="Path to the SDXL model directory.",
     )
@@ -112,11 +113,15 @@ def parse_args(
         help="Path for the generated PNG. Defaults to /tmp or --output-dir.",
     )
     parser.add_argument(
+        "--output-prefix",
+        default=default_output_prefix,
+        help="Prefix used for generated output filenames.",
+    )
+    parser.add_argument(
         "--disable-progress-bar",
         action="store_true",
         help="Disable diffusers progress output.",
     )
-    parser.set_defaults(output_prefix=default_output_prefix)
     return parser.parse_args()
 
 
@@ -165,7 +170,7 @@ def validate_run_device(device_name: str) -> torch.device:
 
 def main(
     *,
-    default_model: str = "/data/llamasim/models/sdxl-turbo",
+    default_model: str | None = "/data/llamasim/models/sdxl-turbo",
     default_output_prefix: str = "sdxl_turbo_gpu_run",
     description: str = "Run SDXL Turbo on GPU without profiler instrumentation.",
 ) -> None:
@@ -192,9 +197,14 @@ def main(
     synchronize_device(device)
     load_seconds = elapsed_seconds(load_start)
 
+    # Warmup mirrors profile_sdxl_turbo_gpu.py: each pass runs the pipe
+    # AND VAE decode so the timed window measures steady-state rather
+    # than first-call VAE compile/autotune.
     warmup_start = time.perf_counter()
     for _ in range(warmup_runs):
         warmup_output = run_pipeline(pipe, args)
+        with torch.no_grad():
+            _ = decode_latents_to_pil(pipe, warmup_output.images)
         synchronize_device(device)
         del warmup_output
     warmup_seconds = elapsed_seconds(warmup_start)
@@ -202,16 +212,13 @@ def main(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    synchronize_device(device)
     inference_start = time.perf_counter()
     output = run_pipeline(pipe, args)
-    synchronize_device(device)
-    inference_seconds = elapsed_seconds(inference_start)
-
-    decode_start = time.perf_counter()
     with torch.no_grad():
         images = decode_latents_to_pil(pipe, output.images)
     synchronize_device(device)
-    decode_seconds = elapsed_seconds(decode_start)
+    inference_seconds = elapsed_seconds(inference_start)
 
     save_start = time.perf_counter()
     images[0].save(image_path)
@@ -233,7 +240,6 @@ def main(
     print(f"load_seconds: {load_seconds:.6f}")
     print(f"warmup_seconds: {warmup_seconds:.6f}")
     print(f"inference_seconds: {inference_seconds:.6f}")
-    print(f"decode_seconds: {decode_seconds:.6f}")
     print(f"save_seconds: {save_seconds:.6f}")
     print(f"e2e_seconds: {e2e_seconds:.6f}")
 

@@ -83,21 +83,24 @@ VARIANT_MODULES = {
 # the compile sidecars (launch_map, tensor_map), and emit a schedule in the
 # same JSON schema as the legacy variants.
 CGSIM_VARIANT_MODULES = {
-    "cgsim_belady": "graph_modifiers.ct_belady_pcie.scheduler",
-    "cgsim_maxbytes": "graph_modifiers.ct_maxbytes.scheduler",
-    "cgsim_steady_state": "graph_modifiers.ct_steady_state.scheduler",
-    "cgsim_spread_cycle": "graph_modifiers.ct_spread_cycle.scheduler",
-    "cgsim_multigraph": "graph_modifiers.ct_multigraph.scheduler",
-    "cgsim_graph_swap": "graph_modifiers.ct_graph_swap.scheduler",
-    "cgsim_graph_swap_noevict": "graph_modifiers.ct_graph_swap.scheduler",
+    # Older schedulers moved into graph_modifiers/old/ during cleanup; they
+    # still work against the same MultiGraphSidecars input.
+    "cgsim_belady": "graph_modifiers.old.ct_belady_pcie.scheduler",
+    "cgsim_maxbytes": "graph_modifiers.old.ct_maxbytes.scheduler",
+    "cgsim_steady_state": "graph_modifiers.old.ct_steady_state.scheduler",
+    "cgsim_spread_cycle": "graph_modifiers.old.ct_spread_cycle.scheduler",
+    "cgsim_multigraph": "graph_modifiers.old.ct_multigraph.scheduler",
+    "cgsim_graph_swap": "graph_modifiers.old.ct_graph_swap.scheduler",
+    "cgsim_graph_swap_noevict": "graph_modifiers.old.ct_graph_swap.scheduler",
     # Cross-graph algorithmic schedulers (multi-graph, non-heuristic).
-    "cgsim_belady_multigraph": "graph_modifiers.ct_belady_multigraph.scheduler",
-    "cgsim_rcpsp": "graph_modifiers.ct_rcpsp.scheduler",
-    "cgsim_mincost_flow": "graph_modifiers.ct_mincost_flow.scheduler",
-    "cgsim_milp_aggregate": "graph_modifiers.ct_milp_aggregate.scheduler",
-    "cgsim_milp_aggregate_duplex": "graph_modifiers.ct_milp_aggregate.scheduler",
+    "cgsim_belady_multigraph": "graph_modifiers.old.ct_belady_multigraph.scheduler",
+    "cgsim_rcpsp": "graph_modifiers.old.ct_rcpsp.scheduler",
+    "cgsim_mincost_flow": "graph_modifiers.old.ct_mincost_flow.scheduler",
+    "cgsim_milp_aggregate": "graph_modifiers.old.ct_milp_aggregate.scheduler",
+    "cgsim_milp_aggregate_duplex": "graph_modifiers.old.ct_milp_aggregate.scheduler",
     "cgsim_milp_oracle": "graph_modifiers.ct_milp_oracle.scheduler",
     "cgsim_milp_oracle_duplex": "graph_modifiers.ct_milp_oracle.scheduler",
+    "cgsim_milp_oracle_old": "graph_modifiers.old.ct_milp_oracle.scheduler",
 }
 
 
@@ -144,6 +147,14 @@ def load_pipeline(model: str, dtype: torch.dtype, device: torch.device):
 
 
 def run_pipeline(pipe, args):
+    # reduce-overhead (CUDA Graph) mode: each Inductor sub-module keeps
+    # a single captured-output buffer that gets OVERWRITTEN on the next
+    # replay. Downstream (e.g., torch.concat of CLIP + CLIP2 outputs in
+    # encode_prompt) reads those outputs AFTER both captures have run →
+    # the first capture's output is gone. Mark a step begin so the
+    # runtime snapshot-copies outputs across boundaries.
+    if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+        torch.compiler.cudagraph_mark_step_begin()
     return pipe(
         prompt=args.prompt,
         num_inference_steps=args.steps,
@@ -277,6 +288,7 @@ def _stage_schedule_cgsim(args, bundle_dir: Path) -> Path:
         "cgsim_belady_multigraph", "cgsim_rcpsp", "cgsim_mincost_flow",
         "cgsim_milp_aggregate", "cgsim_milp_aggregate_duplex",
         "cgsim_milp_oracle", "cgsim_milp_oracle_duplex",
+        "cgsim_milp_oracle_old",
     )
     if args.variant in _MULTIGRAPH_VARIANTS:
         sidecars = load_multi_graph_sidecars(str(bundle_dir))
@@ -291,6 +303,26 @@ def _stage_schedule_cgsim(args, bundle_dir: Path) -> Path:
             kwargs["alpha"] = args.alpha
         if args.variant in ("cgsim_milp_aggregate_duplex", "cgsim_milp_oracle_duplex"):
             kwargs["duplex"] = True
+        # Per-graph multiplicity (per pipeline call): UNet runs once per
+        # diffusion step. Diffusers concatenates cond+uncond into a SINGLE
+        # batched UNet call when CFG is on (guidance_scale > 1.0), so the
+        # wrapper is invoked once per step regardless of CFG. TEs/VAE
+        # once each.  compile_pos = (TE1=0, TE2=1, UNet=2, VAE=3).
+        # Multiplicity matters for ct_milp_oracle's per-iter byte budget
+        # (iter_compute_ns = total / multiplicity) and for the cross-iter
+        # wrap heuristic.  The previous `2 * args.steps` was wrong: it
+        # double-counted CFG which doesn't actually translate to more
+        # wrapper invocations. Trace evidence: lid 907 (graph 2) has 4
+        # GPU events per pipeline call at --steps=4, not 8.
+        if args.variant in (
+            "cgsim_milp_oracle", "cgsim_milp_oracle_duplex",
+            "cgsim_milp_oracle_old",
+        ):
+            kwargs["graph_multiplicity"] = {0: 1, 1: 1, 2: args.steps, 3: 1}
+            import os as _os_local
+            sbpg = _os_local.environ.get("CT_MILP_SUB_BUCKETS")
+            if sbpg:
+                kwargs["sub_buckets_per_graph"] = int(sbpg)
         result = mod.solve(
             trace,
             sidecars=sidecars,
@@ -344,6 +376,12 @@ def stage_run(
         os.environ["TORCH_WS_DISABLE_SAFETY_NET"] = "1"
 
     iconfig.weight_streaming_plan = str(schedule_path)
+    # Launch markers (record_function around every kernel) were on for
+    # the profile stage to capture per-launch trace events. They cost
+    # ~7 µs per kernel — ~80 ms per pipeline call on SDXL UNet's
+    # ~11k kernel-launches per pipeline. Turn off for the timed run.
+    iconfig.weight_streaming_emit_launch_markers = False
+    iconfig.weight_streaming_emit_sync_markers = False
     nodes_csv = bundle_dir / "runtime_nodes.csv"
     tensor_csv = bundle_dir / "pytorch_runtime_tensors.csv"
     if nodes_csv.exists():
@@ -416,6 +454,12 @@ def stage_run(
     # Timed run with peak tracking.
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+        # Reset diagnostic counters so wait stats reflect ONLY the
+        # timed run, not warmup's bootstrap (which has unavoidable
+        # iter-0 misses before any cross-graph issuer has registered
+        # the consumer's tensors).
+        if hasattr(torch.ops.ws_rt, "get_wait_stats"):
+            torch.ops.ws_rt.get_wait_stats()
     print("→ timed inference run ...")
     t0 = time.perf_counter()
     output = run_pipeline(pipe, args)
@@ -536,6 +580,23 @@ def main():
         cpp = getattr(_rt, "_ws_cpp_hits", 0)
         py = getattr(_rt, "_ws_py_hits", 0)
         print(f"ws_dispatch    : cpp={cpp} python={py}")
+        if hasattr(torch.ops.ws_rt, "get_wait_stats"):
+            stats = torch.ops.ws_rt.get_wait_stats()
+            print(
+                f"ws_wait_stats  : hit={stats[0]} miss_synced={stats[1]} "
+                f"miss_resident={stats[2]} fire_async={stats[3]} "
+                f"fire_skip_inflight={stats[4]} "
+                f"fire_skip_resident={stats[5]}"
+            )
+            if len(stats) >= 9:
+                print(
+                    f"ws_xg_stats    : dispatched={stats[6]} "
+                    f"named_miss={stats[7]} rw_miss={stats[8]}"
+                )
+            if hasattr(torch.ops.ws_rt, "drain_stall_us"):
+                stall_us = int(torch.ops.ws_rt.drain_stall_us())
+                if stall_us > 0:
+                    print(f"ws_stall_ms    : {stall_us / 1000.0:.3f}")
     WeightStreamRuntime.reset()
 
 

@@ -25,13 +25,14 @@ from profile_llama_common import (  # noqa: E402
 
 def parse_args(
     *,
-    default_model: str,
+    default_model: str | None,
     default_output_prefix: str,
     description: str,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--model",
+        required=default_model is None,
         default=default_model,
         help="HuggingFace hub id or local path to the Llama checkpoint.",
     )
@@ -121,11 +122,15 @@ def parse_args(
         help="Directory for the generated text file.",
     )
     parser.add_argument(
+        "--output-prefix",
+        default=default_output_prefix,
+        help="Prefix used for generated output filenames.",
+    )
+    parser.add_argument(
         "--text-output",
         default=None,
         help="Path for the generated text. Defaults to /tmp or --output-dir.",
     )
-    parser.set_defaults(output_prefix=default_output_prefix)
     return parser.parse_args()
 
 
@@ -201,7 +206,7 @@ def validate_fusion_runtime(args: argparse.Namespace, device: torch.device) -> N
 
 def main(
     *,
-    default_model: str = "meta-llama/Llama-3.2-3B",
+    default_model: str | None = "meta-llama/Llama-3.2-3B",
     default_output_prefix: str = "llama_3b_gpu_run",
     description: str = "Run Llama on GPU without profiler instrumentation.",
 ) -> None:

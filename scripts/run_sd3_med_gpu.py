@@ -29,13 +29,15 @@ from profile_sdxl_turbo_common import (  # noqa: E402
 
 def parse_args(
     *,
-    default_model: str,
+    default_model: str | None,
     default_output_prefix: str,
     description: str,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
-        "--model", default=default_model,
+        "--model",
+        required=default_model is None,
+        default=default_model,
         help="Path to the SD3.5 model directory.",
     )
     parser.add_argument("--prompt", default="a lovely cat")
@@ -73,7 +75,11 @@ def parse_args(
         action="store_true",
         help="Enable diffusers CPU offload (required for sd-3.5-large on 24 GB GPUs).",
     )
-    parser.set_defaults(output_prefix=default_output_prefix)
+    parser.add_argument(
+        "--output-prefix",
+        default=default_output_prefix,
+        help="Prefix used for generated output filenames.",
+    )
     return parser.parse_args()
 
 
@@ -127,7 +133,7 @@ def validate_run_device(device_name: str) -> torch.device:
 
 def main(
     *,
-    default_model: str = "/data/llamasim/models/sd-3.5-med",
+    default_model: str | None = "/data/llamasim/models/sd-3.5-med",
     default_output_prefix: str = "sd3_med_gpu_run",
     description: str = "Run SD 3.5 medium on GPU without profiler instrumentation.",
 ) -> None:

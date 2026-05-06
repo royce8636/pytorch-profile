@@ -1,0 +1,13 @@
+{
+  "graph_id": 66,
+  "launches": [
+    {
+      "compiled_launch_id": 0,
+      "graph_id": 66,
+      "launch_kind": "KernelCallLine",
+      "kernel_name": "triton_poi_fused__to_copy__unsafe_index_add_arange_unsqueeze_0",
+      "original_fxnode_name": ""
+    }
+  ],
+  "compilation_hash": "c75e16edbed46c47"
+}

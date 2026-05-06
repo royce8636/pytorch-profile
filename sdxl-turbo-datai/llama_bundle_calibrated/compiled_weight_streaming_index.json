@@ -1,0 +1,34 @@
+{
+  "graphs": [
+    {
+      "graph_id": 0,
+      "launch_map": "compiled_launch_map_graph0.json",
+      "tensor_map": "compiled_tensor_map_graph0.json",
+      "compilation_hash": "15e116d6015d3c1a"
+    },
+    {
+      "graph_id": 1,
+      "launch_map": "compiled_launch_map_graph1.json",
+      "tensor_map": "compiled_tensor_map_graph1.json",
+      "compilation_hash": "a2170c6d1821fa24"
+    },
+    {
+      "graph_id": 2,
+      "launch_map": "compiled_launch_map_graph2.json",
+      "tensor_map": "compiled_tensor_map_graph2.json",
+      "compilation_hash": "cf193d2cdf923fcd"
+    },
+    {
+      "graph_id": 3,
+      "launch_map": "compiled_launch_map_graph3.json",
+      "tensor_map": "compiled_tensor_map_graph3.json",
+      "compilation_hash": "db6dbb5959914fb4"
+    },
+    {
+      "graph_id": 4,
+      "launch_map": "compiled_launch_map_graph4.json",
+      "tensor_map": "compiled_tensor_map_graph4.json",
+      "compilation_hash": "ae7f5b32064b0a78"
+    }
+  ]
+}

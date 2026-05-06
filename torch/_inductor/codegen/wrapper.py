@@ -2317,10 +2317,38 @@ class PythonWrapperCodegen(CodeGen):
 
         Returns (id_to_input_name, sidecar_entries).  Both sidecar emission
         and schedule injection call this so the ID assignment is identical.
+
+        Each entry now carries a ``storage_group_id``: a stable handle for
+        the underlying storage of the compile-time graph input, derived
+        from ``id(example_inputs[idx].untyped_storage())``.  Two ctids
+        that point at the same storage receive the same group id, which
+        downstream tools (cg-sim's scheduler) use to recognize
+        compile-graph aliases as one schedulable unit.  Inputs whose
+        storage isn't determinable at compile time emit ``None`` /
+        absent — consumers must treat that as a singleton group.
         """
         from torch._inductor.ir import TensorBox
 
         static_idxs = set(getattr(V.graph, "static_input_idxs", ()))
+        example_inputs = getattr(V.graph, "example_inputs", None)
+
+        def _resolve_storage_group_id(input_idx: int) -> object:
+            """id(untyped_storage()) of the example input at this idx, or
+            None if unavailable.  Stable within one compile process; what
+            matters is that two aliased ctids in the same graph emit the
+            same value."""
+            if example_inputs is None or input_idx >= len(example_inputs):
+                return None
+            inp_t = example_inputs[input_idx]
+            if not isinstance(inp_t, torch.Tensor):
+                return None
+            try:
+                return int(id(inp_t.untyped_storage()))
+            except (RuntimeError, AttributeError):
+                # FakeTensor without a storage backing or similar — leave
+                # as None so the consumer treats this ctid as a singleton.
+                return None
+
         id_to_name: dict[int, str] = {}
         entries: list[dict] = []
         tid = 0
@@ -2340,6 +2368,7 @@ class PythonWrapperCodegen(CodeGen):
                     "graph_input_idx": idx,
                     "dtype": str(layout.dtype),
                     "shape": [str(s) for s in layout.size],
+                    "storage_group_id": _resolve_storage_group_id(idx),
                 }
             )
             tid += 1
@@ -2802,14 +2831,101 @@ class PythonWrapperCodegen(CodeGen):
         new_lines: list = []
 
         if stable_tensor_refs:
-            new_lines.append(
-                WeightStreamingLine(
-                    wrapper=self,
-                    calls=[
-                        f"{alias} = {tensor_id_to_input[tid]}"
-                        for tid, alias in sorted(stable_tensor_refs.items())
-                    ],
+            alias_lines = [
+                f"{alias} = {tensor_id_to_input[tid]}"
+                for tid, alias in sorted(stable_tensor_refs.items())
+            ]
+            # Also mirror (compile_pos, graph_input_name) → tensor into
+            # the ws_rt runtime so cross-graph async issuers can reach
+            # this graph's weights without a local reference. The
+            # runtime method early-outs once a (gid, name) is known, so
+            # subsequent iterations skip per-tensor dispatch.
+            for tid, alias in sorted(stable_tensor_refs.items()):
+                name = tensor_id_to_input[tid]
+                alias_lines.append(
+                    f"_ws_rt.register_weight_named("
+                    f"{current_compile_position}, {name!r}, {alias})"
                 )
+            # Tell the runtime which of this graph's inputs the
+            # scheduler will reload — either via explicit h2d_prefetch
+            # (z=0 cycled) OR via cold_start (z=1 pinned; cold_start
+            # fires on every wrapper invocation, so a cross-graph
+            # eviction is safe because this graph's next run reloads).
+            # Only includes ops where THIS graph is the consumer.
+            reload_names: set[str] = set()
+            for _op in schedule.h2d_prefetches:
+                if getattr(_op, "compiled_graph_id", -1) != current_compile_position:
+                    continue
+                gname = getattr(_op, "graph_input_name", "") or ""
+                if gname:
+                    reload_names.add(gname)
+            for _op in adapter.startup_ops:
+                gname = getattr(_op, "graph_input_name", "") or ""
+                if gname:
+                    reload_names.add(gname)
+            reload_aliases: list[str] = []
+            for tid, alias in sorted(stable_tensor_refs.items()):
+                name = tensor_id_to_input[tid]
+                if name in reload_names:
+                    reload_aliases.append(alias)
+            if reload_aliases:
+                alias_lines.append(
+                    f"_ws_rt.mark_reloadable([{', '.join(reload_aliases)}])"
+                )
+
+            # Per-tensor iter masks for partial schedules. Group by
+            # graph_input_name across this graph's H2DPrefetchOps and
+            # EvictVramOps; non-empty masks are emitted as set_iter_mask
+            # calls. Total iter count comes from the schedule's
+            # graph_multiplicity (per-graph iter count); falls back to
+            # 1 + max(seen iter index) if absent.
+            iter_mask_h2d: dict[str, list[int]] = {}
+            iter_mask_evict: dict[str, list[int]] = {}
+            seen_max_iter = 0
+            for _op in schedule.h2d_prefetches:
+                if getattr(_op, "compiled_graph_id", -1) != current_compile_position:
+                    continue
+                m = list(getattr(_op, "iter_mask", []) or [])
+                if not m:
+                    continue
+                gname = getattr(_op, "graph_input_name", "") or ""
+                if gname:
+                    iter_mask_h2d[gname] = m
+                    seen_max_iter = max(seen_max_iter, max(m))
+            for _op in schedule.evict_vram:
+                if getattr(_op, "compiled_graph_id", -1) != current_compile_position:
+                    continue
+                m = list(getattr(_op, "iter_mask", []) or [])
+                if not m:
+                    continue
+                gname = getattr(_op, "graph_input_name", "") or ""
+                if gname:
+                    iter_mask_evict[gname] = m
+                    seen_max_iter = max(seen_max_iter, max(m))
+            mult_map = getattr(schedule, "graph_multiplicity", {}) or {}
+            total_iters = int(
+                mult_map.get(current_compile_position, seen_max_iter + 1)
+            )
+            partial_names = sorted(set(iter_mask_h2d) | set(iter_mask_evict))
+            for gname in partial_names:
+                h2d_m = iter_mask_h2d.get(gname, [])
+                e_m = iter_mask_evict.get(gname, [])
+                alias_lines.append(
+                    f"_ws_rt.set_iter_mask("
+                    f"{current_compile_position}, {gname!r}, "
+                    f"{h2d_m!r}, {e_m!r}, {total_iters})"
+                )
+
+            # Advance the per-graph iter counter on every wrapper call.
+            # Must come AFTER set_iter_mask (which is idempotent across
+            # iters but only takes effect once the corresponding tensor
+            # is registered_named via register_weight_named above).
+            alias_lines.append(
+                f"_ws_rt.begin_graph_iter({current_compile_position})"
+            )
+
+            new_lines.append(
+                WeightStreamingLine(wrapper=self, calls=alias_lines)
             )
 
         # Cold start prefetches go before any compute. Batched into one call.
@@ -2838,6 +2954,18 @@ class PythonWrapperCodegen(CodeGen):
                     cs_tensors.append(alias)
                 else:
                     cs_names.append(op.tensor_name)
+            # Keep set for cross_graph_evict: ALL of this graph's WS
+            # weights (not just cold-start tensors). This prevents the
+            # wrapper-entry cross-graph eviction from resizing a weight
+            # whose async H2D fired from an earlier graph and whose
+            # consumer kernel is about to wait on it. Cycled tensors
+            # (async-reload, not cold-start) would otherwise be wiped
+            # between the fire and the wait.
+            cs_keep_set = set(cs_tensors)
+            keep_tensors: list[str] = list(cs_tensors)
+            for tid, alias in sorted(stable_tensor_refs.items()):
+                if alias not in cs_keep_set:
+                    keep_tensors.append(alias)
             cold_call = build_ws_ops_call(
                 cold_start=cs_names,
                 cold_start_tensors=cs_tensors,
@@ -2847,6 +2975,7 @@ class PythonWrapperCodegen(CodeGen):
                 # (this graph's pinned + bandwidth-limited cyclable) instead
                 # of (union of all graphs' weights).
                 cross_graph_evict=bool(cs_tensors),
+                keep_tensors=keep_tensors,
             )
             if cold_call is not None:
                 new_lines.append(
@@ -2943,6 +3072,8 @@ class PythonWrapperCodegen(CodeGen):
                 post_evict_vram: list[str] = []
                 post_evict_vram_names: list[str] = []
                 post_async_h2d: list[str] = []
+                post_xg_async_gids: list[int] = []
+                post_xg_async_names: list[str] = []
                 post_evict_dram: list[str] = []
 
                 for op in after_launch.get(line.launch_id, []):
@@ -2952,7 +3083,27 @@ class PythonWrapperCodegen(CodeGen):
                         post_evict_dram.append(op.tensor_name)
 
                 for op in h2d_after_launch.get(line.launch_id, []):
-                    post_async_h2d.append(_vram_ref(op))
+                    # Cross-graph: the issuer is THIS graph but the
+                    # consumer is a different graph. _vram_ref(op) can't
+                    # resolve a local tensor ref — use by-key dispatch
+                    # instead. Registration of (consumer_gid, name) →
+                    # tensor happens in the consumer's wrapper entry.
+                    consumer_gid = getattr(op, "compiled_graph_id", -1)
+                    if (
+                        consumer_gid >= 0
+                        and consumer_gid != current_compile_position
+                    ):
+                        gname = getattr(op, "graph_input_name", "") or ""
+                        if not gname:
+                            log.warning(
+                                "Cross-graph async op missing graph_input_name; "
+                                "skipping (tensor=%s)", op.tensor_name
+                            )
+                            continue
+                        post_xg_async_gids.append(consumer_gid)
+                        post_xg_async_names.append(gname)
+                    else:
+                        post_async_h2d.append(_vram_ref(op))
 
                 if is_kernel:
                     for op in rescaled_after.get(kernel_only_idx, []):
@@ -2967,6 +3118,8 @@ class PythonWrapperCodegen(CodeGen):
                     evict_vram=post_evict_vram,
                     evict_vram_names=post_evict_vram_names,
                     async_h2d=post_async_h2d,
+                    xg_async_gids=post_xg_async_gids,
+                    xg_async_names=post_xg_async_names,
                     evict_dram=post_evict_dram,
                     flush=has_vram_evict,
                 )
