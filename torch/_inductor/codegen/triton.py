@@ -6266,6 +6266,7 @@ class TritonScheduling(SIMDScheduling):
                 kernel_name,
             )
             wrapper.write_provenance_debug_handle(kernel_name, debug_handle)
+            wrapper.register_kernel_module_stack(kernel_name, node_schedule)
 
     def _emit_kernel_to_wrapper(
         self,

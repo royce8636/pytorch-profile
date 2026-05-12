@@ -15,7 +15,7 @@ import os
 import random
 import re
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from itertools import chain, count
 from typing import Any, TYPE_CHECKING
 
@@ -731,6 +731,58 @@ _COMPUTE_LINE_TYPES = (
 )
 
 
+def _nn_module_stack_for_fx_node(
+    node: torch.fx.Node,
+) -> list[tuple[str, str]]:
+    """Return cleaned nn_module_stack for an FX node as a list of
+    (qualified_name, type_qualname) pairs, ordered outermost-first.
+
+    Falls back to fwd_nn_module_stack when nn_module_stack is absent,
+    matching the convention in torch/_inductor/fx_passes/graph_view.py.
+    Returns an empty list if neither key is present.
+    """
+    from torch._inductor.fx_passes.graph_view import (
+        _clean_stack_name,
+        _get_module_stack,
+    )
+
+    out: list[tuple[str, str]] = []
+    for raw_name, module_class in _get_module_stack(node):
+        cleaned = _clean_stack_name(raw_name)
+        if isinstance(module_class, type):
+            type_name = f"{module_class.__module__}.{module_class.__qualname__}"
+        else:
+            type_name = str(module_class)
+        out.append((cleaned, type_name))
+    return out
+
+
+def _longest_common_module_stack(
+    stacks: list[list[tuple[str, str]]],
+) -> list[tuple[str, str]]:
+    """Longest common prefix across the per-FX-node stacks of a fused kernel.
+
+    Fused Triton kernels cover many FX nodes; each may live under a different
+    leaf submodule but share a common ancestor. The deepest shared submodule
+    is the meaningful attribution point.
+    """
+    if not stacks:
+        return []
+    if len(stacks) == 1:
+        return stacks[0]
+    prefix = stacks[0]
+    for other in stacks[1:]:
+        new_len = 0
+        for a, b in zip(prefix, other):
+            if a != b:
+                break
+            new_len += 1
+        prefix = prefix[:new_len]
+        if not prefix:
+            break
+    return prefix
+
+
 @dataclasses.dataclass
 class LaunchMarkerLine(WrapperLine):
     """Wraps a compute line with a record_function marker for profiling."""
@@ -1365,6 +1417,17 @@ class PythonWrapperCodegen(CodeGen):
         self.set_launcher_fn_name()
         self._next_launch_id: int = 0
         self._compilation_hash: str = ""
+        # launch_id -> list of (qualified_name, type_qualname) pairs
+        # populated by generate_kernel_call when a scheduling backend has
+        # registered a pending stack via register_kernel_module_stack.
+        # Keyed by launch_id (not kernel_name) because inductor dedups
+        # kernel definitions across call sites; the same kernel_name can be
+        # launched from multiple submodule contexts.
+        self._ws_launch_module_stacks: dict[int, list[tuple[str, str]]] = {}
+        # One-shot stash set by register_kernel_module_stack at
+        # codegen_comment time; consumed by generate_kernel_call when the
+        # next launch_id is assigned.
+        self._ws_pending_module_stack: list[tuple[str, str]] | None = None
 
         # this is used for tracking which GraphLowering instance---parent graph
         # or (nested) subgraph---is currently codegened; the primary use case is
@@ -2273,6 +2336,65 @@ class PythonWrapperCodegen(CodeGen):
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
 
+    def register_kernel_module_stack(
+        self,
+        kernel_name: str | None,
+        node_schedule: Any,
+    ) -> None:
+        """Record the longest-common nn_module_stack across the FX origins
+        of every scheduler node in ``node_schedule`` for ``kernel_name``.
+        No-op unless weight_streaming_emit_ids is enabled.
+        """
+        if not config.weight_streaming_emit_ids:
+            return
+        if not kernel_name:
+            return
+        try:
+            from torch._inductor.scheduler import BaseSchedulerNode
+            from torch._inductor.codegen.simd_kernel_features import (
+                DisableReduction,
+                EnableReduction,
+            )
+
+            per_node_stacks: list[list[tuple[str, str]]] = []
+            iter_nodes: Iterable[Any]
+            if isinstance(node_schedule, (list, tuple)):
+                iter_nodes = node_schedule
+            else:
+                iter_nodes = [node_schedule]
+            for snode in iter_nodes:
+                if snode in (EnableReduction, DisableReduction):
+                    continue
+                ir_node = getattr(snode, "node", None)
+                if ir_node is None and isinstance(snode, BaseSchedulerNode):
+                    continue
+                # ExternKernel direct path (is_extern=True provenance shape)
+                if ir_node is None:
+                    ir_node = snode
+                origins = getattr(ir_node, "origins", None) or ()
+                origin_node = getattr(ir_node, "origin_node", None)
+                fx_nodes: list[torch.fx.Node] = []
+                if origin_node is not None:
+                    fx_nodes.append(origin_node)
+                else:
+                    fx_nodes.extend(origins)
+                for fx_node in fx_nodes:
+                    stack = _nn_module_stack_for_fx_node(fx_node)
+                    if stack:
+                        per_node_stacks.append(stack)
+            stack = _longest_common_module_stack(per_node_stacks)
+            # Stash for the next generate_kernel_call to pick up. Overwrites
+            # any prior unconsumed pending (defensive: a missed consumer
+            # shouldn't leak into a later unrelated launch).
+            self._ws_pending_module_stack = stack if stack else None
+        except Exception:
+            # Provenance attribution is best-effort; never block compile.
+            log.debug(
+                "register_kernel_module_stack failed for %s",
+                kernel_name,
+                exc_info=True,
+            )
+
     def _write_launch_map_sidecar(self) -> None:
         entries = []
         for line in self.lines:
@@ -2292,10 +2414,25 @@ class PythonWrapperCodegen(CodeGen):
                 entry["original_fxnode_name"] = (
                     inner.original_fxnode_name or ""
                 )
+                stack = self._ws_launch_module_stacks.get(inner.launch_id, [])
             else:
                 entry["kernel_name"] = getattr(
                     inner.node, "get_kernel_name", lambda: ""
                 )()
+                # ExternKernel IR nodes carry .origins / .origin_node directly,
+                # so we don't need the codegen_comment-time map.
+                ir_node = inner.node
+                origin_node = getattr(ir_node, "origin_node", None)
+                if origin_node is not None:
+                    per_stacks = [_nn_module_stack_for_fx_node(origin_node)]
+                else:
+                    per_stacks = [
+                        _nn_module_stack_for_fx_node(fx_node)
+                        for fx_node in (getattr(ir_node, "origins", None) or ())
+                    ]
+                per_stacks = [s for s in per_stacks if s]
+                stack = _longest_common_module_stack(per_stacks)
+            entry["nn_module_stack"] = [list(pair) for pair in stack]
             entries.append(entry)
         gid = V.graph.graph_id
         out_dir = self._get_ws_output_dir()
@@ -4303,6 +4440,10 @@ class PythonWrapperCodegen(CodeGen):
         )
 
         device = device or V.graph.get_current_device_or_throw()
+        lid = self._assign_launch_id()
+        if self._ws_pending_module_stack is not None:
+            self._ws_launch_module_stacks[lid] = self._ws_pending_module_stack
+            self._ws_pending_module_stack = None
         self.writeline(
             KernelCallLine(
                 self,
@@ -4322,7 +4463,7 @@ class PythonWrapperCodegen(CodeGen):
                 graph_name=V.graph.name,
                 # pyrefly: ignore [bad-argument-type]
                 original_fxnode_name=original_fxnode_name,
-                launch_id=self._assign_launch_id(),
+                launch_id=lid,
             )
         )
 

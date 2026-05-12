@@ -7954,3 +7954,6 @@ class BaseScheduling:  # noqa: docstring_linter
             V.graph.wrapper_code.write_provenance_debug_handle(
                 kernel_name, debug_handle
             )
+            V.graph.wrapper_code.register_kernel_module_stack(
+                kernel_name, node_schedule
+            )
