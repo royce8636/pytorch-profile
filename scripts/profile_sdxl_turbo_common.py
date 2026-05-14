@@ -687,6 +687,81 @@ def configure_llamasim_inductor_markers(
             dynamo.reset()
 
 
+def build_module_catalog(
+    module: torch.nn.Module | None,
+) -> dict[str, dict[str, Any]]:
+    """Catalog every submodule under ``module`` for join against
+    ``nn_module_stack`` paths in the launch_map sidecar.
+
+    Returns ``{path: entry}`` where ``path`` is the dotted submodule path as
+    produced by :py:meth:`torch.nn.Module.named_modules` (rooted at the
+    compiled module itself — same convention inductor uses when stamping
+    ``nn_module_stack`` onto FX nodes). Each entry contains the
+    serializable fields of the user's ``ptModuleInfo`` (no nn.Module
+    reference, no parameter tensors).
+    """
+    if module is None:
+        return {}
+    catalog: dict[str, dict[str, Any]] = {}
+    for name, sub in module.named_modules():
+        if not name:
+            # Skip the root entry: its path is "" which would collide with
+            # the sentinel used in the row writer for launches that have
+            # no nn_module_stack attribution.
+            continue
+        params = [
+            (n, p)
+            for n, p in sub.named_parameters(recurse=False)
+            if p is not None
+        ]
+        bufs = [
+            (n, b)
+            for n, b in sub.named_buffers(recurse=False)
+            if b is not None
+        ]
+        size_bytes = sum(
+            t.numel() * t.element_size() for _, t in params
+        ) + sum(t.numel() * t.element_size() for _, t in bufs)
+        catalog[name] = {
+            "class_name": type(sub).__name__,
+            "size_bytes": size_bytes,
+            "has_parameters": bool(params),
+            "parameters_have_data": any(p.numel() > 0 for _, p in params),
+            "has_buffers": bool(bufs),
+            "buffers_have_data": any(b.numel() > 0 for _, b in bufs),
+        }
+    return catalog
+
+
+def _load_launch_module_stacks(
+    llamasim_output_dir: Path,
+) -> dict[tuple[int, int], list[tuple[str, str]]]:
+    """Load all ``compiled_launch_map_graph*.json`` sidecars and return
+    ``{(graph_id, launch_id): nn_module_stack}``.
+
+    Missing files / missing field → empty dict; the bundle writer falls
+    back to empty module columns.
+    """
+    result: dict[tuple[int, int], list[tuple[str, str]]] = {}
+    if not llamasim_output_dir.is_dir():
+        return result
+    for path in llamasim_output_dir.glob("compiled_launch_map_graph*.json"):
+        try:
+            with path.open() as f:
+                doc = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        gid = doc.get("graph_id")
+        for entry in doc.get("launches", []):
+            lid = entry.get("compiled_launch_id")
+            stack = entry.get("nn_module_stack") or []
+            if gid is None or lid is None:
+                continue
+            # stack entries are [qualified_name, type_qualname] pairs
+            result[(gid, lid)] = [tuple(pair) for pair in stack]
+    return result
+
+
 def maybe_compile(
     pipe: Any,
     args: argparse.Namespace,
@@ -3661,6 +3736,7 @@ def write_llamasim_runtime_bundle(
     output_dir: Path,
     *,
     trace_json_path: Path | None = None,
+    module_catalog: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     from torch.autograd import DeviceType
     from torch.autograd.profiler_util import _rewrite_name
@@ -4095,6 +4171,9 @@ def write_llamasim_runtime_bundle(
                     )
         f.write("}\n")
 
+    launch_module_stacks = _load_launch_module_stacks(output_dir)
+    catalog = module_catalog or {}
+
     with runtime_nodes_csv_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "step",
@@ -4120,6 +4199,13 @@ def write_llamasim_runtime_bundle(
             "has_tensor_io",
             "compiled_graph_id",
             "compiled_launch_id",
+            "module_path",
+            "module_class",
+            "module_size_bytes",
+            "module_has_parameters",
+            "module_parameters_have_data",
+            "module_has_buffers",
+            "module_buffers_have_data",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -4127,6 +4213,13 @@ def write_llamasim_runtime_bundle(
             execution_node = matched_execution_node_by_event.get(id(event))
             rf_id = execution_rf_id(execution_node) if execution_node is not None else None
             ws = ws_launch_index.get(id(event))
+            module_path = ""
+            module_entry: dict[str, Any] = {}
+            if ws is not None:
+                stack = launch_module_stacks.get((ws[0], ws[1]), [])
+                if stack:
+                    module_path = stack[-1][0]
+                    module_entry = catalog.get(module_path, {})
             writer.writerow(
                 {
                     "step": 0,
@@ -4177,6 +4270,29 @@ def write_llamasim_runtime_bundle(
                     "has_tensor_io": int(execution_node is not None),
                     "compiled_graph_id": ws[0] if ws is not None else "",
                     "compiled_launch_id": ws[1] if ws is not None else -1,
+                    "module_path": module_path,
+                    "module_class": module_entry.get("class_name", ""),
+                    "module_size_bytes": module_entry.get("size_bytes", ""),
+                    "module_has_parameters": (
+                        int(module_entry["has_parameters"])
+                        if "has_parameters" in module_entry
+                        else ""
+                    ),
+                    "module_parameters_have_data": (
+                        int(module_entry["parameters_have_data"])
+                        if "parameters_have_data" in module_entry
+                        else ""
+                    ),
+                    "module_has_buffers": (
+                        int(module_entry["has_buffers"])
+                        if "has_buffers" in module_entry
+                        else ""
+                    ),
+                    "module_buffers_have_data": (
+                        int(module_entry["buffers_have_data"])
+                        if "buffers_have_data" in module_entry
+                        else ""
+                    ),
                 }
             )
 
@@ -5007,6 +5123,9 @@ def main(
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
+            module_catalog=build_module_catalog(
+                underlying_unet_module(pipe.unet)
+            ),
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))

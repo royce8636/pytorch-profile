@@ -305,6 +305,7 @@ def main() -> None:
             record_shapes=args.record_shapes,
             profile_memory=args.profile_memory,
             with_stack=args.with_stack,
+            with_modules=True,
             execution_trace_observer=execution_trace_observer,
         ) as prof:
             with torch.autograd.profiler.record_function(
@@ -322,11 +323,21 @@ def main() -> None:
 
     images = decode_images(pipe, args, output)
     images[0].save(output_paths.image_path)
+    compiled_module: torch.nn.Module | None = None
+    if args.pipeline == "sdxl-turbo":
+        compiled_module = sdxl_common.underlying_unet_module(pipe.unet)
+    elif hasattr(pipe, "transformer"):
+        compiled_module = sdxl_common.underlying_unet_module(pipe.transformer)
+    _pipe_catalog, _pipe_id_to_path = sdxl_common.build_pipeline_module_index(pipe)
     sdxl_common.write_llamasim_runtime_bundle(
         prof,
         output_paths.execution_trace_path,
         output_paths.llamasim_output_dir,
         trace_json_path=output_paths.trace_path,
+        module_catalog=sdxl_common.build_module_catalog(compiled_module),
+        module_id_to_path=sdxl_common.build_module_id_to_path(compiled_module),
+        pipeline_module_catalog=_pipe_catalog,
+        pipeline_module_id_to_path=_pipe_id_to_path,
     )
     offload_common.free_cpu_offload_hooks(pipe)
 

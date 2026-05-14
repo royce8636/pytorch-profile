@@ -744,6 +744,7 @@ def main(
         record_shapes=args.record_shapes,
         profile_memory=args.profile_memory,
         with_stack=args.with_stack,
+        with_modules=True,
         execution_trace_observer=execution_trace_observer,
     ) as prof:
         with torch.autograd.profiler.record_function(
@@ -840,11 +841,17 @@ def main(
             raise RuntimeError(
                 "llamasim-runtime export requested without an execution trace path"
             )
+        _trans = sdxl_common.underlying_unet_module(pipe.transformer)
+        _pipe_catalog, _pipe_id_to_path = sdxl_common.build_pipeline_module_index(pipe)
         sdxl_common.write_llamasim_runtime_bundle(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
+            module_catalog=sdxl_common.build_module_catalog(_trans),
+            module_id_to_path=sdxl_common.build_module_id_to_path(_trans),
+            pipeline_module_catalog=_pipe_catalog,
+            pipeline_module_id_to_path=_pipe_id_to_path,
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))

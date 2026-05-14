@@ -740,7 +740,15 @@ def _nn_module_stack_for_fx_node(
     Falls back to fwd_nn_module_stack when nn_module_stack is absent,
     matching the convention in torch/_inductor/fx_passes/graph_view.py.
     Returns an empty list if neither key is present.
+
+    The base ``_clean_stack_name`` only handles bracketed access
+    (``L['self']._modules['x']``). Dynamo sometimes records the same
+    information in dot form (``L['self']._modules.x``) — notably for
+    diffusers models — which slips through unchanged. We additionally
+    strip ``_modules.`` segments so the result lines up with
+    ``named_modules()`` paths.
     """
+    import re
     from torch._inductor.fx_passes.graph_view import (
         _clean_stack_name,
         _get_module_stack,
@@ -749,6 +757,8 @@ def _nn_module_stack_for_fx_node(
     out: list[tuple[str, str]] = []
     for raw_name, module_class in _get_module_stack(node):
         cleaned = _clean_stack_name(raw_name)
+        # Strip dot-form _modules. segments left behind by the base cleaner.
+        cleaned = re.sub(r"(?:^|(?<=\.))_modules\.", "", cleaned)
         if isinstance(module_class, type):
             type_name = f"{module_class.__module__}.{module_class.__qualname__}"
         else:

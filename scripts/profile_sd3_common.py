@@ -27,6 +27,9 @@ if str(THIS_DIR) not in sys.path:
 from profile_sdxl_turbo_common import (  # noqa: E402
     DTYPE_BY_NAME,
     OutputPaths,
+    build_module_catalog,
+    build_module_id_to_path,
+    build_pipeline_module_index,
     capture_example_inputs,
     configure_llamasim_inductor_markers,
     dot_level_enabled,
@@ -402,6 +405,7 @@ def main(
         record_shapes=args.record_shapes,
         profile_memory=args.profile_memory,
         with_stack=args.with_stack,
+        with_modules=True,
         execution_trace_observer=execution_trace_observer,
     ) as prof:
         with torch.autograd.profiler.record_function("sd3_run", scope_args):
@@ -478,11 +482,17 @@ def main(
             raise RuntimeError(
                 "llamasim-runtime export requested without an execution trace path"
             )
+        _trans = underlying_transformer_module(pipe.transformer)
+        _pipe_catalog, _pipe_id_to_path = build_pipeline_module_index(pipe)
         write_llamasim_runtime_bundle(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
+            module_catalog=build_module_catalog(_trans),
+            module_id_to_path=build_module_id_to_path(_trans),
+            pipeline_module_catalog=_pipe_catalog,
+            pipeline_module_id_to_path=_pipe_id_to_path,
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
