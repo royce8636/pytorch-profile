@@ -9,7 +9,7 @@
 ## PyTorch
 # Ignore everything with "profile" in the name
 *profile*
-
+exp_results/
 # Except these extensions
 !*profile*.sh
 !*profile*.py
