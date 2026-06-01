@@ -91,21 +91,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="a lovely cat",
+        default="A cute dog and a cat in a park",
         help="Prompt passed to the pipeline.",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=1,
+        default=4,
         help="Number of inference steps.",
     )
     parser.add_argument(
-        "--height", type=int, default=128, help="Output height."
+        "--height", type=int, default=512, help="Output height."
     )
     parser.add_argument(
-        "--width", type=int, default=128, help="Output width."
+        "--width", type=int, default=512, help="Output width."
     )
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--device", default="cuda", help="Execution device."
     )
@@ -128,7 +129,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warmup-runs",
         type=int,
-        default=1,
+        default=4,
         help="Warmup iterations before the timed run.",
     )
     parser.add_argument(
@@ -333,6 +334,8 @@ def install_io_logging(rt: WeightStreamRuntime) -> None:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     image_path = resolve_image_path(args)
     total_start = time.perf_counter()
@@ -536,6 +539,7 @@ def main() -> None:
     print("device:", device)
     print("dtype:", args.dtype)
     print("steps:", args.steps)
+    print("seed:", args.seed)
     print("warmup_runs:", args.warmup_runs)
     print("image_path:", image_path)
     print("latent_shape:", tuple(output.images.shape))

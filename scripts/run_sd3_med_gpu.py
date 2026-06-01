@@ -40,11 +40,12 @@ def parse_args(
         default=default_model,
         help="Path to the SD3.5 model directory.",
     )
-    parser.add_argument("--prompt", default="a lovely cat")
-    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--prompt", default="A cute dog and a cat in a park")
+    parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance-scale", type=float, default=4.5)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-sequence-length", type=int, default=256)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -56,10 +57,10 @@ def parse_args(
     parser.add_argument("--compile-mode", default="default")
     parser.add_argument("--fullgraph", action="store_true")
     parser.add_argument(
-        "--warmup-runs", type=int, default=None,
+        "--warmup-runs", type=int, default=20,
         help=(
-            "Warmup iterations before timing. Defaults to 1 for --fusion=inductor "
-            "and 0 otherwise."
+            "Warmup iterations before timing. Defaults to the SD3.5 medium "
+            "denoising step count."
         ),
     )
     parser.add_argument("--output-dir", default=None)
@@ -144,6 +145,8 @@ def main(
     )
     device = validate_run_device(args.device)
     validate_fusion_runtime(args, device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     warmup_runs = (
         args.warmup_runs if args.warmup_runs is not None else int(args.fusion != "none")
@@ -195,6 +198,7 @@ def main(
     print("dtype:", args.dtype)
     print("fusion:", args.fusion)
     print("steps:", args.steps)
+    print("seed:", args.seed)
     print("height:", args.height)
     print("width:", args.width)
     print("warmup_runs:", warmup_runs)

@@ -85,9 +85,15 @@ def parse_args() -> argparse.Namespace:
         help="Prompt fed to the causal LM.",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Manual seed passed to torch.manual_seed. Set negative to skip seeding.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=16,
+        default=15,
         help="Number of tokens to generate per run.",
     )
     parser.add_argument(
@@ -106,6 +112,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Sampling temperature (only used with --do-sample).",
+    )
+    parser.add_argument(
+        "--enable-eos-stop",
+        action="store_true",
+        help="Stop early when every batch item emits EOS. Disabled by default.",
     )
     parser.add_argument(
         "--device",
@@ -308,7 +319,7 @@ def _generate(pipe: Any, args: argparse.Namespace) -> Any:
             pipe.model,
             input_ids,
             max_new_tokens=args.max_new_tokens,
-            eos_token_id=pipe.tokenizer.eos_token_id,
+            eos_token_id=pipe.tokenizer.eos_token_id if args.enable_eos_stop else None,
             do_sample=args.do_sample,
             temperature=args.temperature,
         )
@@ -318,6 +329,8 @@ def _generate(pipe: Any, args: argparse.Namespace) -> Any:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     text_path = resolve_text_path(args)
     total_start = time.perf_counter()
@@ -455,6 +468,8 @@ def main() -> None:
 
     print("device:", device)
     print("dtype:", args.dtype)
+    print("seed:", args.seed)
+    print("enable_eos_stop:", args.enable_eos_stop)
     print("max_new_tokens:", args.max_new_tokens)
     print("batch_size:", args.batch_size)
     print("warmup_runs:", args.warmup_runs)

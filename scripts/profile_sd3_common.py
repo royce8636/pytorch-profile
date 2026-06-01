@@ -28,8 +28,11 @@ from profile_sdxl_turbo_common import (  # noqa: E402
     DTYPE_BY_NAME,
     OutputPaths,
     build_module_catalog,
+    build_module_hierarchy,
     build_module_id_to_path,
+    build_module_id_to_path_from_prof,
     build_pipeline_module_index,
+    build_pipeline_module_index_from_prof,
     capture_example_inputs,
     configure_llamasim_inductor_markers,
     dot_level_enabled,
@@ -82,13 +85,13 @@ def parse_args(
     )
     parser.add_argument(
         "--prompt",
-        default="a lovely cat",
+        default="A cute dog and a cat in a park",
         help="Prompt passed to the pipeline.",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=4,
+        default=20,
         help="Number of denoising steps.",
     )
     parser.add_argument(
@@ -108,6 +111,12 @@ def parse_args(
         type=int,
         default=512,
         help="Output width.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Manual seed passed to torch.manual_seed. Set negative to skip seeding.",
     )
     parser.add_argument(
         "--max-sequence-length",
@@ -148,10 +157,10 @@ def parse_args(
     parser.add_argument(
         "--warmup-runs",
         type=int,
-        default=None,
+        default=20,
         help=(
-            "Warmup iterations run before profiling. Defaults to 1 for "
-            "--fusion=inductor and 0 otherwise."
+            "Warmup iterations run before profiling. Defaults to the SD3.5 "
+            "medium denoising step count."
         ),
     )
     parser.add_argument("--output-dir", default=None)
@@ -363,6 +372,8 @@ def main(
     validate_dot_args(args)
     device = validate_device(args)
     validate_fusion_runtime(args, device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     warmup_runs = (
         args.warmup_runs if args.warmup_runs is not None else int(args.fusion != "none")
@@ -422,7 +433,7 @@ def main(
     metadata_json = None
     for event in prof.events():
         if event.name == "sd3_run":
-            metadata_json = event.metadata_json
+            metadata_json = getattr(event, "metadata_json", None)
             break
 
     prof.export_chrome_trace(str(output_paths.trace_path))
@@ -483,16 +494,22 @@ def main(
                 "llamasim-runtime export requested without an execution trace path"
             )
         _trans = underlying_transformer_module(pipe.transformer)
-        _pipe_catalog, _pipe_id_to_path = build_pipeline_module_index(pipe)
+        # Use prof-derived observation-order mapping so the trace's
+        # `nn.Module: <cls>_<id>` event names resolve to the correct
+        # submodule paths instead of named_modules() walk-order.
+        _pipe_catalog, _pipe_id_to_path = build_pipeline_module_index_from_prof(
+            prof, pipe,
+        )
         write_llamasim_runtime_bundle(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
             module_catalog=build_module_catalog(_trans),
-            module_id_to_path=build_module_id_to_path(_trans),
+            module_id_to_path=build_module_id_to_path_from_prof(prof, _trans),
             pipeline_module_catalog=_pipe_catalog,
             pipeline_module_id_to_path=_pipe_id_to_path,
+            module_hierarchy=build_module_hierarchy(pipe),
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
@@ -504,6 +521,7 @@ def main(
     print("dtype:", args.dtype)
     print("fusion:", args.fusion)
     print("dot_level:", args.dot_level)
+    print("seed:", args.seed)
     print("profile_memory:", args.profile_memory)
     print("record_shapes:", args.record_shapes)
     print("with_stack:", args.with_stack)

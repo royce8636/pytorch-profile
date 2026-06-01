@@ -23,6 +23,8 @@ DTYPE_BY_NAME = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
+DEFAULT_SDXL_VAE_MODEL = "madebyollin/sdxl-vae-fp16-fix"
+DEFAULT_SDXL_PIPELINE_VARIANT = "fp16"
 
 
 def format_missing_diffusers_runtime_error(
@@ -79,12 +81,15 @@ def parse_args(
     default_dtype: str,
     default_output_prefix: str,
     default_model: str | None = "/data/llamasim/models/sdxl-turbo",
+    default_vae_model: str | None = DEFAULT_SDXL_VAE_MODEL,
+    default_variant: str | None = DEFAULT_SDXL_PIPELINE_VARIANT,
     default_component: str = "sdxl_turbo_pipeline",
     default_fusion: str = "none",
     default_dot_level: str,
     default_profile_memory: bool,
     default_record_shapes: bool,
     default_with_stack: bool,
+    default_with_modules: bool = True,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="SDXL profiler driver for the patched PyTorch build."
@@ -97,26 +102,32 @@ def parse_args(
     )
     parser.add_argument(
         "--prompt",
-        default="a lovely cat",
+        default="A cute dog and a cat in a park",
         help="Prompt passed to the pipeline.",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=1,
+        default=4,
         help="Number of inference steps.",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=128,
+        default=512,
         help="Output height.",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=128,
+        default=512,
         help="Output width.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Manual seed passed to torch.manual_seed. Set negative to skip seeding.",
     )
     parser.add_argument(
         "--device",
@@ -128,6 +139,22 @@ def parse_args(
         choices=tuple(DTYPE_BY_NAME.keys()),
         default=default_dtype,
         help="Torch dtype used to load the pipeline.",
+    )
+    parser.add_argument(
+        "--vae-model",
+        default=default_vae_model,
+        help=(
+            "VAE checkpoint loaded into the SDXL pipeline. Use 'none' to keep the "
+            "VAE bundled with --model."
+        ),
+    )
+    parser.add_argument(
+        "--variant",
+        default=default_variant,
+        help=(
+            "Diffusers checkpoint variant loaded for the SDXL pipeline. Use 'none' "
+            "or an empty string to omit the variant argument."
+        ),
     )
     parser.add_argument(
         "--fusion",
@@ -151,10 +178,10 @@ def parse_args(
     parser.add_argument(
         "--warmup-runs",
         type=int,
-        default=None,
+        default=4,
         help=(
-            "Warmup iterations run before profiling. Defaults to 1 for "
-            "--fusion=inductor and 0 otherwise."
+            "Warmup iterations run before profiling. Defaults to the SDXL-Turbo "
+            "denoising step count."
         ),
     )
     parser.add_argument(
@@ -338,6 +365,19 @@ def parse_args(
         dest="with_stack",
         action="store_false",
         help="Disable Python source-location capture in the profiler results.",
+    )
+    parser.add_argument(
+        "--with-modules",
+        dest="with_modules",
+        action="store_true",
+        default=default_with_modules,
+        help="Record module hierarchy information in profiler events.",
+    )
+    parser.add_argument(
+        "--no-with-modules",
+        dest="with_modules",
+        action="store_false",
+        help="Disable module hierarchy capture in profiler events.",
     )
     return parser.parse_args()
 
@@ -625,9 +665,23 @@ def profile_activities(device: torch.device) -> list[torch.profiler.ProfilerActi
     return activities
 
 
-def load_pipeline(model: str, torch_dtype: torch.dtype, device: torch.device) -> Any:
+def _optional_model_arg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value == "" or value.lower() == "none":
+        return None
+    return value
+
+
+def load_pipeline(
+    model: str,
+    torch_dtype: torch.dtype,
+    device: torch.device,
+    vae_model: str | None = DEFAULT_SDXL_VAE_MODEL,
+    variant: str | None = DEFAULT_SDXL_PIPELINE_VARIANT,
+) -> Any:
     try:
-        from diffusers import StableDiffusionXLPipeline
+        from diffusers import AutoencoderKL, StableDiffusionXLPipeline
     except ModuleNotFoundError as exc:
         if is_missing_diffusers_error(exc):
             raise RuntimeError(
@@ -638,11 +692,26 @@ def load_pipeline(model: str, torch_dtype: torch.dtype, device: torch.device) ->
             ) from exc
         raise
 
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        model,
-        torch_dtype=torch_dtype,
-        use_safetensors=True,
-    ).to(device)
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "use_safetensors": True,
+    }
+    selected_variant = _optional_model_arg(variant)
+    if selected_variant is not None:
+        load_kwargs["variant"] = selected_variant
+
+    selected_vae_model = _optional_model_arg(vae_model)
+    if selected_vae_model is not None:
+        load_kwargs["vae"] = AutoencoderKL.from_pretrained(
+            selected_vae_model,
+            torch_dtype=torch_dtype,
+            use_safetensors=True,
+        )
+
+    pipe = StableDiffusionXLPipeline.from_pretrained(model, **load_kwargs).to(device)
+    vae_config = getattr(getattr(pipe, "vae", None), "config", None)
+    if vae_config is not None and hasattr(vae_config, "force_upcast"):
+        vae_config.force_upcast = False
     return pipe
 
 
@@ -687,8 +756,43 @@ def configure_llamasim_inductor_markers(
             dynamo.reset()
 
 
+def _join_module_path(prefix: str, name: str) -> str:
+    if not prefix:
+        return name
+    if not name:
+        return prefix
+    return f"{prefix}.{name}"
+
+
+def _module_catalog_entry(sub: torch.nn.Module) -> dict[str, Any]:
+    params = [
+        (n, p)
+        for n, p in sub.named_parameters(recurse=False)
+        if p is not None
+    ]
+    bufs = [
+        (n, b)
+        for n, b in sub.named_buffers(recurse=False)
+        if b is not None
+    ]
+    size_bytes = sum(
+        t.numel() * t.element_size() for _, t in params
+    ) + sum(t.numel() * t.element_size() for _, t in bufs)
+    return {
+        "class_name": type(sub).__name__,
+        "size_bytes": size_bytes,
+        "has_parameters": bool(params),
+        "parameters_have_data": any(p.numel() > 0 for _, p in params),
+        "has_buffers": bool(bufs),
+        "buffers_have_data": any(b.numel() > 0 for _, b in bufs),
+    }
+
+
 def build_module_catalog(
     module: torch.nn.Module | None,
+    *,
+    path_prefix: str = "",
+    include_root: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Catalog every submodule under ``module`` for join against
     ``nn_module_stack`` paths in the launch_map sidecar.
@@ -704,33 +808,285 @@ def build_module_catalog(
         return {}
     catalog: dict[str, dict[str, Any]] = {}
     for name, sub in module.named_modules():
-        if not name:
+        if not name and not include_root:
             # Skip the root entry: its path is "" which would collide with
             # the sentinel used in the row writer for launches that have
             # no nn_module_stack attribution.
             continue
-        params = [
-            (n, p)
-            for n, p in sub.named_parameters(recurse=False)
-            if p is not None
-        ]
-        bufs = [
-            (n, b)
-            for n, b in sub.named_buffers(recurse=False)
-            if b is not None
-        ]
-        size_bytes = sum(
-            t.numel() * t.element_size() for _, t in params
-        ) + sum(t.numel() * t.element_size() for _, t in bufs)
-        catalog[name] = {
-            "class_name": type(sub).__name__,
-            "size_bytes": size_bytes,
-            "has_parameters": bool(params),
-            "parameters_have_data": any(p.numel() > 0 for _, p in params),
-            "has_buffers": bool(bufs),
-            "buffers_have_data": any(b.numel() > 0 for _, b in bufs),
-        }
+        path = _join_module_path(path_prefix, name)
+        if not path:
+            continue
+        catalog[path] = _module_catalog_entry(sub)
     return catalog
+
+
+def build_module_id_to_path(
+    module: torch.nn.Module | None,
+    *,
+    path_prefix: str = "",
+    include_root: bool = False,
+    class_counts: dict[str, int] | None = None,
+) -> dict[str, str]:
+    if module is None:
+        return {}
+    counts = class_counts if class_counts is not None else {}
+    module_id_to_path: dict[str, str] = {}
+    for name, sub in module.named_modules():
+        if not name and not include_root:
+            continue
+        path = _join_module_path(path_prefix, name)
+        if not path:
+            continue
+        class_name = type(sub).__name__
+        class_index = counts.get(class_name, 0)
+        counts[class_name] = class_index + 1
+        module_id_to_path[f"{class_name}_{class_index}"] = path
+    return module_id_to_path
+
+
+def build_module_id_to_path_from_prof(
+    prof: Any,
+    module: torch.nn.Module | None,
+    *,
+    path_prefix: str = "",
+    include_root: bool = False,
+) -> dict[str, str]:
+    """Build ``module_id_to_path`` keyed by ``f"{cls_name}_{observation_index}"``
+    where ``observation_index`` matches PyTorch profiler's per-class instance
+    counter (the k-th instance of ``cls`` observed during the profiled run —
+    see comment at ``torch/csrc/profiler/collection.h:283``).
+
+    The naïve :func:`build_module_id_to_path` walks ``module.named_modules()``
+    and assigns per-class indices in walk order. PyTorch profiler instead
+    indexes modules by **call order** (kth ``nn.Module.__call__`` of that
+    class observed during the recorded run). The two orderings only match if
+    ``named_modules()`` visits modules in the same order they're first called
+    — which is NOT the case on SDXL: the pipeline's attribute order visits
+    ``vae.*`` before ``unet.*`` (so our walk gives Dropout_0..Dropout_25 to
+    vae and Dropout_26..Dropout_252 to unet), but at runtime unet executes
+    first (so the profiler's Dropout_0..Dropout_N are unet dropouts and the
+    higher ids are vae's). Every Dropout / LayerNorm / Linear / etc. event
+    in the trace then resolves to the WRONG path, fragmenting unet's
+    burst-detected lifetime with stray "vae.encoder.X" events and inflating
+    sim peak VRAM (sim keeps vae resident from the first stray event to
+    the last, overlapping with unet's whole pipeline).
+
+    The fix here uses ``_NNModuleInfo.self_ptr`` (Python's ``id(module)``)
+    exposed at ``torch/_C/_profiler.pyi:180`` to bridge correctly. Walk the
+    profiler's ``experimental_event_tree`` in chronological order, assign
+    a per-class observation index the FIRST time we see each ``self_ptr``
+    (matching the C++ counter exactly), and look up the path via
+    ``id(submodule) -> path`` from ``named_modules()``.
+    """
+    if module is None:
+        return {}
+    try:
+        from torch._C._profiler import _ExtraFields_PyCall
+    except Exception:
+        # Older PyTorch may lack this binding — fall back to walk order.
+        return build_module_id_to_path(
+            module, path_prefix=path_prefix, include_root=include_root,
+        )
+
+    addr_to_path: dict[int, str] = {}
+    for name, sub in module.named_modules():
+        if not name and not include_root:
+            continue
+        path = _join_module_path(path_prefix, name)
+        if not path:
+            continue
+        # First registration wins for shared instances; matches the
+        # canonical path returned by `named_modules()`.
+        addr_to_path.setdefault(id(sub), path)
+
+    try:
+        event_tree = prof.profiler.kineto_results.experimental_event_tree()
+    except Exception:
+        return build_module_id_to_path(
+            module, path_prefix=path_prefix, include_root=include_root,
+        )
+
+    out: dict[str, str] = {}
+    seen_ptrs: dict[str, dict[int, int]] = {}
+
+    def walk(node: Any) -> None:
+        ef = getattr(node, "extra_fields", None)
+        if isinstance(ef, _ExtraFields_PyCall) and ef.module is not None:
+            cls = ef.module.cls_name
+            ptr = int(ef.module.self_ptr)
+            seen = seen_ptrs.setdefault(cls, {})
+            if ptr not in seen:
+                seen[ptr] = len(seen)
+                obs_index = seen[ptr]
+                path = addr_to_path.get(ptr)
+                if path is not None:
+                    out[f"{cls}_{obs_index}"] = path
+        for child in getattr(node, "children", None) or []:
+            walk(child)
+
+    for root in event_tree:
+        walk(root)
+
+    return out
+
+
+def _pipeline_module_components(pipe: Any) -> dict[str, torch.nn.Module]:
+    components = getattr(pipe, "components", None)
+    if isinstance(components, dict):
+        modules = {
+            name: module
+            for name, module in components.items()
+            if isinstance(module, torch.nn.Module)
+        }
+        if modules:
+            return modules
+
+    modules = {}
+    for name in ("text_encoder", "text_encoder_2", "unet", "transformer", "vae"):
+        module = getattr(pipe, name, None)
+        if isinstance(module, torch.nn.Module):
+            modules[name] = module
+    return modules
+
+
+def build_pipeline_module_index(
+    pipe: Any,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    catalog: dict[str, dict[str, Any]] = {}
+    module_id_to_path: dict[str, str] = {}
+    class_counts: dict[str, int] = {}
+    for name, module in _pipeline_module_components(pipe).items():
+        catalog.update(
+            build_module_catalog(
+                module,
+                path_prefix=name,
+                include_root=True,
+            )
+        )
+        module_id_to_path.update(
+            build_module_id_to_path(
+                module,
+                path_prefix=name,
+                include_root=True,
+                class_counts=class_counts,
+            )
+        )
+    return catalog, module_id_to_path
+
+
+def build_pipeline_module_index_from_prof(
+    prof: Any,
+    pipe: Any,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Pipeline-wide variant of :func:`build_module_id_to_path_from_prof`.
+
+    Unlike :func:`build_pipeline_module_index` (which assigns per-class
+    indices by walking each component in attribute order), this builds a
+    single ``addr -> path`` map across **all** components and then assigns
+    observation indices from a single chronological walk of the profiler
+    event tree. That matches the per-class counter PyTorch maintains
+    globally during the recorded run, so ``Dropout_<N>`` in the trace
+    resolves to whichever submodule the runtime actually called as its
+    Nth Dropout — regardless of which top-level component owns it.
+    """
+    catalog: dict[str, dict[str, Any]] = {}
+    addr_to_path: dict[int, str] = {}
+    for name, module in _pipeline_module_components(pipe).items():
+        catalog.update(
+            build_module_catalog(
+                module,
+                path_prefix=name,
+                include_root=True,
+            )
+        )
+        for sub_name, sub in module.named_modules():
+            full = _join_module_path(name, sub_name)
+            if not full:
+                continue
+            addr_to_path.setdefault(id(sub), full)
+
+    try:
+        from torch._C._profiler import _ExtraFields_PyCall
+        event_tree = prof.profiler.kineto_results.experimental_event_tree()
+    except Exception:
+        # Fallback to walk-order path on older PyTorch / missing API.
+        return build_pipeline_module_index(pipe)
+
+    module_id_to_path: dict[str, str] = {}
+    seen_ptrs: dict[str, dict[int, int]] = {}
+
+    def walk(node: Any) -> None:
+        ef = getattr(node, "extra_fields", None)
+        if isinstance(ef, _ExtraFields_PyCall) and ef.module is not None:
+            cls = ef.module.cls_name
+            ptr = int(ef.module.self_ptr)
+            seen = seen_ptrs.setdefault(cls, {})
+            if ptr not in seen:
+                seen[ptr] = len(seen)
+                obs_index = seen[ptr]
+                path = addr_to_path.get(ptr)
+                if path is not None:
+                    module_id_to_path[f"{cls}_{obs_index}"] = path
+        for child in getattr(node, "children", None) or []:
+            walk(child)
+
+    for root in event_tree:
+        walk(root)
+
+    return catalog, module_id_to_path
+
+
+def _build_hierarchy_tree(module: torch.nn.Module) -> dict[str, Any]:
+    """Build a nested ``{class, children: {name: subtree}}`` from
+    ``module.named_modules()``. Leaves (no submodules) drop the
+    ``children`` key for compactness — matching the ``apply_group_offloading``
+    solver's expected form: ``{"class": "Linear"}``.
+    """
+    root: dict[str, Any] = {"class": type(module).__name__, "children": {}}
+    for name, sub in module.named_modules():
+        if not name:
+            continue
+        node = root
+        for part in name.split("."):
+            node = node["children"].setdefault(
+                part, {"class": "", "children": {}}
+            )
+        node["class"] = type(sub).__name__
+
+    def trim(node: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {"class": node["class"]}
+        if node["children"]:
+            out["children"] = {k: trim(v) for k, v in node["children"].items()}
+        return out
+
+    return trim(root)
+
+
+def build_module_hierarchy(pipe: Any) -> dict[str, Any]:
+    """Pipeline-wide module hierarchy. For diffusers ``DiffusionPipeline``
+    containers, returns a tree rooted at the pipeline class with each
+    nn.Module component as a top-level child (``unet``, ``vae``,
+    ``text_encoder``, …). For a bare ``nn.Module`` (HF Llama), returns the
+    single-tree form rooted at the model class.
+
+    Downstream solvers walk this to find ``ModuleList`` / ``Sequential``
+    containers and split by group — without the hierarchy, the solver has
+    to guess (e.g. by path-component depth) whether a path segment is an
+    index into a block list, or a regular submodule.
+    """
+    components = _pipeline_module_components(pipe)
+    if components and not isinstance(pipe, torch.nn.Module):
+        root: dict[str, Any] = {
+            "class": type(pipe).__name__,
+            "children": {},
+        }
+        for name, comp in components.items():
+            comp_mod = underlying_unet_module(comp)
+            root["children"][name] = _build_hierarchy_tree(comp_mod)
+        return root
+    if isinstance(pipe, torch.nn.Module):
+        return _build_hierarchy_tree(underlying_unet_module(pipe))
+    return {}
 
 
 def _load_launch_module_stacks(
@@ -2471,6 +2827,86 @@ def _infer_chrome_trace_start_us(trace_events: list[dict[str, Any]]) -> float:
     return 0.0
 
 
+def _trace_event_tid(event: dict[str, Any]) -> int | str | None:
+    tid = event.get("tid")
+    if tid is None:
+        return None
+    try:
+        return int(tid)
+    except (TypeError, ValueError):
+        return str(tid)
+
+
+def _trace_module_key(event_name: Any) -> str | None:
+    if not isinstance(event_name, str):
+        return None
+    prefix = "nn.Module: "
+    if not event_name.startswith(prefix):
+        return None
+    return event_name[len(prefix):]
+
+
+def _load_python_module_intervals(
+    trace_json_path: Path | None,
+    module_id_to_path: dict[str, str],
+) -> dict[int | str, list[tuple[float, float, str]]]:
+    all_threads_key = "__all__"
+    if trace_json_path is None or not module_id_to_path:
+        return {}
+    with trace_json_path.open(encoding="utf-8") as f:
+        trace_json = json.load(f)
+    trace_events = trace_json.get("traceEvents", [])
+    if not isinstance(trace_events, list):
+        return {}
+    trace_start_us = _infer_chrome_trace_start_us(trace_events)
+    intervals_by_tid: dict[int | str, list[tuple[float, float, str]]] = {}
+    for event in trace_events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("ph") != "X" or event.get("cat") != "python_function":
+            continue
+        module_key = _trace_module_key(event.get("name"))
+        if module_key is None:
+            continue
+        module_path = module_id_to_path.get(module_key)
+        if module_path is None:
+            continue
+        ts = event.get("ts")
+        dur = event.get("dur")
+        tid = _trace_event_tid(event)
+        if ts is None or dur is None or tid is None:
+            continue
+        start_us = float(ts) - trace_start_us
+        end_us = start_us + float(dur)
+        intervals_by_tid.setdefault(tid, []).append((start_us, end_us, module_path))
+        intervals_by_tid.setdefault(all_threads_key, []).append(
+            (start_us, end_us, module_path)
+        )
+    for intervals in intervals_by_tid.values():
+        intervals.sort(key=lambda item: (item[0], item[1] - item[0]))
+    return intervals_by_tid
+
+
+def _module_path_from_python_intervals(
+    event: Any,
+    intervals_by_tid: dict[int | str, list[tuple[float, float, str]]],
+    trace_start_ns: int,
+) -> str:
+    intervals = intervals_by_tid.get(event.start_thread_id(), [])
+    if not intervals:
+        intervals = intervals_by_tid.get("__all__", [])
+    if not intervals:
+        return ""
+    event_start_us = _event_relative_start_us(event, trace_start_ns)
+    best: tuple[float, str] | None = None
+    for start_us, end_us, module_path in intervals:
+        if start_us <= event_start_us <= end_us:
+            duration_us = end_us - start_us
+            if best is None or duration_us < best[0]:
+                best = (duration_us, module_path)
+    return "" if best is None else best[1]
+
+
 def _select_ac2g_trace_endpoint(
     *,
     correlation_id: int,
@@ -3737,6 +4173,10 @@ def write_llamasim_runtime_bundle(
     *,
     trace_json_path: Path | None = None,
     module_catalog: dict[str, dict[str, Any]] | None = None,
+    module_id_to_path: dict[str, str] | None = None,
+    pipeline_module_catalog: dict[str, dict[str, Any]] | None = None,
+    pipeline_module_id_to_path: dict[str, str] | None = None,
+    module_hierarchy: dict[str, Any] | None = None,
 ) -> None:
     from torch.autograd import DeviceType
     from torch.autograd.profiler_util import _rewrite_name
@@ -4067,6 +4507,12 @@ def write_llamasim_runtime_bundle(
     runtime_nodes_csv_path = output_dir / "runtime_nodes.csv"
     runtime_edges_csv_path = output_dir / "runtime_edges.csv"
     manifest_path = output_dir / "manifest.json"
+    module_hierarchy_path = output_dir / "module_hierarchy.json"
+
+    if module_hierarchy:
+        module_hierarchy_path.write_text(
+            json.dumps(module_hierarchy, indent=2) + "\n", encoding="utf-8"
+        )
 
     with dot_path.open("w", encoding="utf-8") as f:
         f.write("digraph G {\n")
@@ -4172,7 +4618,18 @@ def write_llamasim_runtime_bundle(
         f.write("}\n")
 
     launch_module_stacks = _load_launch_module_stacks(output_dir)
-    catalog = module_catalog or {}
+    catalog = {
+        **(pipeline_module_catalog or {}),
+        **(module_catalog or {}),
+    }
+    python_module_id_to_path = {
+        **(module_id_to_path or {}),
+        **(pipeline_module_id_to_path or {}),
+    }
+    python_module_intervals = _load_python_module_intervals(
+        trace_json_path,
+        python_module_id_to_path,
+    )
 
     with runtime_nodes_csv_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = [
@@ -4220,6 +4677,13 @@ def write_llamasim_runtime_bundle(
                 if stack:
                     module_path = stack[-1][0]
                     module_entry = catalog.get(module_path, {})
+            if not module_path and event.device_type() == DeviceType.CPU:
+                module_path = _module_path_from_python_intervals(
+                    event,
+                    python_module_intervals,
+                    trace_start_ns,
+                )
+                module_entry = catalog.get(module_path, {})
             writer.writerow(
                 {
                     "step": 0,
@@ -4434,6 +4898,9 @@ def write_llamasim_runtime_bundle(
         "node_csv": runtime_nodes_csv_path.name,
         "edge_csv": runtime_edges_csv_path.name,
         "tensor_csv": tensor_csv_path.name,
+        "module_hierarchy": (
+            module_hierarchy_path.name if module_hierarchy else None
+        ),
         "trace_start_ns": trace_start_ns,
         "node_count": len(selected_events),
         "gpu_node_count": len(selected_gpu_events),
@@ -4896,6 +5363,10 @@ def decode_latents_to_pil(pipe: Any, latents: torch.Tensor) -> list[Any]:
     if needs_upcasting:
         pipe.upcast_vae()
         latents = latents.to(next(iter(pipe.vae.post_quant_conv.parameters())).dtype)
+    elif pipe.vae.config.force_upcast:
+        vae_decode_dtype = next(iter(pipe.vae.post_quant_conv.parameters())).dtype
+        if latents.dtype != vae_decode_dtype:
+            latents = latents.to(vae_decode_dtype)
     elif latents.dtype != pipe.vae.dtype and torch.backends.mps.is_available():
         pipe.vae = pipe.vae.to(latents.dtype)
 
@@ -4982,6 +5453,8 @@ def main(
     default_dtype: str,
     default_output_prefix: str,
     default_model: str | None = "/data/llamasim/models/sdxl-turbo",
+    default_vae_model: str | None = DEFAULT_SDXL_VAE_MODEL,
+    default_variant: str | None = DEFAULT_SDXL_PIPELINE_VARIANT,
     default_component: str = "sdxl_turbo_pipeline",
     default_fusion: str = "none",
     default_dot_level: str = "none",
@@ -4989,22 +5462,28 @@ def main(
     default_profile_memory: bool = False,
     default_record_shapes: bool = False,
     default_with_stack: bool = False,
+    default_with_modules: bool = True,
 ) -> None:
     args = parse_args(
         default_device=default_device,
         default_dtype=default_dtype,
         default_output_prefix=default_output_prefix,
         default_model=default_model,
+        default_vae_model=default_vae_model,
+        default_variant=default_variant,
         default_component=default_component,
         default_fusion=default_fusion,
         default_dot_level=default_dot_level,
         default_profile_memory=default_profile_memory,
         default_record_shapes=default_record_shapes,
         default_with_stack=default_with_stack,
+        default_with_modules=default_with_modules,
     )
     validate_dot_args(args)
     device = validate_device(args)
     validate_fusion_runtime(args, device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     warmup_runs = (
         args.warmup_runs if args.warmup_runs is not None else int(args.fusion != "none")
@@ -5015,7 +5494,13 @@ def main(
         default_llamasim_output_dirname=default_llamasim_output_dirname,
     )
 
-    pipe = load_pipeline(args.model, torch_dtype, device)
+    pipe = load_pipeline(
+        args.model,
+        torch_dtype,
+        device,
+        args.vae_model,
+        args.variant,
+    )
     if args.disable_progress_bar:
         pipe.set_progress_bar_config(disable=True)
     maybe_compile(pipe, args, output_paths)
@@ -5042,6 +5527,7 @@ def main(
         record_shapes=args.record_shapes,
         profile_memory=args.profile_memory,
         with_stack=args.with_stack,
+        with_modules=args.with_modules,
         execution_trace_observer=execution_trace_observer,
     ) as prof:
         with torch.autograd.profiler.record_function("sdxl_turbo_run", scope_args):
@@ -5058,7 +5544,7 @@ def main(
     metadata_json = None
     for event in prof.events():
         if event.name == "sdxl_turbo_run":
-            metadata_json = event.metadata_json
+            metadata_json = getattr(event, "metadata_json", None)
             break
 
     prof.export_chrome_trace(str(output_paths.trace_path))
@@ -5118,14 +5604,24 @@ def main(
             raise RuntimeError(
                 "llamasim-runtime export requested without an execution trace path"
             )
+        _unet = underlying_unet_module(pipe.unet)
+        # Use prof-derived observation-order mapping so the trace's
+        # `nn.Module: <cls>_<id>` event names resolve to the correct
+        # submodule path. See `build_module_id_to_path_from_prof` and
+        # `build_pipeline_module_index_from_prof`.
+        _pipe_catalog, _pipe_id_to_path = build_pipeline_module_index_from_prof(
+            prof, pipe,
+        )
         write_llamasim_runtime_bundle(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
-            module_catalog=build_module_catalog(
-                underlying_unet_module(pipe.unet)
-            ),
+            module_catalog=build_module_catalog(_unet),
+            module_id_to_path=build_module_id_to_path_from_prof(prof, _unet),
+            pipeline_module_catalog=_pipe_catalog,
+            pipeline_module_id_to_path=_pipe_id_to_path,
+            module_hierarchy=build_module_hierarchy(pipe),
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
@@ -5135,11 +5631,15 @@ def main(
         print(f"inductor_unique_graphs: {unique_graphs}")
     print("device:", device)
     print("dtype:", args.dtype)
+    print("vae_model:", args.vae_model)
+    print("variant:", args.variant)
     print("fusion:", args.fusion)
     print("dot_level:", args.dot_level)
+    print("seed:", args.seed)
     print("profile_memory:", args.profile_memory)
     print("record_shapes:", args.record_shapes)
     print("with_stack:", args.with_stack)
+    print("with_modules:", args.with_modules)
     print("warmup_runs:", warmup_runs)
     print("trace_path:", output_paths.trace_path)
     if hasattr(prof, "export_csv"):

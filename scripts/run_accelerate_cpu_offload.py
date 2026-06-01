@@ -14,12 +14,14 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-import profile_qwen_image_common as qwen_common  # noqa: E402
 import profile_sdxl_turbo_common as sdxl_common  # noqa: E402
 
 
-OFFLOAD_MODES = ("none", "model", "sequential", "module", "module-hook")
+OFFLOAD_MODES = ("none", "model", "sequential", "module", "module-hook", "group")
 _DIRECT_HF_ACCELERATE_HOOKS_ATTR = "_direct_hf_accelerate_cpu_offload_hooks"
+DEFAULT_SDXL_VAE_MODEL = "madebyollin/sdxl-vae-fp16-fix"
+DEFAULT_SDXL_PIPELINE_VARIANT = "fp16"
+_GROUP_OFFLOAD_COMPONENTS = ("unet", "text_encoder", "text_encoder_2", "vae")
 
 
 def add_common_args(
@@ -37,26 +39,32 @@ def add_common_args(
     )
     parser.add_argument(
         "--prompt",
-        default="a lovely cat",
+        default="A cute dog and a cat in a park",
         help="Prompt passed to the pipeline.",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=1,
+        default=4,
         help="Number of inference steps.",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=128,
+        default=512,
         help="Output height.",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=128,
+        default=512,
         help="Output width.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Manual seed passed to torch.manual_seed. Set negative to skip seeding.",
     )
     parser.add_argument(
         "--device",
@@ -68,6 +76,22 @@ def add_common_args(
         choices=tuple(sdxl_common.DTYPE_BY_NAME.keys()),
         default=default_dtype,
         help="Torch dtype used to load the pipeline.",
+    )
+    parser.add_argument(
+        "--vae-model",
+        default=DEFAULT_SDXL_VAE_MODEL,
+        help=(
+            "VAE checkpoint loaded into the SDXL pipeline. Use 'none' to keep the "
+            "VAE bundled with --model."
+        ),
+    )
+    parser.add_argument(
+        "--variant",
+        default=DEFAULT_SDXL_PIPELINE_VARIANT,
+        help=(
+            "Diffusers checkpoint variant loaded for the SDXL pipeline. Use 'none' "
+            "or an empty string to omit the variant argument."
+        ),
     )
     parser.add_argument(
         "--fusion",
@@ -98,8 +122,42 @@ def add_common_args(
             "'sequential' uses Diffusers enable_sequential_cpu_offload, 'module' applies "
             "HF Accelerate cpu_offload directly to each pipeline module, and "
             "'module-hook' applies HF Accelerate cpu_offload_with_hook directly to the "
-            "pipeline module sequence."
+            "pipeline module sequence, and 'group' uses Diffusers group offload with "
+            "CPU as the offload target."
         ),
+    )
+    parser.add_argument(
+        "--group-offload-type",
+        choices=("block_level", "leaf_level"),
+        default="block_level",
+        help="Diffusers group-offload granularity used by --offload-mode group.",
+    )
+    parser.add_argument(
+        "--group-offload-num-blocks",
+        type=int,
+        default=1,
+        help=(
+            "Number of blocks per group for --offload-mode group when "
+            "--group-offload-type=block_level."
+        ),
+    )
+    parser.add_argument(
+        "--group-offload-use-stream",
+        dest="group_offload_use_stream",
+        action="store_true",
+        default=True,
+        help="Use a transfer stream for Diffusers group offload.",
+    )
+    parser.add_argument(
+        "--no-group-offload-use-stream",
+        dest="group_offload_use_stream",
+        action="store_false",
+        help="Disable the transfer stream for Diffusers group offload.",
+    )
+    parser.add_argument(
+        "--group-offload-non-blocking",
+        action="store_true",
+        help="Use non-blocking transfers for Diffusers group offload.",
     )
     parser.add_argument(
         "--warmup-runs",
@@ -127,8 +185,8 @@ def add_common_args(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run SDXL-Turbo or Qwen-Image with HF Accelerate CPU offload so the "
-            "pipeline can exceed GPU VRAM."
+            "Run SDXL-Turbo with HF Accelerate CPU offload so the pipeline can "
+            "exceed GPU VRAM."
         )
     )
     subparsers = parser.add_subparsers(dest="pipeline", required=True)
@@ -142,54 +200,13 @@ def parse_args() -> argparse.Namespace:
         default_model="/data/llamasim/models/sdxl-turbo",
         default_dtype="float16",
         default_offload_mode="model",
-        default_warmup_runs=0,
+        default_warmup_runs=4,
     )
     sdxl_parser.set_defaults(
-        steps=8,
+        steps=4,
         height=512,
         width=512,
-        prompt="a cute cat and a cute dog in a park",
-    )
-
-    qwen_parser = subparsers.add_parser(
-        "qwen-image",
-        help="Run the local Qwen-Image pipeline with CPU offload.",
-    )
-    add_common_args(
-        qwen_parser,
-        default_model="/data/llamasim/models/qwen-image-2512",
-        default_dtype="bfloat16",
-        default_offload_mode="sequential",
-        default_warmup_runs=0,
-    )
-    qwen_parser.add_argument(
-        "--negative-prompt",
-        default=" ",
-        help="Negative prompt passed to the pipeline.",
-    )
-    qwen_parser.add_argument(
-        "--true-cfg-scale",
-        type=float,
-        default=4.0,
-        help="Traditional classifier-free guidance scale used by Qwen-Image.",
-    )
-    qwen_parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        default=None,
-        help="Optional guidance-distilled scale.",
-    )
-    qwen_parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Seed for the generation RNG. Set to a negative value to disable.",
-    )
-    qwen_parser.add_argument(
-        "--max-sequence-length",
-        type=int,
-        default=512,
-        help="Maximum prompt sequence length passed to the pipeline.",
+        prompt="A cute dog and a cat in a park",
     )
     return parser.parse_args()
 
@@ -246,10 +263,7 @@ def ensure_accelerate_available() -> str:
 def maybe_compile(pipe: Any, args: argparse.Namespace) -> None:
     if args.fusion == "none":
         return
-    if args.pipeline == "sdxl-turbo":
-        sdxl_common.maybe_compile(pipe, args)
-        return
-    qwen_common.maybe_compile(pipe, args)
+    sdxl_common.maybe_compile(pipe, args)
 
 
 def pipeline_module_components(pipe: Any) -> dict[str, torch.nn.Module]:
@@ -371,6 +385,39 @@ def apply_accelerate_module_hook_cpu_offload(
     setattr(pipe, _DIRECT_HF_ACCELERATE_HOOKS_ATTR, hooks)
 
 
+def apply_diffusers_group_cpu_offload(
+    pipe: Any,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> None:
+    from diffusers.hooks import apply_group_offloading
+
+    if hasattr(pipe, "remove_all_hooks"):
+        pipe.remove_all_hooks()
+
+    modules = [
+        (name, module)
+        for name in _GROUP_OFFLOAD_COMPONENTS
+        if isinstance((module := getattr(pipe, name, None)), torch.nn.Module)
+    ]
+    if not modules:
+        raise RuntimeError(
+            "Could not find any SDXL torch.nn.Module components for "
+            "--offload-mode group."
+        )
+
+    group_offload_kwargs = dict(
+        onload_device=device,
+        offload_device=torch.device("cpu"),
+        offload_type=args.group_offload_type,
+        num_blocks_per_group=args.group_offload_num_blocks,
+        non_blocking=args.group_offload_non_blocking,
+        use_stream=args.group_offload_use_stream,
+    )
+    for _name, module in modules:
+        apply_group_offloading(module=module, **group_offload_kwargs)
+
+
 def apply_cpu_offload(pipe: Any, args: argparse.Namespace, device: torch.device) -> None:
     if args.offload_mode == "none":
         pipe.to(device)
@@ -384,7 +431,10 @@ def apply_cpu_offload(pipe: Any, args: argparse.Namespace, device: torch.device)
     if args.offload_mode == "module":
         apply_accelerate_module_cpu_offload(pipe, device)
         return
-    apply_accelerate_module_hook_cpu_offload(pipe, device)
+    if args.offload_mode == "module-hook":
+        apply_accelerate_module_hook_cpu_offload(pipe, device)
+        return
+    apply_diffusers_group_cpu_offload(pipe, args, device)
 
 
 def free_cpu_offload_hooks(pipe: Any) -> None:
@@ -398,58 +448,42 @@ def free_cpu_offload_hooks(pipe: Any) -> None:
         pipe.maybe_free_model_hooks()
 
 
-def format_qwen_model_offload_oom_error(
-    *,
-    model: str,
-    device: torch.device,
-    torch_dtype: torch.dtype,
-    exc: BaseException,
-) -> str:
-    return "\n".join(
-        [
-            "Qwen-Image hit CUDA OOM while using Accelerate model CPU offload.",
-            f"Model path: {model}",
-            f"device = {device}",
-            f"torch_dtype = {torch_dtype}",
-            f"Original error: {exc}",
-            "In `--offload-mode model`, Diffusers still moves the entire transformer onto the accelerator for each forward pass.",
-            "That transformer does not fit on this GPU, even though CPU RAM is available.",
-            "Re-run with `--offload-mode sequential` so Accelerate offloads submodules instead of the whole transformer.",
-        ]
-    )
+def _optional_model_arg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value == "" or value.lower() == "none":
+        return None
+    return value
 
 
-def load_sdxl_pipeline(model: str, torch_dtype: torch.dtype) -> Any:
+def _sdxl_text_to_image_pipeline_class() -> type[Any]:
     try:
+        from diffusers import AutoPipelineForText2Image
+
+        return AutoPipelineForText2Image
+    except ModuleNotFoundError as exc:
+        if sdxl_common.is_missing_diffusers_error(exc):
+            raise RuntimeError(
+                sdxl_common.format_missing_diffusers_runtime_error(
+                    component="the Accelerate CPU offload runner",
+                    exc=exc,
+                )
+            ) from exc
+        raise
+    except (ImportError, RuntimeError):
         from diffusers import StableDiffusionXLPipeline
-    except ModuleNotFoundError as exc:
-        if sdxl_common.is_missing_diffusers_error(exc):
-            raise RuntimeError(
-                sdxl_common.format_missing_diffusers_runtime_error(
-                    component="the Accelerate CPU offload runner",
-                    exc=exc,
-                )
-            ) from exc
-        raise
 
-    return StableDiffusionXLPipeline.from_pretrained(
-        model,
-        torch_dtype=torch_dtype,
-        use_safetensors=True,
-    )
+        return StableDiffusionXLPipeline
 
 
-def load_qwen_pipeline(model: str, torch_dtype: torch.dtype) -> Any:
-    architecture, model_type = qwen_common._read_qwen_model_requirements(model)
-    qwen_common.install_qwen25_transformers_compat()
+def load_sdxl_pipeline(
+    model: str,
+    torch_dtype: torch.dtype,
+    vae_model: str | None = DEFAULT_SDXL_VAE_MODEL,
+    variant: str | None = DEFAULT_SDXL_PIPELINE_VARIANT,
+) -> Any:
     try:
-        from diffusers import (
-            AutoencoderKLQwenImage,
-            FlowMatchEulerDiscreteScheduler,
-            QwenImagePipeline,
-            QwenImageTransformer2DModel,
-        )
-        import transformers
+        from diffusers import AutoencoderKL
     except ModuleNotFoundError as exc:
         if sdxl_common.is_missing_diffusers_error(exc):
             raise RuntimeError(
@@ -459,114 +493,48 @@ def load_qwen_pipeline(model: str, torch_dtype: torch.dtype) -> Any:
                 )
             ) from exc
         raise
-    except Exception as exc:
-        raise RuntimeError(
-            qwen_common.format_qwen_runtime_error(
-                model=model,
-                exc=exc,
-                diffusers_version=qwen_common._module_version("diffusers"),
-                transformers_version=qwen_common._module_version("transformers"),
-                architecture=architecture,
-                model_type=model_type,
-            )
-        ) from exc
 
-    text_encoder_cls = getattr(transformers, "Qwen2_5_VLForConditionalGeneration", None)
-    tokenizer_cls = getattr(transformers, "Qwen2Tokenizer", None)
-    missing_symbols = [
-        name
-        for name, value in (
-            ("Qwen2_5_VLForConditionalGeneration", text_encoder_cls),
-            ("Qwen2Tokenizer", tokenizer_cls),
-        )
-        if value is None
-    ]
-    if missing_symbols:
-        raise RuntimeError(
-            "transformers is missing required Qwen symbols after installing "
-            f"compatibility hooks: {', '.join(missing_symbols)}"
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "use_safetensors": True,
+    }
+    selected_variant = _optional_model_arg(variant)
+    if selected_variant is not None:
+        load_kwargs["variant"] = selected_variant
+
+    selected_vae_model = _optional_model_arg(vae_model)
+    if selected_vae_model is not None:
+        load_kwargs["vae"] = AutoencoderKL.from_pretrained(
+            selected_vae_model,
+            torch_dtype=torch_dtype,
+            use_safetensors=True,
         )
 
-    model_path = Path(model)
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_path / "scheduler")
-    text_encoder = text_encoder_cls.from_pretrained(
-        model_path / "text_encoder",
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=False,
-    )
-    tokenizer = tokenizer_cls.from_pretrained(model_path / "tokenizer")
-    transformer = QwenImageTransformer2DModel.from_pretrained(
-        model_path / "transformer",
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=False,
-    )
-    vae = AutoencoderKLQwenImage.from_pretrained(
-        model_path / "vae",
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=False,
-    )
-    pipe = QwenImagePipeline(
-        scheduler=scheduler,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        transformer=transformer,
-    )
-    missing = [
-        attr
-        for attr in ("transformer", "vae", "image_processor", "_unpack_latents", "vae_scale_factor")
-        if not hasattr(pipe, attr)
-    ]
-    if missing:
-        raise RuntimeError(
-            f"Loaded pipeline {type(pipe).__name__} from {model} is missing "
-            f"required Qwen attributes: {', '.join(missing)}"
-        )
+    pipeline_cls = _sdxl_text_to_image_pipeline_class()
+    pipe = pipeline_cls.from_pretrained(model, **load_kwargs)
+    vae_config = getattr(getattr(pipe, "vae", None), "config", None)
+    if vae_config is not None and hasattr(vae_config, "force_upcast"):
+        vae_config.force_upcast = False
     return pipe
 
 
 def load_pipeline(args: argparse.Namespace, torch_dtype: torch.dtype) -> Any:
-    if args.pipeline == "sdxl-turbo":
-        return load_sdxl_pipeline(args.model, torch_dtype)
-    return load_qwen_pipeline(args.model, torch_dtype)
-
-
-def run_qwen_pipeline_with_oom_guidance(
-    pipe: Any,
-    args: argparse.Namespace,
-    generator: torch.Generator | None,
-) -> Any:
-    try:
-        return qwen_common.run_pipeline(pipe, args, generator)
-    except torch.OutOfMemoryError as exc:
-        if args.offload_mode == "model":
-            raise RuntimeError(
-                format_qwen_model_offload_oom_error(
-                    model=args.model,
-                    device=torch.device(args.device),
-                    torch_dtype=sdxl_common.DTYPE_BY_NAME[args.dtype],
-                    exc=exc,
-                )
-            ) from exc
-        raise
+    return load_sdxl_pipeline(
+        args.model,
+        torch_dtype,
+        getattr(args, "vae_model", DEFAULT_SDXL_VAE_MODEL),
+        getattr(args, "variant", DEFAULT_SDXL_PIPELINE_VARIANT),
+    )
 
 
 def run_warmups(
     pipe: Any,
     args: argparse.Namespace,
     device: torch.device,
-    generator: torch.Generator | None,
 ) -> float:
     warmup_start = time.perf_counter()
     for _ in range(args.warmup_runs):
-        if args.pipeline == "sdxl-turbo":
-            warmup_output = sdxl_common.run_pipeline(pipe, args)
-        else:
-            warmup_output = run_qwen_pipeline_with_oom_guidance(
-                pipe,
-                args,
-                generator,
-            )
+        warmup_output = sdxl_common.run_pipeline(pipe, args)
         sdxl_common.synchronize_device(device)
         del warmup_output
     return elapsed_seconds(warmup_start)
@@ -576,17 +544,9 @@ def run_inference(
     pipe: Any,
     args: argparse.Namespace,
     device: torch.device,
-    generator: torch.Generator | None,
 ) -> tuple[Any, float]:
     inference_start = time.perf_counter()
-    if args.pipeline == "sdxl-turbo":
-        output = sdxl_common.run_pipeline(pipe, args)
-    else:
-        output = run_qwen_pipeline_with_oom_guidance(
-            pipe,
-            args,
-            generator,
-        )
+    output = sdxl_common.run_pipeline(pipe, args)
     sdxl_common.synchronize_device(device)
     return output, elapsed_seconds(inference_start)
 
@@ -594,15 +554,7 @@ def run_inference(
 def decode_images(pipe: Any, args: argparse.Namespace, output: Any, device: torch.device) -> tuple[list[Any], float]:
     decode_start = time.perf_counter()
     with torch.no_grad():
-        if args.pipeline == "sdxl-turbo":
-            images = sdxl_common.decode_latents_to_pil(pipe, output.images)
-        else:
-            images = qwen_common.decode_latents_to_pil(
-                pipe,
-                output.images,
-                height=args.height,
-                width=args.width,
-            )
+        images = sdxl_common.decode_latents_to_pil(pipe, output.images)
     sdxl_common.synchronize_device(device)
     return images, elapsed_seconds(decode_start)
 
@@ -616,6 +568,8 @@ def main() -> None:
         if args.offload_mode != "none"
         else "not_used"
     )
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = sdxl_common.DTYPE_BY_NAME[args.dtype]
     image_path = resolve_image_path(args)
 
@@ -630,16 +584,10 @@ def main() -> None:
     sdxl_common.synchronize_device(device)
     load_seconds = elapsed_seconds(load_start)
 
-    generator = (
-        qwen_common.build_generator(args, device)
-        if args.pipeline == "qwen-image"
-        else None
-    )
-
-    warmup_seconds = run_warmups(pipe, args, device, generator)
+    warmup_seconds = run_warmups(pipe, args, device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    output, inference_seconds = run_inference(pipe, args, device, generator)
+    output, inference_seconds = run_inference(pipe, args, device)
     images, decode_seconds = decode_images(pipe, args, output, device)
 
     free_cpu_offload_hooks(pipe)
@@ -662,6 +610,9 @@ def main() -> None:
     print("fusion:", args.fusion)
     print("accelerate_version:", accelerate_version)
     print("dtype:", args.dtype)
+    print("vae_model:", args.vae_model)
+    print("variant:", args.variant)
+    print("seed:", args.seed)
     print("steps:", args.steps)
     print("warmup_runs:", args.warmup_runs)
     print("image_path:", image_path)

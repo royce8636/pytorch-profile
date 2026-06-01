@@ -476,16 +476,23 @@ def main(
                 "llamasim-runtime export requested without an execution trace path"
             )
         _trans = sdxl_common.underlying_unet_module(pipe.transformer)
-        _pipe_catalog, _pipe_id_to_path = sdxl_common.build_pipeline_module_index(pipe)
+        # Use prof-derived observation-order mapping (see
+        # `build_module_id_to_path_from_prof`).
+        _pipe_catalog, _pipe_id_to_path = (
+            sdxl_common.build_pipeline_module_index_from_prof(prof, pipe)
+        )
         sdxl_common.write_llamasim_runtime_bundle(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
             module_catalog=sdxl_common.build_module_catalog(_trans),
-            module_id_to_path=sdxl_common.build_module_id_to_path(_trans),
+            module_id_to_path=sdxl_common.build_module_id_to_path_from_prof(
+                prof, _trans,
+            ),
             pipeline_module_catalog=_pipe_catalog,
             pipeline_module_id_to_path=_pipe_id_to_path,
+            module_hierarchy=sdxl_common.build_module_hierarchy(pipe),
         )
 
     if hasattr(pipe, "maybe_free_model_hooks"):

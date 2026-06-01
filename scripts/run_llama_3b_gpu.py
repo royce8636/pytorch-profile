@@ -42,9 +42,15 @@ def parse_args(
         help="Prompt fed to the causal LM.",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Manual seed passed to torch.manual_seed. Set negative to skip seeding.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=64,
+        default=15,
         help="Number of tokens to generate per run.",
     )
     parser.add_argument(
@@ -63,6 +69,11 @@ def parse_args(
         type=float,
         default=1.0,
         help="Sampling temperature (only used with --do-sample).",
+    )
+    parser.add_argument(
+        "--enable-eos-stop",
+        action="store_true",
+        help="Stop early when every batch item emits EOS. Disabled by default.",
     )
     parser.add_argument(
         "--device",
@@ -110,10 +121,9 @@ def parse_args(
     parser.add_argument(
         "--warmup-runs",
         type=int,
-        default=None,
+        default=1,
         help=(
-            "Warmup iterations before timing. Defaults to 1 for --fusion=inductor "
-            "and 0 otherwise."
+            "Warmup iterations before timing."
         ),
     )
     parser.add_argument(
@@ -217,6 +227,8 @@ def main(
     )
     device = validate_run_device(args.device)
     validate_fusion_runtime(args, device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     warmup_runs = (
         args.warmup_runs if args.warmup_runs is not None else int(args.fusion != "none")
@@ -259,6 +271,8 @@ def main(
     print("device:", device)
     print("dtype:", args.dtype)
     print("fusion:", args.fusion)
+    print("seed:", args.seed)
+    print("enable_eos_stop:", args.enable_eos_stop)
     print("max_new_tokens:", args.max_new_tokens)
     print("batch_size:", args.batch_size)
     print("warmup_runs:", warmup_runs)

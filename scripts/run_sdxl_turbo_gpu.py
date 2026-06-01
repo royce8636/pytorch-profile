@@ -15,6 +15,8 @@ if str(THIS_DIR) not in sys.path:
 
 from profile_sdxl_turbo_common import (  # noqa: E402
     DTYPE_BY_NAME,
+    DEFAULT_SDXL_PIPELINE_VARIANT,
+    DEFAULT_SDXL_VAE_MODEL,
     decode_latents_to_pil,
     load_pipeline,
     maybe_compile,
@@ -28,6 +30,8 @@ from profile_sdxl_turbo_common import (  # noqa: E402
 def parse_args(
     *,
     default_model: str | None = "/data/llamasim/models/sdxl-turbo",
+    default_vae_model: str | None = DEFAULT_SDXL_VAE_MODEL,
+    default_variant: str | None = DEFAULT_SDXL_PIPELINE_VARIANT,
     default_output_prefix: str = "sdxl_turbo_gpu_run",
     description: str = "Run SDXL Turbo on GPU without profiler instrumentation.",
 ) -> argparse.Namespace:
@@ -42,26 +46,32 @@ def parse_args(
     )
     parser.add_argument(
         "--prompt",
-        default="a lovely cat",
+        default="A cute dog and a cat in a park",
         help="Prompt passed to the pipeline.",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=1,
+        default=4,
         help="Number of inference steps.",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=128,
+        default=512,
         help="Output height.",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=128,
+        default=512,
         help="Output width.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Manual seed passed to torch.manual_seed. Set negative to skip seeding.",
     )
     parser.add_argument(
         "--device",
@@ -73,6 +83,22 @@ def parse_args(
         choices=tuple(DTYPE_BY_NAME.keys()),
         default="float16",
         help="Torch dtype used to load the pipeline.",
+    )
+    parser.add_argument(
+        "--vae-model",
+        default=default_vae_model,
+        help=(
+            "VAE checkpoint loaded into the SDXL pipeline. Use 'none' to keep the "
+            "VAE bundled with --model."
+        ),
+    )
+    parser.add_argument(
+        "--variant",
+        default=default_variant,
+        help=(
+            "Diffusers checkpoint variant loaded for the SDXL pipeline. Use 'none' "
+            "or an empty string to omit the variant argument."
+        ),
     )
     parser.add_argument(
         "--fusion",
@@ -96,10 +122,10 @@ def parse_args(
     parser.add_argument(
         "--warmup-runs",
         type=int,
-        default=None,
+        default=4,
         help=(
-            "Warmup iterations run before timing. Defaults to 1 for "
-            "--fusion=inductor and 0 otherwise."
+            "Warmup iterations run before timing. Defaults to the SDXL-Turbo "
+            "denoising step count."
         ),
     )
     parser.add_argument(
@@ -171,16 +197,22 @@ def validate_run_device(device_name: str) -> torch.device:
 def main(
     *,
     default_model: str | None = "/data/llamasim/models/sdxl-turbo",
+    default_vae_model: str | None = DEFAULT_SDXL_VAE_MODEL,
+    default_variant: str | None = DEFAULT_SDXL_PIPELINE_VARIANT,
     default_output_prefix: str = "sdxl_turbo_gpu_run",
     description: str = "Run SDXL Turbo on GPU without profiler instrumentation.",
 ) -> None:
     args = parse_args(
         default_model=default_model,
+        default_vae_model=default_vae_model,
+        default_variant=default_variant,
         default_output_prefix=default_output_prefix,
         description=description,
     )
     device = validate_run_device(args.device)
     validate_fusion_runtime(args, device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     warmup_runs = (
         args.warmup_runs if args.warmup_runs is not None else int(args.fusion != "none")
@@ -190,7 +222,13 @@ def main(
     total_start = time.perf_counter()
 
     load_start = time.perf_counter()
-    pipe = load_pipeline(args.model, torch_dtype, device)
+    pipe = load_pipeline(
+        args.model,
+        torch_dtype,
+        device,
+        args.vae_model,
+        args.variant,
+    )
     if args.disable_progress_bar:
         pipe.set_progress_bar_config(disable=True)
     maybe_compile(pipe, args)
@@ -228,8 +266,11 @@ def main(
 
     print("device:", device)
     print("dtype:", args.dtype)
+    print("vae_model:", args.vae_model)
+    print("variant:", args.variant)
     print("fusion:", args.fusion)
     print("steps:", args.steps)
+    print("seed:", args.seed)
     print("warmup_runs:", warmup_runs)
     print("image_path:", image_path)
     print("latent_shape:", tuple(output.images.shape))

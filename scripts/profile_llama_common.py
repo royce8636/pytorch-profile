@@ -30,8 +30,11 @@ from profile_sdxl_turbo_common import (  # noqa: E402
     DTYPE_BY_NAME,
     OutputPaths,
     build_module_catalog,
+    build_module_hierarchy,
     build_module_id_to_path,
+    build_module_id_to_path_from_prof,
     build_pipeline_module_index,
+    build_pipeline_module_index_from_prof,
     capture_example_inputs,
     configure_llamasim_inductor_markers,
     dot_level_enabled,
@@ -100,13 +103,16 @@ def parse_args(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_output_dir: str | None = None,
     default_model: str | None,
     default_component: str,
     default_fusion: str,
     default_dot_level: str,
+    default_max_new_tokens: int = 15,
     default_profile_memory: bool,
     default_record_shapes: bool,
     default_with_stack: bool,
+    default_with_modules: bool = True,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Llama profiler driver for the patched PyTorch build."
@@ -126,9 +132,15 @@ def parse_args(
         help="Prompt fed to the causal LM.",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Manual seed passed to torch.manual_seed. Set negative to skip seeding.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=16,
+        default=default_max_new_tokens,
         help="Number of tokens to generate per run.",
     )
     parser.add_argument(
@@ -147,6 +159,11 @@ def parse_args(
         type=float,
         default=1.0,
         help="Sampling temperature (only used with --do-sample).",
+    )
+    parser.add_argument(
+        "--enable-eos-stop",
+        action="store_true",
+        help="Stop early when every batch item emits EOS. Disabled by default.",
     )
     parser.add_argument(
         "--device",
@@ -198,15 +215,14 @@ def parse_args(
     parser.add_argument(
         "--warmup-runs",
         type=int,
-        default=None,
+        default=1,
         help=(
-            "Warmup iterations run before profiling. Defaults to 1 for "
-            "--fusion=inductor and 0 otherwise."
+            "Warmup iterations run before profiling."
         ),
     )
     parser.add_argument(
         "--output-dir",
-        default=None,
+        default=default_output_dir,
         help=(
             "Directory for profiler outputs. If set, writes trace JSON, trace CSV, "
             "text output, and optional DOT outputs into this directory."
@@ -312,6 +328,19 @@ def parse_args(
         dest="with_stack",
         action="store_false",
         help="Disable Python source-location capture in the profiler results.",
+    )
+    parser.add_argument(
+        "--with-modules",
+        dest="with_modules",
+        action="store_true",
+        default=default_with_modules,
+        help="Record module hierarchy information in profiler events.",
+    )
+    parser.add_argument(
+        "--no-with-modules",
+        dest="with_modules",
+        action="store_false",
+        help="Disable module hierarchy capture in profiler events.",
     )
     return parser.parse_args()
 
@@ -584,12 +613,15 @@ def greedy_generate(
 
 def run_pipeline(pipe: LlamaPipeline, args: argparse.Namespace) -> LlamaOutput:
     input_ids = encode_prompt(pipe, args)
+    eos_token_id = (
+        pipe.tokenizer.eos_token_id if getattr(args, "enable_eos_stop", False) else None
+    )
     with torch.no_grad():
         sequences = greedy_generate(
             pipe.model,
             input_ids,
             max_new_tokens=args.max_new_tokens,
-            eos_token_id=pipe.tokenizer.eos_token_id,
+            eos_token_id=eos_token_id,
             do_sample=args.do_sample,
             temperature=args.temperature,
         )
@@ -619,30 +651,38 @@ def main(
     default_device: str,
     default_dtype: str,
     default_output_prefix: str,
+    default_output_dir: str | None = None,
     default_model: str | None,
     default_component: str = "llama",
     default_fusion: str = "none",
     default_dot_level: str = "none",
     default_llamasim_output_dirname: str | None = None,
+    default_max_new_tokens: int = 15,
     default_profile_memory: bool = False,
     default_record_shapes: bool = False,
     default_with_stack: bool = False,
+    default_with_modules: bool = True,
 ) -> None:
     args = parse_args(
         default_device=default_device,
         default_dtype=default_dtype,
         default_output_prefix=default_output_prefix,
+        default_output_dir=default_output_dir,
         default_model=default_model,
         default_component=default_component,
         default_fusion=default_fusion,
         default_dot_level=default_dot_level,
+        default_max_new_tokens=default_max_new_tokens,
         default_profile_memory=default_profile_memory,
         default_record_shapes=default_record_shapes,
         default_with_stack=default_with_stack,
+        default_with_modules=default_with_modules,
     )
     validate_dot_args(args)
     device = validate_device(args)
     validate_fusion_runtime(args, device)
+    if args.seed is not None and args.seed >= 0:
+        torch.manual_seed(args.seed)
     torch_dtype = DTYPE_BY_NAME[args.dtype]
     warmup_runs = (
         args.warmup_runs if args.warmup_runs is not None else int(args.fusion != "none")
@@ -677,7 +717,7 @@ def main(
         record_shapes=args.record_shapes,
         profile_memory=args.profile_memory,
         with_stack=args.with_stack,
-        with_modules=True,
+        with_modules=args.with_modules,
         execution_trace_observer=execution_trace_observer,
     ) as prof:
         with torch.autograd.profiler.record_function("llama_run", scope_args):
@@ -692,7 +732,7 @@ def main(
     metadata_json = None
     for event in prof.events():
         if event.name == "llama_run":
-            metadata_json = event.metadata_json
+            metadata_json = getattr(event, "metadata_json", None)
             break
 
     prof.export_chrome_trace(str(output_paths.trace_path))
@@ -760,16 +800,22 @@ def main(
                 "llamasim-runtime export requested without an execution trace path"
             )
         _llm = underlying_model(pipe.model)
-        _pipe_catalog, _pipe_id_to_path = build_pipeline_module_index(_llm)
+        # Use prof-derived observation-order mapping so the trace's
+        # `nn.Module: <cls>_<id>` event names resolve to the correct
+        # submodule paths instead of named_modules() walk-order.
+        _pipe_catalog, _pipe_id_to_path = build_pipeline_module_index_from_prof(
+            prof, _llm,
+        )
         write_llamasim_runtime_bundle(
             prof,
             output_paths.execution_trace_path,
             output_paths.llamasim_output_dir,
             trace_json_path=output_paths.trace_path,
             module_catalog=build_module_catalog(_llm),
-            module_id_to_path=build_module_id_to_path(_llm),
+            module_id_to_path=build_module_id_to_path_from_prof(prof, _llm),
             pipeline_module_catalog=_pipe_catalog,
             pipeline_module_id_to_path=_pipe_id_to_path,
+            module_hierarchy=build_module_hierarchy(_llm),
         )
 
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
@@ -781,9 +827,12 @@ def main(
     print("dtype:", args.dtype)
     print("fusion:", args.fusion)
     print("dot_level:", args.dot_level)
+    print("seed:", args.seed)
+    print("enable_eos_stop:", args.enable_eos_stop)
     print("profile_memory:", args.profile_memory)
     print("record_shapes:", args.record_shapes)
     print("with_stack:", args.with_stack)
+    print("with_modules:", args.with_modules)
     print("warmup_runs:", warmup_runs)
     print("trace_path:", output_paths.trace_path)
     if hasattr(prof, "export_csv"):
