@@ -103,6 +103,13 @@ CGSIM_VARIANT_MODULES = {
     "cgsim_milp_oracle_old": "graph_modifiers.old.ct_milp_oracle.scheduler",
 }
 
+# Schedulers with the ``solve_neutral`` interface: they emit a backend-
+# neutral schedule whose anchors are exact trace node ids, converted to the
+# PyTorch schema via ``neutral_to_pytorch_anchored``.
+NEUTRAL_VARIANT_MODULES = {
+    "cgsim_milp_orderax": "graph_modifiers.schedulers.ct_milp_orderax.scheduler",
+}
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -113,6 +120,7 @@ def parse_args():
     p.add_argument("--variant", default="ct_belady_pcie",
                    choices=list(VARIANT_MODULES.keys())
                    + list(CGSIM_VARIANT_MODULES.keys())
+                   + list(NEUTRAL_VARIANT_MODULES.keys())
                    + ["baseline_nows"])
     p.add_argument(
         "--work-dir", default="/tmp/streaming_e2e_out",
@@ -133,6 +141,14 @@ def parse_args():
     p.add_argument(
         "--alpha", type=float, default=1.0,
         help="For cgsim_mincost_flow: 0..1 peak-vs-stall Pareto weight.",
+    )
+    p.add_argument(
+        "--cap-gib", type=float, default=7.0,
+        help="For solve_neutral variants: VRAM peak target in GiB.",
+    )
+    p.add_argument(
+        "--cap-margin", type=float, default=0.05,
+        help="For solve_neutral variants: safety margin fraction on the cap.",
     )
     return p.parse_args()
 
@@ -218,6 +234,8 @@ def stage_schedule(
     args, bundle_dir: Path
 ) -> Path:
     """Invoke the selected scheduler variant on the bundle; return schedule path."""
+    if args.variant in NEUTRAL_VARIANT_MODULES:
+        return _stage_schedule_neutral(args, bundle_dir)
     if args.variant in CGSIM_VARIANT_MODULES:
         return _stage_schedule_cgsim(args, bundle_dir)
 
@@ -262,6 +280,84 @@ def stage_schedule(
     with open(out_path, "w") as f:
         json.dump(schedule, f, indent=2)
     print(f"→ schedule written to {out_path}")
+    return out_path
+
+
+def _stage_schedule_neutral(args, bundle_dir: Path) -> Path:
+    """Path for solve_neutral schedulers (order-axis MILP family)."""
+    from graph_modifiers.common import (
+        build_node_timeline, build_unified_timeline, load_hw_params,
+        load_multi_graph_sidecars, load_trace_from_bundle,
+        map_trace_tids_to_sidecar, neutral_to_pytorch_anchored,
+        remap_neutral_to_compile_space, write_neutral_schedule,
+    )
+
+    mod = importlib.import_module(NEUTRAL_VARIANT_MODULES[args.variant])
+
+    print(f"→ [cg-sim] loading trace from {bundle_dir}")
+    trace = load_trace_from_bundle(str(bundle_dir))
+    sidecars = load_multi_graph_sidecars(str(bundle_dir))
+    if not sidecars.launch_maps:
+        raise RuntimeError(f"bundle {bundle_dir} has no compile sidecars.")
+    hw = load_hw_params(args.hw)
+
+    # The PyTorch wrapper can only stream compile-space graph inputs.
+    # Restrict the pool to trace tids that resolve to sidecar entries and
+    # speak compile-space in the emitted ops.
+    tl = build_unified_timeline(
+        trace, sidecars, cpu_per_launch_ns=hw.cpu_per_launch_ns,
+    )
+    tid_to_sidecar = map_trace_tids_to_sidecar(trace, tl)
+
+    # Executor-matched semantics: cold tensors are never released on the
+    # real executor (only streamed tensors get tail evicts + reloads).
+    # setdefault so an explicit MILP_COLD_NO_RELEASE=0 (e.g. to reproduce
+    # a published sweep's schedule methodology) is honored.
+    os.environ.setdefault("MILP_COLD_NO_RELEASE", "1")
+
+    peak_target = int(args.cap_gib * 1024**3)
+    print(f"→ solve_neutral: cap={peak_target / 1e6:.0f}MB "
+          f"margin={args.cap_margin} "
+          f"schedulable_tids={len(tid_to_sidecar)}")
+    neutral = mod.solve_neutral(
+        trace,
+        hw=hw,
+        peak_target_bytes=peak_target,
+        safety_margin_frac=args.cap_margin,
+        sidecars=sidecars,
+        schedulable_tids=set(tid_to_sidecar),
+        audit=True,
+    )
+    if hasattr(mod, "print_summary"):
+        mod.print_summary(neutral)
+
+    n_unmapped, unmapped_b = remap_neutral_to_compile_space(
+        neutral, tid_to_sidecar,
+    )
+    if n_unmapped:
+        print(f"→ remap: {n_unmapped} tensors unmapped "
+              f"({unmapped_b / 1e6:.0f}MB stays resident)")
+    write_neutral_schedule(bundle_dir / "neutral_schedule.json", neutral)
+
+    node_starts, node_ends = build_node_timeline(tl, trace)
+    hashes = {
+        int(gid): str(lm.get("compilation_hash", ""))
+        for gid, lm in sidecars.launch_maps.items()
+    }
+    doc = neutral_to_pytorch_anchored(
+        neutral, trace=trace,
+        node_starts=node_starts, node_ends=node_ends,
+        compilation_hashes=hashes,
+    )
+    out_path = bundle_dir / "jit_sim_prune_schedule.json"
+    with open(out_path, "w") as f:
+        json.dump(doc, f, indent=2)
+    n_pf = sum(1 for op in doc["io_operations"]
+               if op["type"] == "vram_prefetch_h2d")
+    n_ev = len(doc["io_operations"]) - n_pf
+    print(f"→ schedule written to {out_path} "
+          f"(h2d={n_pf} evict={n_ev} "
+          f"cold={len(doc['cold_start_prefetches'])})")
     return out_path
 
 
@@ -448,8 +544,38 @@ def stage_run(
     _ = run_pipeline(pipe, args)
     sync(device)
 
-    # (Pre-evict of non-current-graph weights was here — removed because
-    # the compiled wrappers don't emit reload ops to bring them back.)
+    # Order-axis plans measure one pipeline call from the plan's INITIAL
+    # state: streamed tensors absent, cold tensors resident (the sim's
+    # cold set is loaded at layout time). Park ONLY the streamed set —
+    # h2d consumers that are not cold-starts — in DRAM; the timed call's
+    # own prefetch ops bring them back per plan. (evict_cross_graph([])
+    # would also park the cold set, turning the timed run's wrapper-top
+    # cold-start path into a multi-GB serial sync reload.)
+    if args.variant in NEUTRAL_VARIANT_MODULES and device.type == "cuda":
+        cold_keys = {
+            (int(op.compiled_graph_id), op.graph_input_name)
+            for op in schedule.cold_starts
+        }
+        streamed: dict[int, torch.Tensor] = {}
+        for op in schedule.h2d_prefetches:
+            key = (int(op.compiled_graph_id), op.graph_input_name)
+            if key in cold_keys:
+                continue
+            t = rt._named_weights.get(key)
+            if t is not None:
+                streamed[id(t)] = t
+        if streamed:
+            sync(device)
+            torch.ops.ws_rt.ws_ops(
+                [], [], list(streamed.values()), [], [], [], True,
+            )
+            sync(device)
+            torch.ops.ws_rt.flush_ready_vram_evictions()
+            parked = sum(
+                t.numel() * t.element_size() for t in streamed.values()
+            )
+            print(f"→ parked {len(streamed)} streamed weights "
+                  f"({parked / 1e6:.0f}MB) in DRAM (plan initial state)")
 
     # Timed run with peak tracking.
     if device.type == "cuda":
@@ -460,11 +586,18 @@ def stage_run(
         # the consumer's tensors).
         if hasattr(torch.ops.ws_rt, "get_wait_stats"):
             torch.ops.ws_rt.get_wait_stats()
+    memsnap = os.environ.get("TORCH_WS_MEMSNAP")
+    if memsnap and device.type == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=400000)
     print("→ timed inference run ...")
     t0 = time.perf_counter()
     output = run_pipeline(pipe, args)
     sync(device)
     elapsed = time.perf_counter() - t0
+    if memsnap and device.type == "cuda":
+        torch.cuda.memory._dump_snapshot(memsnap)
+        torch.cuda.memory._record_memory_history(None)
+        print(f"→ memory snapshot written to {memsnap}")
 
     alloc_mb = torch.cuda.memory_allocated(device) / 1e6 if device.type == "cuda" else 0
     peak_mb = torch.cuda.max_memory_allocated(device) / 1e6 if device.type == "cuda" else 0

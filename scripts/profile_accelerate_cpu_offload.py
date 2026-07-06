@@ -287,18 +287,22 @@ def main() -> None:
     compiled_module = sdxl_common.underlying_unet_module(pipe.unet)
     # Use prof-derived observation-order mapping (see
     # `build_module_id_to_path_from_prof`).
+    print("llamasim_runtime_bundle: building pipeline module index", flush=True)
     _pipe_catalog, _pipe_id_to_path = (
         sdxl_common.build_pipeline_module_index_from_prof(prof, pipe)
     )
+    print("llamasim_runtime_bundle: building component module index", flush=True)
+    _module_id_to_path = sdxl_common.build_module_id_to_path_from_prof(
+        prof, compiled_module,
+    )
+    print("llamasim_runtime_bundle: writing runtime bundle", flush=True)
     sdxl_common.write_llamasim_runtime_bundle(
         prof,
         output_paths.execution_trace_path,
         output_paths.llamasim_output_dir,
         trace_json_path=output_paths.trace_path,
         module_catalog=sdxl_common.build_module_catalog(compiled_module),
-        module_id_to_path=sdxl_common.build_module_id_to_path_from_prof(
-            prof, compiled_module,
-        ),
+        module_id_to_path=_module_id_to_path,
         pipeline_module_catalog=_pipe_catalog,
         pipeline_module_id_to_path=_pipe_id_to_path,
         module_hierarchy=sdxl_common.build_module_hierarchy(pipe),

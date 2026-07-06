@@ -97,6 +97,10 @@ class WeightStreamRuntime:
         # of the C++ ``named_to_key`` map.
         self._named_weights: dict[tuple[int, str], torch.Tensor] = {}
 
+        # Per-graph iter counters for the Python fallback path (the C++
+        # runtime keeps its own).
+        self._graph_iters: dict[int, int] = {}
+
         # VRAM evictions are deferred until the CUDA stream reaches the point
         # where eviction was requested. This prevents host-side storage resize
         # from racing outstanding kernels that still read the tensor.
@@ -205,13 +209,18 @@ class WeightStreamRuntime:
         if _ws_native_available():
             torch.ops.ws_rt.mark_reloadable(list(tensors))
 
-    def begin_graph_iter(self, gid: int) -> None:
+    def begin_graph_iter(self, gid: int) -> int:
         """Advance the per-graph iter counter (called once per wrapper
         invocation). The runtime uses this counter to filter masked ops
-        for partial schedules.
+        for partial schedules. Returns the new iter index (0 on the
+        graph's first invocation) so generated code can gate its
+        one-time registration block.
         """
         if _ws_native_available():
-            torch.ops.ws_rt.begin_graph_iter(int(gid))
+            return int(torch.ops.ws_rt.begin_graph_iter(int(gid)))
+        idx = self._graph_iters.get(gid, -1) + 1
+        self._graph_iters[gid] = idx
+        return idx
 
     def set_iter_mask(
         self,

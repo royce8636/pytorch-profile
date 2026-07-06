@@ -77,10 +77,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vram-kind",
         choices=("reserved", "allocated"),
-        default="reserved",
+        default="allocated",
         help=(
             "Which peak VRAM value to report from profiler memory events. "
-            "Defaults to reserved."
+            "Defaults to allocated, matching the no-profile runners' "
+            "torch.cuda.max_memory_allocated() peak."
+        ),
+    )
+    parser.add_argument(
+        "--memory-source",
+        choices=("auto", "trace", "manifest"),
+        default="auto",
+        help=(
+            "Where to read peak VRAM from. 'auto' prefers llama_bundle "
+            "manifest CUDA memory stats for profile directories/bundles, "
+            "and raw profiler trace memory events for explicit trace JSON/CSV "
+            "inputs."
         ),
     )
     parser.add_argument(
@@ -290,23 +302,7 @@ def _parse_peak_vram_from_trace_json(trace_json_path: Path, vram_kind: str) -> i
     return peak
 
 
-def _resolve_peak_vram_bytes(path: Path, vram_kind: str) -> int:
-    trace_json_path = _find_trace_json_path(path)
-    trace_error: RuntimeError | None = None
-    if trace_json_path is not None:
-        try:
-            return _parse_peak_vram_from_trace_json(trace_json_path, vram_kind)
-        except RuntimeError as exc:
-            trace_error = exc
-
-    manifest_path = _find_manifest_path(path)
-    if manifest_path is None:
-        if trace_error is not None:
-            raise trace_error
-        raise RuntimeError(
-            "Could not find profiler trace memory events or manifest.json. "
-            "Pass a profile output directory containing a *_trace.json file."
-        )
+def _parse_peak_vram_from_manifest(manifest_path: Path, vram_kind: str) -> int:
     manifest = _load_json(manifest_path)
     key = (
         "vram_peak_reserved_bytes"
@@ -317,6 +313,65 @@ def _resolve_peak_vram_bytes(path: Path, vram_kind: str) -> int:
     if value is None:
         raise RuntimeError(f"{manifest_path} does not contain {key}")
     return int(value)
+
+
+def _is_explicit_trace_input(path: Path) -> bool:
+    return _is_profiler_trace_json_path(path) or (
+        path.is_file() and path.suffix == ".csv"
+    )
+
+
+def _resolve_peak_vram_bytes(
+    path: Path,
+    vram_kind: str,
+    memory_source: str,
+) -> int:
+    manifest_path = _find_manifest_path(path)
+
+    if memory_source == "manifest":
+        if manifest_path is None:
+            raise RuntimeError(f"Could not find manifest.json near {path}")
+        return _parse_peak_vram_from_manifest(manifest_path, vram_kind)
+
+    trace_json_path = _find_trace_json_path(path)
+
+    if memory_source == "trace":
+        if trace_json_path is None:
+            raise RuntimeError(f"Could not find profiler trace JSON near {path}")
+        return _parse_peak_vram_from_trace_json(trace_json_path, vram_kind)
+
+    if memory_source != "auto":
+        raise ValueError(f"Unsupported memory_source: {memory_source}")
+
+    manifest_error: RuntimeError | None = None
+    if manifest_path is not None and not _is_explicit_trace_input(path):
+        try:
+            return _parse_peak_vram_from_manifest(manifest_path, vram_kind)
+        except RuntimeError as exc:
+            manifest_error = exc
+
+    trace_error: RuntimeError | None = None
+    if trace_json_path is not None:
+        try:
+            return _parse_peak_vram_from_trace_json(trace_json_path, vram_kind)
+        except RuntimeError as exc:
+            trace_error = exc
+
+    if manifest_path is not None:
+        try:
+            return _parse_peak_vram_from_manifest(manifest_path, vram_kind)
+        except RuntimeError as exc:
+            manifest_error = exc
+
+    if trace_error is not None:
+        raise trace_error
+    if manifest_error is not None:
+        raise manifest_error
+    raise RuntimeError(
+        "Could not find profiler trace memory events or manifest.json. "
+        "Pass a profile output directory containing a *_trace.json file or "
+        "a llama_bundle manifest."
+    )
 
 
 def _duration_ns_from_row(row: dict[str, str]) -> float:
@@ -431,11 +486,12 @@ def summarize_profile(
     path: Path,
     *,
     vram_kind: str,
+    memory_source: str = "auto",
     time_source: str = "auto",
 ) -> ProfileSummary:
     cpu_busy_time_us, gpu_busy_time_us = _resolve_busy_times_us(path)
     return ProfileSummary(
-        peak_vram_bytes=_resolve_peak_vram_bytes(path, vram_kind),
+        peak_vram_bytes=_resolve_peak_vram_bytes(path, vram_kind, memory_source),
         e2e_time_us=_resolve_e2e_time_us(path, time_source),
         cpu_busy_time_us=cpu_busy_time_us,
         gpu_busy_time_us=gpu_busy_time_us,
@@ -480,6 +536,7 @@ def main() -> None:
     summary = summarize_profile(
         Path(args.path),
         vram_kind=args.vram_kind,
+        memory_source=args.memory_source,
         time_source=args.time_source,
     )
     print_summary(summary)

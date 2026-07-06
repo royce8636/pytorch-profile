@@ -28,6 +28,8 @@ group_offload_kwargs = dict(
     num_blocks_per_group=1,
     use_stream=True,
     non_blocking=False,
+    record_stream=False,
+    low_cpu_mem_usage=False,
 )
 
 apply_group_offloading(pipe.unet, **group_offload_kwargs)

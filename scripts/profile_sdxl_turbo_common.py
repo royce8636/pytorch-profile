@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 from dataclasses import dataclass
 import gzip
@@ -2813,6 +2814,114 @@ def _trace_event_int_arg(event: dict[str, Any], key: str) -> int | None:
         return None
 
 
+_CHROME_TRACE_READ_CHUNK_BYTES = 1024 * 1024
+
+
+def _iter_chrome_trace_events(trace_json_path: Path):
+    """Yield Chrome traceEvents one at a time without loading the whole trace."""
+    decoder = json.JSONDecoder()
+    trace_events_key = '"traceEvents"'
+    buffer = ""
+    pos = 0
+
+    with trace_json_path.open(encoding="utf-8") as f:
+        while True:
+            chunk = f.read(_CHROME_TRACE_READ_CHUNK_BYTES)
+            if not chunk:
+                return
+            buffer += chunk
+            key_pos = buffer.find(trace_events_key)
+            if key_pos < 0:
+                buffer = buffer[-len(trace_events_key):]
+                continue
+            list_pos = buffer.find("[", key_pos + len(trace_events_key))
+            if list_pos < 0:
+                buffer = buffer[key_pos:]
+                continue
+            pos = list_pos + 1
+            break
+
+        while True:
+            while True:
+                while pos < len(buffer) and buffer[pos] in " \t\r\n,":
+                    pos += 1
+                if pos < len(buffer):
+                    break
+                chunk = f.read(_CHROME_TRACE_READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                buffer = chunk
+                pos = 0
+
+            if buffer[pos] == "]":
+                return
+
+            try:
+                event, next_pos = decoder.raw_decode(buffer, pos)
+            except json.JSONDecodeError:
+                chunk = f.read(_CHROME_TRACE_READ_CHUNK_BYTES)
+                if not chunk:
+                    raise
+                buffer = buffer[pos:] + chunk
+                pos = 0
+                continue
+
+            if isinstance(event, dict):
+                yield event
+            pos = next_pos
+            if pos > _CHROME_TRACE_READ_CHUNK_BYTES:
+                buffer = buffer[pos:]
+                pos = 0
+
+
+def _select_chrome_trace_start_us(
+    trace_category_start_us: float | None,
+    iteration_start_us: float | None,
+) -> float:
+    if trace_category_start_us is not None:
+        return trace_category_start_us
+    if iteration_start_us is not None:
+        return iteration_start_us
+    return 0.0
+
+
+def _update_chrome_trace_start_candidates(
+    event: dict[str, Any],
+    trace_category_start_us: float | None,
+    iteration_start_us: float | None,
+) -> tuple[float | None, float | None]:
+    ts = event.get("ts")
+    if ts is None:
+        return trace_category_start_us, iteration_start_us
+    if (
+        trace_category_start_us is None
+        and event.get("ph") == "X"
+        and event.get("cat") == "Trace"
+    ):
+        trace_category_start_us = float(ts)
+    if iteration_start_us is None and event.get(
+        "name"
+    ) == "Iteration Start: PyTorch Profiler":
+        iteration_start_us = float(ts)
+    return trace_category_start_us, iteration_start_us
+
+
+def _compact_ac2g_trace_event(event: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        key: event.get(key)
+        for key in ("ph", "cat", "name", "ts", "dur", "pid", "tid")
+        if key in event
+    }
+    args = event.get("args")
+    if isinstance(args, dict):
+        compact["args"] = {
+            key: args[key]
+            for key in ("correlation", "correlation_id", "device", "stream")
+            if key in args
+        }
+    return compact
+
+
 def _infer_chrome_trace_start_us(trace_events: list[dict[str, Any]]) -> float:
     for event in trace_events:
         if event.get("ph") == "X" and event.get("cat") == "Trace":
@@ -2853,16 +2962,15 @@ def _load_python_module_intervals(
     all_threads_key = "__all__"
     if trace_json_path is None or not module_id_to_path:
         return {}
-    with trace_json_path.open(encoding="utf-8") as f:
-        trace_json = json.load(f)
-    trace_events = trace_json.get("traceEvents", [])
-    if not isinstance(trace_events, list):
-        return {}
-    trace_start_us = _infer_chrome_trace_start_us(trace_events)
+    trace_category_start_us: float | None = None
+    iteration_start_us: float | None = None
     intervals_by_tid: dict[int | str, list[tuple[float, float, str]]] = {}
-    for event in trace_events:
-        if not isinstance(event, dict):
-            continue
+    for event in _iter_chrome_trace_events(trace_json_path):
+        trace_category_start_us, iteration_start_us = (
+            _update_chrome_trace_start_candidates(
+                event, trace_category_start_us, iteration_start_us
+            )
+        )
         if event.get("ph") != "X" or event.get("cat") != "python_function":
             continue
         module_key = _trace_module_key(event.get("name"))
@@ -2876,12 +2984,22 @@ def _load_python_module_intervals(
         tid = _trace_event_tid(event)
         if ts is None or dur is None or tid is None:
             continue
-        start_us = float(ts) - trace_start_us
+        start_us = float(ts)
         end_us = start_us + float(dur)
         intervals_by_tid.setdefault(tid, []).append((start_us, end_us, module_path))
         intervals_by_tid.setdefault(all_threads_key, []).append(
             (start_us, end_us, module_path)
         )
+    trace_start_us = _select_chrome_trace_start_us(
+        trace_category_start_us, iteration_start_us
+    )
+    intervals_by_tid = {
+        tid: [
+            (start_us - trace_start_us, end_us - trace_start_us, module_path)
+            for start_us, end_us, module_path in intervals
+        ]
+        for tid, intervals in intervals_by_tid.items()
+    }
     for intervals in intervals_by_tid.values():
         intervals.sort(key=lambda item: (item[0], item[1] - item[0]))
     return intervals_by_tid
@@ -2952,24 +3070,23 @@ def _select_ac2g_trace_endpoint(
 def parse_ac2g_flow_endpoints(
     trace_json_path: Path, trace_start_us: float | None = None
 ) -> Ac2gFlowEndpoints:
-    with trace_json_path.open(encoding="utf-8") as f:
-        trace_json = json.load(f)
-    trace_events = trace_json.get("traceEvents", [])
-    if not isinstance(trace_events, list):
-        trace_events = []
-    if trace_start_us is None:
-        trace_start_us = _infer_chrome_trace_start_us(trace_events)
-
+    trace_category_start_us: float | None = None
+    iteration_start_us: float | None = None
     starts: dict[int, list[dict[str, Any]]] = {}
     ends: dict[int, list[dict[str, Any]]] = {}
     x_events_by_corr_id: dict[int, list[dict[str, Any]]] = {}
-    for event in trace_events:
-        if not isinstance(event, dict):
-            continue
+    for event in _iter_chrome_trace_events(trace_json_path):
+        trace_category_start_us, iteration_start_us = (
+            _update_chrome_trace_start_candidates(
+                event, trace_category_start_us, iteration_start_us
+            )
+        )
         if event.get("ph") == "X":
             corr_id = _trace_event_correlation_id(event)
             if corr_id is not None:
-                x_events_by_corr_id.setdefault(corr_id, []).append(event)
+                x_events_by_corr_id.setdefault(corr_id, []).append(
+                    _compact_ac2g_trace_event(event)
+                )
             continue
 
         if event.get("cat") != "ac2g":
@@ -2986,6 +3103,11 @@ def parse_ac2g_flow_endpoints(
             starts.setdefault(corr_id, []).append(event)
         elif ph == "f":
             ends.setdefault(corr_id, []).append(event)
+
+    if trace_start_us is None:
+        trace_start_us = _select_chrome_trace_start_us(
+            trace_category_start_us, iteration_start_us
+        )
 
     paired = set(starts) & set(ends)
     start_ts_us: dict[int, float] = {}
@@ -3493,7 +3615,8 @@ def _nearest_aten_exact_sync_parent_id(
 
 def _gpu_events_linked_to_cpu_submit_descendants(
     *,
-    gpu_events: list[Any],
+    gpu_events: list[Any] | None = None,
+    gpu_events_by_correlation_id: dict[int, list[Any]] | None = None,
     cpu_descendants: list[Any],
     parent_event: Any,
     sync_event: Any,
@@ -3509,25 +3632,32 @@ def _gpu_events_linked_to_cpu_submit_descendants(
     if not submit_corr_ids:
         return []
 
-    candidates: list[Any] = []
-    for gpu_event in gpu_events:
-        if id(gpu_event) not in node_ids:
-            continue
-        gpu_corr_ids = {
-            cid
-            for cid in (
+    if gpu_events_by_correlation_id is None:
+        gpu_events_by_correlation_id = {}
+        for gpu_event in gpu_events or []:
+            for corr_id in (
                 gpu_event.correlation_id(),
                 gpu_event.linked_correlation_id(),
-            )
-            if cid > 0
-        }
-        if not gpu_corr_ids & submit_corr_ids:
-            continue
-        if gpu_event.start_ns() < parent_event.start_ns():
-            continue
-        if gpu_event.end_ns() > sync_event.end_ns():
-            continue
-        candidates.append(gpu_event)
+            ):
+                if corr_id > 0:
+                    gpu_events_by_correlation_id.setdefault(corr_id, []).append(
+                        gpu_event
+                    )
+
+    candidates: list[Any] = []
+    seen_gpu_event_ids: set[int] = set()
+    for corr_id in submit_corr_ids:
+        for gpu_event in gpu_events_by_correlation_id.get(corr_id, []):
+            if id(gpu_event) in seen_gpu_event_ids:
+                continue
+            seen_gpu_event_ids.add(id(gpu_event))
+            if id(gpu_event) not in node_ids:
+                continue
+            if gpu_event.start_ns() < parent_event.start_ns():
+                continue
+            if gpu_event.end_ns() > sync_event.end_ns():
+                continue
+            candidates.append(gpu_event)
     return candidates
 
 
@@ -3593,6 +3723,14 @@ def build_llamasim_aten_sync_wait_edges(
     handled: set[int] = set()
     attrs_by_edge: dict[tuple[str, str], dict[str, str]] = {}
     seen: set[tuple[str, str]] = set()
+    gpu_events_by_correlation_id: dict[int, list[Any]] = {}
+    for gpu_event in gpu_events:
+        for corr_id in (
+            gpu_event.correlation_id(),
+            gpu_event.linked_correlation_id(),
+        ):
+            if corr_id > 0:
+                gpu_events_by_correlation_id.setdefault(corr_id, []).append(gpu_event)
 
     for sync_event in cpu_events:
         if id(sync_event) in updated_roles:
@@ -3619,7 +3757,7 @@ def build_llamasim_aten_sync_wait_edges(
             if event_id in event_by_id
         ]
         candidates = _gpu_events_linked_to_cpu_submit_descendants(
-            gpu_events=gpu_events,
+            gpu_events_by_correlation_id=gpu_events_by_correlation_id,
             cpu_descendants=cpu_descendants,
             parent_event=parent_event,
             sync_event=sync_event,
@@ -3681,8 +3819,19 @@ def build_llamasim_sync_wait_edges(
             event.device_resource_id(),
         )
         gpu_events_by_stream.setdefault(key, []).append(event)
-    for stream_events in gpu_events_by_stream.values():
-        stream_events.sort(key=raw_event_sort_key)
+    gpu_event_end_ns_by_stream: dict[tuple[Any, int, int], list[int]] = {}
+    for stream_key, stream_events in gpu_events_by_stream.items():
+        stream_events.sort(
+            key=lambda event: (
+                event.end_ns(),
+                event.start_ns(),
+                event.correlation_id(),
+                event.name(),
+            )
+        )
+        gpu_event_end_ns_by_stream[stream_key] = [
+            event.end_ns() for event in stream_events
+        ]
     gpu_stream_resource_ids = {key[2] for key in gpu_events_by_stream}
 
     sync_wait_edges: list[tuple[str, str, str]] = []
@@ -3708,12 +3857,13 @@ def build_llamasim_sync_wait_edges(
                     and stream_key[2] != cpu_event.device_resource_id()
                 ):
                     continue
-            completed = [
-                event for event in stream_events if event.end_ns() <= cpu_event.end_ns()
-            ]
-            if not completed:
+            stream_end_ns = gpu_event_end_ns_by_stream[stream_key]
+            completed_index = bisect.bisect_right(
+                stream_end_ns, cpu_event.end_ns()
+            ) - 1
+            if completed_index < 0:
                 continue
-            source_gpu_events.append(max(completed, key=raw_event_sort_key))
+            source_gpu_events.append(stream_events[completed_index])
 
         added = False
         for source_gpu in source_gpu_events:
@@ -4181,9 +4331,12 @@ def write_llamasim_runtime_bundle(
     from torch.autograd import DeviceType
     from torch.autograd.profiler_util import _rewrite_name
 
+    print("llamasim_runtime_bundle: collecting raw Kineto events", flush=True)
     trace_start_ns, raw_events = get_raw_kineto_events(prof)
     ws_launch_index = build_ws_launch_index(raw_events)
+    print("llamasim_runtime_bundle: loading execution trace nodes", flush=True)
     execution_nodes = load_execution_trace_nodes(execution_trace_path)
+    print("llamasim_runtime_bundle: matching execution trace nodes", flush=True)
     matched_execution_node_by_event, match_errors, match_warnings = (
         match_execution_nodes_to_gpu_kernels(raw_events, execution_nodes)
     )
@@ -4209,7 +4362,13 @@ def write_llamasim_runtime_bundle(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    module_hierarchy_path = output_dir / "module_hierarchy.json"
+    if module_hierarchy:
+        module_hierarchy_path.write_text(
+            json.dumps(module_hierarchy, indent=2) + "\n", encoding="utf-8"
+        )
 
+    print("llamasim_runtime_bundle: parsing Chrome ac2g flows", flush=True)
     ac2g_endpoints = (
         parse_ac2g_flow_endpoints(trace_json_path)
         if trace_json_path is not None
@@ -4233,6 +4392,7 @@ def write_llamasim_runtime_bundle(
             id(pair.cpu_event) for pair in ac2g_matches.pairs_by_corr_id.values()
         }
 
+    print("llamasim_runtime_bundle: selecting runtime events", flush=True)
     profiler_sync_excluded_cpu_event_ids = find_profiler_sync_excluded_cpu_event_ids(
         raw_events
     )
@@ -4246,15 +4406,19 @@ def write_llamasim_runtime_bundle(
 
     node_ids = {id(event): f"k{index}" for index, event in enumerate(selected_events)}
     node_indexes = {id(event): index for index, event in enumerate(selected_events)}
+    event_by_node_id = {node_ids[id(event)]: event for event in selected_events}
     selected_event_ids = set(node_ids.values())
 
+    print("llamasim_runtime_bundle: building thread order edges", flush=True)
     thread_order_edges = build_llamasim_thread_order_edges(
         node_ids, selected_cpu_events
     )
+    print("llamasim_runtime_bundle: building stream order edges", flush=True)
     stream_order_edges = build_llamasim_stream_order_edges(
         node_ids, selected_gpu_events
     )
     if ac2g_ids:
+        print("llamasim_runtime_bundle: building exact submit edges", flush=True)
         submit_edges, runtime_role_by_event_id, submit_edge_attrs = (
             build_llamasim_submit_edges_from_ac2g(
                 node_ids,
@@ -4270,6 +4434,7 @@ def write_llamasim_runtime_bundle(
         )
         submit_edge_provenance = "ac2g_endpoint_exact"
     else:
+        print("llamasim_runtime_bundle: building heuristic submit edges", flush=True)
         submit_edges, runtime_role_by_event_id = build_llamasim_submit_edges(
             node_ids,
             selected_cpu_events,
@@ -4281,6 +4446,7 @@ def write_llamasim_runtime_bundle(
     # Exact wait edges from ws_sync markers (takes priority over heuristics).
     # ws_sync record_function events are parents; propagate their metadata to
     # the actual CUDA sync/wait leaf nodes selected in the runtime graph.
+    print("llamasim_runtime_bundle: building wrapper exact wait edges", flush=True)
     ws_sync_marker_index = build_ws_sync_index(raw_events)
     ws_sync_index = propagate_ws_sync_to_leaf_events(
         raw_events,
@@ -4312,6 +4478,7 @@ def write_llamasim_runtime_bundle(
     ws_sync_empty_source_count = sum(
         1 for sync_info in ws_sync_index.values() if not sync_info.src_launch_ids
     )
+    print("llamasim_runtime_bundle: building aten exact wait edges", flush=True)
     aten_exact_wait_edges, runtime_role_by_event_id, _aten_handled_ids, aten_wait_attrs = (
         build_llamasim_aten_sync_wait_edges(
             node_ids,
@@ -4323,12 +4490,14 @@ def write_llamasim_runtime_bundle(
     )
 
     # Heuristic wait edges (fallback for events not handled by exact path)
+    print("llamasim_runtime_bundle: building linked-family wait edges", flush=True)
     linked_wait_edges, runtime_role_by_event_id = build_llamasim_wait_edges(
         node_ids,
         selected_cpu_events,
         selected_gpu_events,
         runtime_role_by_event_id,
     )
+    print("llamasim_runtime_bundle: building sync fallback wait edges", flush=True)
     sync_wait_edges, runtime_role_by_event_id = build_llamasim_sync_wait_edges(
         node_ids,
         selected_cpu_events,
@@ -4339,11 +4508,10 @@ def write_llamasim_runtime_bundle(
     # Provenance: track which edges are exact vs heuristic
     wait_edge_attrs: dict[tuple[str, str], dict[str, str]] = {}
     for src, dst, _ in exact_wait_edges:
-        sync_info = None
-        for cpu_event in selected_cpu_events:
-            if node_ids.get(id(cpu_event)) == dst:
-                sync_info = ws_sync_index.get(id(cpu_event))
-                break
+        cpu_event = event_by_node_id.get(dst)
+        sync_info = (
+            ws_sync_index.get(id(cpu_event)) if cpu_event is not None else None
+        )
         attr: dict[str, str] = {
             "wait_exact": "true",
             "wait_source": "wrapper_ws_sync",
@@ -4366,17 +4534,16 @@ def write_llamasim_runtime_bundle(
             }
     for src, dst, _ in sync_wait_edges:
         if (src, dst) not in wait_edge_attrs:
-            for cpu_event in selected_cpu_events:
-                if node_ids.get(id(cpu_event)) == dst:
-                    wait_edge_attrs[(src, dst)] = heuristic_sync_wait_attrs(
-                        cpu_event.name()
-                    )
-                    break
-            else:
+            cpu_event = event_by_node_id.get(dst)
+            if cpu_event is None:
                 wait_edge_attrs[(src, dst)] = {
                     "wait_exact": "false",
                     "wait_source": "kineto_sync_frontier",
                 }
+            else:
+                wait_edge_attrs[(src, dst)] = heuristic_sync_wait_attrs(
+                    cpu_event.name()
+                )
 
     # Merge: exact edges first, then heuristic
     exact_wait_edges = exact_wait_edges + aten_exact_wait_edges
@@ -4433,6 +4600,7 @@ def write_llamasim_runtime_bundle(
             record = tensor_records[tensor_key]
         return tensor_key
 
+    print("llamasim_runtime_bundle: collecting tensor IO", flush=True)
     for event in selected_events:
         execution_node = matched_execution_node_by_event.get(id(event))
         if execution_node is None:
@@ -4507,13 +4675,8 @@ def write_llamasim_runtime_bundle(
     runtime_nodes_csv_path = output_dir / "runtime_nodes.csv"
     runtime_edges_csv_path = output_dir / "runtime_edges.csv"
     manifest_path = output_dir / "manifest.json"
-    module_hierarchy_path = output_dir / "module_hierarchy.json"
 
-    if module_hierarchy:
-        module_hierarchy_path.write_text(
-            json.dumps(module_hierarchy, indent=2) + "\n", encoding="utf-8"
-        )
-
+    print("llamasim_runtime_bundle: writing DOT graph", flush=True)
     with dot_path.open("w", encoding="utf-8") as f:
         f.write("digraph G {\n")
         f.write("  newrank = true;\n")
@@ -4626,11 +4789,13 @@ def write_llamasim_runtime_bundle(
         **(module_id_to_path or {}),
         **(pipeline_module_id_to_path or {}),
     }
+    print("llamasim_runtime_bundle: loading Python module intervals", flush=True)
     python_module_intervals = _load_python_module_intervals(
         trace_json_path,
         python_module_id_to_path,
     )
 
+    print("llamasim_runtime_bundle: writing runtime_nodes.csv", flush=True)
     with runtime_nodes_csv_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "step",
@@ -4760,6 +4925,7 @@ def write_llamasim_runtime_bundle(
                 }
             )
 
+    print("llamasim_runtime_bundle: writing runtime_edges.csv", flush=True)
     with runtime_edges_csv_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "step",
@@ -4813,6 +4979,7 @@ def write_llamasim_runtime_bundle(
                 }
             )
 
+    print("llamasim_runtime_bundle: writing pytorch_runtime_tensors.csv", flush=True)
     with tensor_csv_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "step",
@@ -4979,6 +5146,7 @@ def write_llamasim_runtime_bundle(
         ),
         **memory_stats,
     }
+    print("llamasim_runtime_bundle: writing manifest.json", flush=True)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 

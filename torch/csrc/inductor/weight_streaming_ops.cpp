@@ -29,6 +29,7 @@
 #include <ATen/native/cuda/Resize.h>
 #endif
 
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -146,6 +147,37 @@ struct WSState {
   bool measure_stall = false;
   std::vector<std::pair<at::cuda::CUDAEvent, at::cuda::CUDAEvent>>
       stall_brackets;
+
+  // Order-paced H2D issue. Each ws_ops boundary with async fires records
+  // one event on the compute stream and fences the h2d streams behind it,
+  // so copies start no earlier than their issue anchor's position in
+  // compute order (device-side; no host blocking). Without this the copy
+  // begins when the HOST reaches the boundary — the host runs a whole
+  // iteration ahead, so in-flight bytes and PCIe order stop matching the
+  // schedule's order axis. TORCH_WS_NO_H2D_PACING=1 restores host-timed
+  // issue.
+  bool pace_h2d = true;
+
+  // Claimed-but-unarrived byte budget (the scheduler paced-pool constant
+  // B). Async dst storage is allocated at host-enqueue time; without a
+  // bound the host's lead claims the whole iteration's streamed bytes and
+  // the allocator peak stops tracking the plan. When over budget the
+  // HOST waits on the oldest in-flight copy (GPU is busy then — costs no
+  // wall time). TORCH_WS_INFLIGHT_MB sets the cap (default 130; 0 =
+  // unbounded). FIFO entries: (completion event on h2d_stream, bytes).
+  int64_t inflight_cap_bytes = 130 * 1000000LL;
+  int64_t inflight_bytes = 0;
+  std::deque<std::pair<at::cuda::CUDAEvent, int64_t>> inflight_fifo;
+
+  // Evicted-but-unfreed leash ("claims wait for planned evicts"). Evict
+  // frees are device-gated while claims are host-timed; with the host a
+  // full iteration ahead, every gap evict of iter k is still pending
+  // when iter k+1's claims land — the allocator holds both. Bounding
+  // pending-evict bytes keeps the host-side peak tracking device-side
+  // residency. TORCH_WS_EVICT_LEASH_MB (default 256; 0 = unbounded).
+  int64_t evict_leash_bytes = 256 * 1000000LL;
+  int64_t pending_evict_bytes = 0;
+  std::deque<Key> pending_evict_fifo;  // record order; stale keys skipped
 };
 
 static WSState& state() {
@@ -153,6 +185,13 @@ static WSState& state() {
   static bool inited = false;
   if (!inited) {
     s.measure_stall = (std::getenv("TORCH_WS_MEASURE_STALL") != nullptr);
+    s.pace_h2d = (std::getenv("TORCH_WS_NO_H2D_PACING") == nullptr);
+    if (const char* env = std::getenv("TORCH_WS_INFLIGHT_MB")) {
+      s.inflight_cap_bytes = std::atoll(env) * 1000000LL;
+    }
+    if (const char* env = std::getenv("TORCH_WS_EVICT_LEASH_MB")) {
+      s.evict_leash_bytes = std::atoll(env) * 1000000LL;
+    }
     inited = true;
   }
   return s;
@@ -221,6 +260,17 @@ static void free_tensor_storage(const at::Tensor& t) {
   }
 }
 
+// All pending_evictions erasures go through here to keep the leash's
+// byte counter in sync. (The fifo is cleaned lazily — stale keys are
+// skipped at pop time.)
+static void erase_pending_eviction(
+    WSState& s,
+    std::unordered_map<Key, std::pair<at::Tensor, at::cuda::CUDAEvent>>::
+        iterator it) {
+  s.pending_evict_bytes -= s.weight_storage_nbytes[it->first];
+  s.pending_evictions.erase(it);
+}
+
 static c10::cuda::CUDAStream& pick_h2d_stream(WSState& s) {
   // Single-stream case is the common one.
   if (s.h2d_streams.size() == 1) {
@@ -252,7 +302,10 @@ static void register_weight_locked(WSState& s, const at::Tensor& gpu_tensor) {
   s.weight_backups[k] = std::move(cpu_backup);
   s.weight_storage_nbytes[k] = gpu_tensor.storage().nbytes();
   s.registered_weights[k] = gpu_tensor;
-  s.pending_evictions.erase(k);
+  auto pend_it = s.pending_evictions.find(k);
+  if (pend_it != s.pending_evictions.end()) {
+    erase_pending_eviction(s, pend_it);
+  }
 }
 
 static void register_weight_impl(WSState& s, const at::Tensor& gpu_tensor) {
@@ -294,6 +347,13 @@ static void reset_impl(WSState& s) {
   s.registered_weights.clear();
   s.named_to_key.clear();
   s.reloadable_keys.clear();
+  for (auto& entry : s.inflight_fifo) {
+    entry.first.synchronize();
+  }
+  s.inflight_fifo.clear();
+  s.inflight_bytes = 0;
+  s.pending_evict_fifo.clear();
+  s.pending_evict_bytes = 0;
   s.event_pool.clear();
   s.h2d_streams.clear();
   s.device_index = -1;
@@ -333,21 +393,71 @@ static void h2d_prefetch_async(WSState& s, const at::Tensor& gpu_tensor) {
     ++s.fire_async;
   }
 
-  // Drain any pending evict first.
+  // Drain any pending evict first. With pacing the write-after-read
+  // ordering moves to the device: every h2d stream fences behind the
+  // eviction event, so the host never blocks here. Without pacing fall
+  // back to the host-blocking drain (the copy would otherwise race the
+  // compute kernels still reading the old storage).
   auto pend_it = s.pending_evictions.find(k);
   if (pend_it != s.pending_evictions.end()) {
     auto& [pending_tensor, evict_event] = pend_it->second;
     if (!evict_event.query()) {
-      evict_event.synchronize();
+      if (s.pace_h2d) {
+        for (auto& st : s.h2d_streams) {
+          evict_event.block(st);
+        }
+      } else {
+        evict_event.synchronize();
+      }
     }
     free_tensor_storage(pending_tensor);
     release_event(s, std::move(evict_event));
-    s.pending_evictions.erase(pend_it);
+    erase_pending_eviction(s, pend_it);
   }
 
   auto& h2d_stream = pick_h2d_stream(s);
   if (gpu_tensor.storage().nbytes() == 0) {
     int64_t nbytes = s.weight_storage_nbytes[k];
+    // Claims wait for planned evicts: when evicted-but-unfreed bytes
+    // exceed the leash, host-wait the oldest eviction's event and free
+    // it before claiming more. Bounds the host-side allocator peak to
+    // device-side residency + leash; blocks only a host that is far
+    // ahead of the GPU.
+    if (s.evict_leash_bytes > 0) {
+      while (s.pending_evict_bytes > s.evict_leash_bytes &&
+             !s.pending_evict_fifo.empty()) {
+        Key vk = s.pending_evict_fifo.front();
+        s.pending_evict_fifo.pop_front();
+        auto vit = s.pending_evictions.find(vk);
+        if (vit == s.pending_evictions.end()) {
+          continue;  // already drained elsewhere
+        }
+        auto& [victim, victim_ev] = vit->second;
+        victim_ev.synchronize();
+        free_tensor_storage(victim);
+        release_event(s, std::move(victim_ev));
+        erase_pending_eviction(s, vit);
+      }
+    }
+    // Reclaim arrived claims, then enforce the in-flight budget: when
+    // over, host-wait the OLDEST in-flight copy. The oldest is issued
+    // before anything the compute stream could be waiting on, so this
+    // cannot deadlock; it only ever blocks a host that is far ahead of
+    // the GPU.
+    while (!s.inflight_fifo.empty() && s.inflight_fifo.front().first.query()) {
+      s.inflight_bytes -= s.inflight_fifo.front().second;
+      release_event(s, std::move(s.inflight_fifo.front().first));
+      s.inflight_fifo.pop_front();
+    }
+    if (s.inflight_cap_bytes > 0) {
+      while (s.inflight_bytes + nbytes > s.inflight_cap_bytes &&
+             !s.inflight_fifo.empty()) {
+        s.inflight_fifo.front().first.synchronize();
+        s.inflight_bytes -= s.inflight_fifo.front().second;
+        release_event(s, std::move(s.inflight_fifo.front().first));
+        s.inflight_fifo.pop_front();
+      }
+    }
     resize_storage_bytes(gpu_tensor, nbytes);
     // record_stream tells the caching allocator the h2d_stream is using
     // storage allocated on the default stream.
@@ -366,6 +476,13 @@ static void h2d_prefetch_async(WSState& s, const at::Tensor& gpu_tensor) {
     c10::cuda::CUDAStreamGuard guard(h2d_stream);
     auto& backup = backup_it->second;
     gpu_tensor.copy_(backup, /*non_blocking=*/true);
+    // Track the claim until the copy completes (arrival). A second
+    // event is recorded because the per-key event below is moved out by
+    // ``h2d_wait`` and can't double as the FIFO entry.
+    auto claim_ev = acquire_event(s);
+    claim_ev.record(h2d_stream);
+    s.inflight_fifo.emplace_back(std::move(claim_ev), nbytes);
+    s.inflight_bytes += nbytes;
   }
 
   auto ev = acquire_event(s);
@@ -386,9 +503,9 @@ static void h2d_prefetch_sync(WSState& s, const at::Tensor& gpu_tensor) {
     if (evict_event.query()) {
       free_tensor_storage(pending_tensor);
       release_event(s, std::move(evict_event));
-      s.pending_evictions.erase(pend_it);
+      erase_pending_eviction(s, pend_it);
     } else if (gpu_tensor.storage().nbytes() > 0) {
-      s.pending_evictions.erase(pend_it);
+      erase_pending_eviction(s, pend_it);
       return;  // still resident — fine, evict will drop on the floor
     }
   }
@@ -465,6 +582,8 @@ static void evict_vram(WSState& s, const at::Tensor& gpu_tensor) {
   ev.record(current);
   s.pending_evictions.emplace(
       k, std::make_pair(gpu_tensor, std::move(ev)));
+  s.pending_evict_bytes += s.weight_storage_nbytes[k];
+  s.pending_evict_fifo.push_back(k);
 }
 
 // Forward declarations for per-iter mask helpers (defined further
@@ -483,6 +602,7 @@ static void flush_ready_vram_evictions(WSState& s) {
     if (ev.query()) {
       free_tensor_storage(gpu_tensor);
       release_event(s, std::move(ev));
+      s.pending_evict_bytes -= s.weight_storage_nbytes[it->first];
       it = s.pending_evictions.erase(it);
     } else {
       ++it;
@@ -530,7 +650,13 @@ static void ws_ops_impl(
   for (const auto& t : waits) {
     if (have_h2d_masks &&
         !fires_in_iter(s.h2d_iter_mask, key_of(t), cur_iter)) {
-      continue;  // partial schedule: tensor was kept resident this iter
+      // Partial schedule: tensor should be resident this iter. If it is
+      // NOT (schedule/mask desync), fall through to h2d_wait whose sync
+      // fallback restores residency — slow but correct, and counted in
+      // wait_miss_synced for visibility.
+      if (t.storage().nbytes() != 0) {
+        continue;
+      }
     }
     h2d_wait(s, t);
   }
@@ -554,6 +680,19 @@ static void ws_ops_impl(
       continue;  // partial schedule: not evicted in this iter's gap
     }
     evict_vram(s, t);
+  }
+  // Order pacing: fence the h2d streams behind this boundary's position
+  // on the compute stream before issuing the copies. record + block are
+  // both enqueued synchronously here, so the event's snapshot is already
+  // captured and it can go straight back to the pool.
+  if (s.pace_h2d && !s.h2d_streams.empty() &&
+      (!async_h2d.empty() || !xg_async_gids.empty())) {
+    auto pace = acquire_event(s);
+    pace.record(at::cuda::getCurrentCUDAStream(s.device_index));
+    for (auto& st : s.h2d_streams) {
+      pace.block(st);
+    }
+    release_event(s, std::move(pace));
   }
   for (const auto& t : async_h2d) {
     if (have_h2d_masks &&
@@ -650,16 +789,20 @@ static void reset_op() {
 // iter (legacy semantic).
 // ---------------------------------------------------------------------------
 
-static void begin_graph_iter_op(int64_t gid) {
+// Returns the new iter index (0 on the graph's first invocation) so the
+// wrapper can gate its one-time registration block.
+static int64_t begin_graph_iter_op(int64_t gid) {
   auto& s = state();
   std::lock_guard<std::mutex> lk(s.mu);
   auto it = s.graph_iter_idx.find(gid);
+  int64_t iter = 0;
   if (it == s.graph_iter_idx.end()) {
     s.graph_iter_idx[gid] = 0;
   } else {
-    it->second += 1;
+    iter = ++it->second;
   }
   s.current_graph_id = gid;
+  return iter;
 }
 
 static void set_iter_mask_op(
@@ -688,6 +831,8 @@ static void set_iter_mask_op(
 
 // Returns true iff the op should fire this iter. Empty/missing mask =
 // "fires every iter" (legacy, full-evict, or unmasked single-iter op).
+// The iter counter is absolute across pipeline calls while masks are
+// sized to one pipeline call (graph_multiplicity), so masking is cyclic.
 static inline bool fires_in_iter(
     const std::unordered_map<Key, std::vector<uint8_t>>& mask_map,
     Key key,
@@ -695,8 +840,8 @@ static inline bool fires_in_iter(
   auto it = mask_map.find(key);
   if (it == mask_map.end()) return true;
   const auto& mask = it->second;
-  if (iter < 0 || iter >= (int64_t)mask.size()) return true;
-  return mask[(size_t)iter] != 0;
+  if (iter < 0 || mask.empty()) return true;
+  return mask[(size_t)(iter % (int64_t)mask.size())] != 0;
 }
 
 static int64_t current_iter_of(WSState& s, int64_t gid) {
@@ -749,10 +894,19 @@ static void evict_cross_graph_op(at::TensorList keep_tensors) {
     if (pend_it != s.pending_evictions.end()) {
       auto& [pending_tensor, evict_event] = pend_it->second;
       if (!evict_event.query()) {
-        evict_event.synchronize();
+        if (s.pace_h2d) {
+          // Reuse is device-ordered: same-stream allocs are stream-
+          // ordered after the old reads, and h2d-stream writes are
+          // fenced behind a later compute position by the pacing event.
+          for (auto& st : s.h2d_streams) {
+            evict_event.block(st);
+          }
+        } else {
+          evict_event.synchronize();
+        }
       }
       release_event(s, std::move(evict_event));
-      s.pending_evictions.erase(pend_it);
+      erase_pending_eviction(s, pend_it);
     }
     if (rw->second.storage().nbytes() > 0) {
       resize_storage_bytes(rw->second, 0);
@@ -795,7 +949,7 @@ TORCH_LIBRARY_FRAGMENT(ws_rt, m) {
   m.def("mark_reloadable(Tensor[] tensors) -> ()", mark_reloadable_op);
   m.def("get_wait_stats() -> int[]", get_wait_stats_op);
   m.def("drain_stall_us() -> int", drain_stall_us_op);
-  m.def("begin_graph_iter(int gid) -> ()", begin_graph_iter_op);
+  m.def("begin_graph_iter(int gid) -> int", begin_graph_iter_op);
   m.def(
       "set_iter_mask(int gid, str name, int[] h2d_iters, "
       "int[] evict_iters, int total_iters) -> ()",

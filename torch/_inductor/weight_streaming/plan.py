@@ -129,6 +129,12 @@ class IOSchedule:
     # call). Indexed by compile_position. Default 1 for absent entries.
     # Used by the wrapper to size per-iter masks for partial schedules.
     graph_multiplicity: dict[int, int] = field(default_factory=dict)
+    # Whether the wrapper should evict other graphs' weights at each graph
+    # boundary (legacy per-graph residency cycling). Schedulers that model
+    # residency across the whole pipeline (e.g. ct_milp_orderax) set
+    # summary.cross_graph_evict=false — extra evictions would break their
+    # plan's residency invariants.
+    cross_graph_evict: bool = True
 
 
 def _load_tensors_csv(path: str) -> dict[str, TensorEntry]:
@@ -287,6 +293,7 @@ def load_io_schedule(
     summary = data.get("summary", {}) or {}
     raw_mult = summary.get("graph_multiplicity", {}) or {}
     graph_multiplicity = {int(k): int(v) for k, v in raw_mult.items()}
+    cross_graph_evict = bool(summary.get("cross_graph_evict", True))
     return IOSchedule(
         nodes=nodes,
         prefetches=prefetches,
@@ -297,4 +304,5 @@ def load_io_schedule(
         tensors=tensors,
         compilation_hash=data.get("compilation_hash", ""),
         graph_multiplicity=graph_multiplicity,
+        cross_graph_evict=cross_graph_evict,
     )

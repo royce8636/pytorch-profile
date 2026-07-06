@@ -167,6 +167,8 @@ def _apply_sd3_group_cpu_offload(
         num_blocks_per_group=args.group_offload_num_blocks,
         non_blocking=args.group_offload_non_blocking,
         use_stream=args.group_offload_use_stream,
+        record_stream=False,
+        low_cpu_mem_usage=False,
     )
     for name in _SD3_OFFLOAD_COMPONENTS:
         module = getattr(pipe, name, None)

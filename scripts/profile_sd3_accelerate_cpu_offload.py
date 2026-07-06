@@ -204,16 +204,20 @@ def main() -> None:
     transformer = underlying_unet_module(pipe.transformer)
     # Use prof-derived observation-order mapping (see
     # `build_module_id_to_path_from_prof`).
+    print("llamasim_runtime_bundle: building pipeline module index", flush=True)
     _pipe_catalog, _pipe_id_to_path = build_pipeline_module_index_from_prof(
         prof, pipe,
     )
+    print("llamasim_runtime_bundle: building component module index", flush=True)
+    _module_id_to_path = build_module_id_to_path_from_prof(prof, transformer)
+    print("llamasim_runtime_bundle: writing runtime bundle", flush=True)
     write_llamasim_runtime_bundle(
         prof,
         output_paths.execution_trace_path,
         output_paths.llamasim_output_dir,
         trace_json_path=output_paths.trace_path,
         module_catalog=build_module_catalog(transformer),
-        module_id_to_path=build_module_id_to_path_from_prof(prof, transformer),
+        module_id_to_path=_module_id_to_path,
         pipeline_module_catalog=_pipe_catalog,
         pipeline_module_id_to_path=_pipe_id_to_path,
         module_hierarchy=build_module_hierarchy(pipe),

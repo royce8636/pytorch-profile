@@ -2982,14 +2982,19 @@ class PythonWrapperCodegen(CodeGen):
                 f"{alias} = {tensor_id_to_input[tid]}"
                 for tid, alias in sorted(stable_tensor_refs.items())
             ]
-            # Also mirror (compile_pos, graph_input_name) → tensor into
-            # the ws_rt runtime so cross-graph async issuers can reach
-            # this graph's weights without a local reference. The
-            # runtime method early-outs once a (gid, name) is known, so
-            # subsequent iterations skip per-tensor dispatch.
+            # Registration block: mirrored runtime state (named weights,
+            # reloadable set, iter masks) persists across wrapper
+            # invocations, so it only needs to run on the graph's first
+            # iteration. Collected into ``reg_lines`` and gated behind
+            # ``begin_graph_iter() == 0`` below — N_weights Python calls
+            # per invocation otherwise dominate per-iter overhead.
+            reg_lines: list[str] = []
+            # Mirror (compile_pos, graph_input_name) → tensor into the
+            # ws_rt runtime so cross-graph async issuers can reach this
+            # graph's weights without a local reference.
             for tid, alias in sorted(stable_tensor_refs.items()):
                 name = tensor_id_to_input[tid]
-                alias_lines.append(
+                reg_lines.append(
                     f"_ws_rt.register_weight_named("
                     f"{current_compile_position}, {name!r}, {alias})"
                 )
@@ -3016,7 +3021,7 @@ class PythonWrapperCodegen(CodeGen):
                 if name in reload_names:
                     reload_aliases.append(alias)
             if reload_aliases:
-                alias_lines.append(
+                reg_lines.append(
                     f"_ws_rt.mark_reloadable([{', '.join(reload_aliases)}])"
                 )
 
@@ -3057,19 +3062,20 @@ class PythonWrapperCodegen(CodeGen):
             for gname in partial_names:
                 h2d_m = iter_mask_h2d.get(gname, [])
                 e_m = iter_mask_evict.get(gname, [])
-                alias_lines.append(
+                reg_lines.append(
                     f"_ws_rt.set_iter_mask("
                     f"{current_compile_position}, {gname!r}, "
                     f"{h2d_m!r}, {e_m!r}, {total_iters})"
                 )
 
-            # Advance the per-graph iter counter on every wrapper call.
-            # Must come AFTER set_iter_mask (which is idempotent across
-            # iters but only takes effect once the corresponding tensor
-            # is registered_named via register_weight_named above).
+            # Advance the per-graph iter counter on every wrapper call;
+            # run the registration block only on the first (it must
+            # follow register_weight in the runtime init, which happens
+            # before any wrapper executes).
             alias_lines.append(
-                f"_ws_rt.begin_graph_iter({current_compile_position})"
+                f"if _ws_rt.begin_graph_iter({current_compile_position}) == 0:"
             )
+            alias_lines.extend("    " + line for line in reg_lines)
 
             new_lines.append(
                 WeightStreamingLine(wrapper=self, calls=alias_lines)
@@ -3120,8 +3126,11 @@ class PythonWrapperCodegen(CodeGen):
                 # it's a graph boundary: evict every other registered weight
                 # (other graphs) before loading ours. Bounds peak VRAM by
                 # (this graph's pinned + bandwidth-limited cyclable) instead
-                # of (union of all graphs' weights).
-                cross_graph_evict=bool(cs_tensors),
+                # of (union of all graphs' weights). Schedulers that model
+                # residency across the whole pipeline turn this off via
+                # summary.cross_graph_evict=false.
+                cross_graph_evict=bool(cs_tensors)
+                and getattr(schedule, "cross_graph_evict", True),
                 keep_tensors=keep_tensors,
             )
             if cold_call is not None:
@@ -3260,6 +3269,10 @@ class PythonWrapperCodegen(CodeGen):
                             post_evict_vram_names.append(op.tensor_name)
 
                 has_vram_evict = bool(post_evict_vram or post_evict_vram_names)
+                # Flush at fire boundaries too: a graph's tail evictions
+                # otherwise stay pending (allocated) through the next
+                # graph's compute until its own evict boundary drains them.
+                has_async_fire = bool(post_async_h2d or post_xg_async_gids)
 
                 post_call = build_ws_ops_call(
                     evict_vram=post_evict_vram,
@@ -3268,7 +3281,7 @@ class PythonWrapperCodegen(CodeGen):
                     xg_async_gids=post_xg_async_gids,
                     xg_async_names=post_xg_async_names,
                     evict_dram=post_evict_dram,
-                    flush=has_vram_evict,
+                    flush=has_vram_evict or has_async_fire,
                 )
                 if post_call is not None:
                     new_lines.append(
