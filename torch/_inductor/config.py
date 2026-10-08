@@ -302,6 +302,11 @@ joint_custom_post_pass: torch._inductor.custom_graph_pass.CustomGraphPassType = 
 # use post-grad passes.
 pre_grad_custom_pass: Callable[[torch.fx.graph.Graph], None] | None = None
 
+# Weight streaming: path of a plan (gpuco_torch.plan, in gpu-co). When
+# set, each compiled graph's wrapper is instrumented for capture-time streaming
+# of the plan's weights and writes its copy list next to the plan.
+weight_streaming_plan: str = ""
+
 # Registers a custom pass to be run right before fusion in Inductor scheduler.
 # WARNING: Inductor scheduler IR is at prototype stage and subject to change,
 # hence custom IR passes built on top of it might break in the future.

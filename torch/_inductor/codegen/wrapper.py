@@ -579,6 +579,7 @@ class ExitDeviceContextManagerLine(WrapperLine):
 class ExternKernelAllocLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     node: ir.ExternKernelAlloc
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         node = self.node
@@ -593,6 +594,7 @@ class ExternKernelAllocLine(WrapperLine):
 class ExternKernelOutLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     node: ir.ExternKernelOut
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         node = self.node
@@ -630,6 +632,7 @@ class ExternKernelMultiOutLine(WrapperLine):
 
     wrapper: PythonWrapperCodegen
     node: ir.ExternKernelMultiOut
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         node = self.node
@@ -675,6 +678,7 @@ class KernelCallLine(WrapperLine):
     device: torch.device
     graph_name: str
     original_fxnode_name: str
+    launch_id: int = -1
 
     def codegen(self, code: IndentedBuffer) -> None:
         self.wrapper._generate_kernel_call_helper(
@@ -1227,6 +1231,12 @@ class PythonWrapperCodegen(CodeGen):
         self.launcher_fn_name = None
         # This function can be overridden to change the launcher name
         self.set_launcher_fn_name()
+        # Kernel launches in emission order; weight streaming anchors its
+        # in-graph waits and frees to these, and its issue orders to the module
+        # each launch belongs to (set by register_kernel_module_stack).
+        self._next_launch_id = 0
+        self._ws_launch_module_stacks: dict[int, list[tuple[str, str]]] = {}
+        self._ws_pending_module_stack: list[tuple[str, str]] | None = None
 
         # this is used for tracking which GraphLowering instance---parent graph
         # or (nested) subgraph---is currently codegened; the primary use case is
@@ -1298,6 +1308,19 @@ class PythonWrapperCodegen(CodeGen):
     def set_launcher_fn_name(self) -> None:
         # pyrefly: ignore [bad-assignment]
         self.launcher_fn_name = "call"
+
+    def _assign_launch_id(self) -> int:
+        lid = self._next_launch_id
+        self._next_launch_id += 1
+        return lid
+
+    def register_kernel_module_stack(self, kernel_name: str | None, node_schedule: Any) -> None:
+        """Attribute the next kernel launch to its module (weight streaming only)."""
+        if not config.weight_streaming_plan or not kernel_name:
+            return
+        from torch._inductor.weight_streaming.codegen.module_stack import scheduled_kernel_stack
+
+        self._ws_pending_module_stack = scheduled_kernel_stack(node_schedule) or None
 
     def write_constant(self, name: str, hashed: str) -> None:
         self.header.writeline(f"{name} = None  # {hashed}")
@@ -1768,17 +1791,23 @@ class PythonWrapperCodegen(CodeGen):
             if custom_codegen is not None:
                 custom_codegen(node, self.writeline)
                 return
-        self.writeline(ExternKernelAllocLine(self, node))
+        self.writeline(
+            ExternKernelAllocLine(self, node, launch_id=self._assign_launch_id())
+        )
 
     def generate_extern_kernel_multi_out(self, node: ir.ExternKernelMultiOut) -> None:
         """Generate .out() call with pre-allocated output buffers."""
         for out_node in node.out_variant_output_nodes:
             self.codegen_allocation(out_node)
-        self.writeline(ExternKernelMultiOutLine(self, node))
+        self.writeline(
+            ExternKernelMultiOutLine(self, node, launch_id=self._assign_launch_id())
+        )
 
     def generate_extern_kernel_alloc(self, node: ir.ExternKernelAlloc):
         node.codegen_comment(self)
-        self.writeline(ExternKernelAllocLine(self, node))
+        self.writeline(
+            ExternKernelAllocLine(self, node, launch_id=self._assign_launch_id())
+        )
         if isinstance(node.layout, ir.Layout):
             node.codegen_size_asserts(self)
 
@@ -1816,7 +1845,9 @@ class PythonWrapperCodegen(CodeGen):
         node: ir.ExternKernelOut,
     ) -> None:
         node.codegen_comment(self)
-        self.writeline(ExternKernelOutLine(self, node))
+        self.writeline(
+            ExternKernelOutLine(self, node, launch_id=self._assign_launch_id())
+        )
 
     def _generate_extern_kernel_out_helper(
         self,
@@ -1971,6 +2002,11 @@ class PythonWrapperCodegen(CodeGen):
                 self.generate_start_graph()
 
             self.run_wrapper_ir_passes(is_inference)
+
+            if config.weight_streaming_plan:
+                from torch._inductor.weight_streaming.codegen.inject import inject
+
+                inject(self)
 
             if config.triton.store_cubin and not config.triton.autotune_at_compile_time:
                 self.generate_reset_kernel_saved_flags()
@@ -3135,6 +3171,10 @@ class PythonWrapperCodegen(CodeGen):
         )
 
         device = device or V.graph.get_current_device_or_throw()
+        lid = self._assign_launch_id()
+        if self._ws_pending_module_stack is not None:
+            self._ws_launch_module_stacks[lid] = self._ws_pending_module_stack
+            self._ws_pending_module_stack = None
         self.writeline(
             KernelCallLine(
                 self,
@@ -3154,6 +3194,7 @@ class PythonWrapperCodegen(CodeGen):
                 graph_name=V.graph.name,
                 # pyrefly: ignore [bad-argument-type]
                 original_fxnode_name=original_fxnode_name,
+                launch_id=lid,
             )
         )
 

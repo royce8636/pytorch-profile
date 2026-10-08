@@ -90,6 +90,18 @@ from .triton_compat import (
 from .triton_helpers import get_constexprs
 
 
+# Weight streaming's tiered loader releases weight storages until the first
+# compiled call lands or repoints them, and autotuning benchmarks kernels against
+# those very tensors. While set, the first precompiled config is taken unmeasured.
+_skip_autotune = False
+autotune_skipped = 0
+
+
+def set_skip_autotune(skip: bool) -> None:
+    global _skip_autotune
+    _skip_autotune = skip
+
+
 class BenchmarkFailureReason(enum.Enum):
     """Reasons why a triton config benchmark may return float('inf')."""
 
@@ -1214,6 +1226,12 @@ class CachingAutotuner(KernelInterface):
 
     def autotune_to_one_config(self, *args, **kwargs):
         """Do the actual autotuning"""
+        if _skip_autotune:
+            global autotune_skipped
+            autotune_skipped += 1
+            self.launchers = [self.launchers[0]]
+            self.autotune_time_taken_ns = self.precompile_time_taken_ns
+            return
         start_time = time.time_ns()
         timings = self.benchmark_all_configs(*args, **kwargs)
         benchmark_time_taken_ns = time.time_ns() - start_time
